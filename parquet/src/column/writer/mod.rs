@@ -402,10 +402,9 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             _ => None,
         };
 
-        let def_levels_encoder = Self::create_level_encoder(descr.max_def_level(), &props);
-        let rep_levels_encoder = Self::create_level_encoder(descr.max_rep_level(), &props);
-
         Self {
+            def_levels_encoder: Self::create_level_encoder(descr.max_def_level(), &props),
+            rep_levels_encoder: Self::create_level_encoder(descr.max_rep_level(), &props),
             descr,
             props,
             statistics_enabled,
@@ -413,8 +412,6 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             codec,
             compressor,
             encoder,
-            def_levels_encoder,
-            rep_levels_encoder,
             data_pages: VecDeque::new(),
             page_metrics,
             column_metrics,
