@@ -415,6 +415,10 @@ fn create_batches() -> Vec<(&'static str, RecordBatch)> {
     let batch = create_primitive_bench_batch(BATCH_SIZE, 0.99, 0.75).unwrap();
     batches.push(("primitive_sparse_99pct_null", batch));
 
+    // Sparse list: 99% nulls — exercises batched null handling in write_list
+    let batch = create_list_primitive_bench_batch(BATCH_SIZE, 0.99, 0.75).unwrap();
+    batches.push(("list_primitive_sparse_99pct_null", batch));
+
     batches
 }
 
