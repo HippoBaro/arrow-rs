@@ -929,6 +929,12 @@ impl LevelHistogram {
             self.inner[level as usize] += 1;
         }
     }
+
+    /// Increments the count for a level value by `count`.
+    #[inline]
+    pub fn update_n(&mut self, level: i16, count: i64) {
+        self.inner[level as usize] += count;
+    }
 }
 
 impl From<Vec<i64>> for LevelHistogram {
