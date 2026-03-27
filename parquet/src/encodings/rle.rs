@@ -122,6 +122,27 @@ impl RleEncoder {
         bit_packed_max_size.max(rle_max_size)
     }
 
+    /// Returns `true` if the encoder is currently in RLE accumulation mode
+    /// for the given value (i.e., `repeat_count > 8` and `current_value == value`).
+    ///
+    /// When this returns `true`, callers may use [`extend_run`](Self::extend_run)
+    /// to add more repetitions without per-element overhead.
+    #[inline]
+    pub fn is_accumulating(&self, value: u64) -> bool {
+        self.repeat_count > 8 && self.current_value == value
+    }
+
+    /// Extends the current RLE run by `count` additional repetitions.
+    ///
+    /// # Safety contract
+    /// The caller **must** have verified [`is_accumulating`](Self::is_accumulating)
+    /// returns `true` for the same value before calling this method.
+    #[inline]
+    pub fn extend_run(&mut self, count: usize) {
+        debug_assert!(self.repeat_count > 8);
+        self.repeat_count += count;
+    }
+
     /// Encodes `value`, which must be representable with `bit_width` bits.
     #[inline]
     pub fn put(&mut self, value: u64) {
