@@ -125,7 +125,25 @@ impl LevelEncoder {
     /// incrementally across multiple batches without forcing run boundaries.
     /// The encoder is flushed automatically when [`consume`](Self::consume) is called.
     #[inline]
+    #[allow(dead_code)]
     pub fn put(&mut self, buffer: &[i16]) -> usize {
+        self.put_with_observer(buffer, |_, _| {})
+    }
+
+    /// Put/encode levels vector into this level encoder and calls
+    /// `observer(value, count)` for each run of identical values encountered
+    /// during encoding.
+    /// Returns number of encoded values that are less than or equal to length
+    /// of the input buffer.
+    ///
+    /// This method does **not** flush the underlying encoder, so it can be called
+    /// incrementally across multiple batches without forcing run boundaries.
+    /// The encoder is flushed automatically when [`consume`](Self::consume) is called.
+    #[inline]
+    pub fn put_with_observer<F>(&mut self, buffer: &[i16], mut observer: F) -> usize
+    where
+        F: FnMut(i16, usize),
+    {
         match *self {
             LevelEncoder::Rle(ref mut encoder) | LevelEncoder::RleV2(ref mut encoder) => {
                 let len = buffer.len();
@@ -142,22 +160,26 @@ impl LevelEncoder {
                         while run_end < len && buffer[run_end] as u64 == value {
                             run_end += 1;
                         }
-                        encoder.extend_run(run_end - i);
+                        let run_len = run_end - i;
+                        encoder.extend_run(run_len);
+                        observer(buffer[i], run_len);
                         i = run_end;
                     } else {
                         encoder.put(value);
+                        observer(buffer[i], 1);
                         i += 1;
                     }
                 }
-                len
             }
             LevelEncoder::BitPacked(bit_width, ref mut encoder) => {
-                for value in buffer {
-                    encoder.put_value(*value as u64, bit_width as usize);
+                for &value in buffer {
+                    encoder.put_value(value as u64, bit_width as usize);
+                    observer(value, 1);
                 }
-                buffer.len()
             }
         }
+
+        buffer.len()
     }
 
     /// Finalizes level encoder, flush all intermediate buffers and return resulting
