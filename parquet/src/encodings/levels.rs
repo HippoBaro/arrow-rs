@@ -126,22 +126,38 @@ impl LevelEncoder {
     /// The encoder is flushed automatically when [`consume`](Self::consume) is called.
     #[inline]
     pub fn put(&mut self, buffer: &[i16]) -> usize {
-        let mut num_encoded = 0;
         match *self {
             LevelEncoder::Rle(ref mut encoder) | LevelEncoder::RleV2(ref mut encoder) => {
-                for value in buffer {
-                    encoder.put(*value as u64);
-                    num_encoded += 1;
+                let len = buffer.len();
+                let mut i = 0;
+
+                while i < len {
+                    let value = buffer[i] as u64;
+
+                    // When the encoder is already in RLE accumulation mode for
+                    // this value (repeat_count > 8), scan ahead and bulk-extend
+                    // the run without per-element overhead.
+                    if encoder.is_accumulating(value) {
+                        let mut run_end = i + 1;
+                        while run_end < len && buffer[run_end] as u64 == value {
+                            run_end += 1;
+                        }
+                        encoder.extend_run(run_end - i);
+                        i = run_end;
+                    } else {
+                        encoder.put(value);
+                        i += 1;
+                    }
                 }
+                len
             }
             LevelEncoder::BitPacked(bit_width, ref mut encoder) => {
                 for value in buffer {
                     encoder.put_value(*value as u64, bit_width as usize);
-                    num_encoded += 1;
                 }
+                buffer.len()
             }
         }
-        num_encoded
     }
 
     /// Finalizes level encoder, flush all intermediate buffers and return resulting
