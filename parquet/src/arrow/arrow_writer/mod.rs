@@ -817,6 +817,18 @@ enum ArrowColumnWriterImpl {
 impl ArrowColumnWriter {
     /// Write an [`ArrowLeafColumn`]
     pub fn write(&mut self, col: &ArrowLeafColumn) -> Result<()> {
+        // Fast path: all-null column — skip type dispatch and level materialization
+        if let Some((def_val, rep_val, count)) = col.0.uniform_levels() {
+            match &mut self.writer {
+                ArrowColumnWriterImpl::Column(c) => {
+                    c.write_uniform_null_batch(def_val, rep_val, count)?;
+                }
+                ArrowColumnWriterImpl::ByteArray(c) => {
+                    c.write_uniform_null_batch(def_val, rep_val, count)?;
+                }
+            }
+            return Ok(());
+        }
         match &mut self.writer {
             ArrowColumnWriterImpl::Column(c) => {
                 write_leaf(c, &col.0)?;

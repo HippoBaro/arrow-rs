@@ -143,6 +143,30 @@ impl RleEncoder {
         self.repeat_count += count;
     }
 
+    /// Encode `count` repetitions of `value` in O(1) amortized.
+    ///
+    /// Feeds values one at a time until the encoder transitions into RLE
+    /// accumulation mode (`repeat_count > 8`), then bulk-extends the run
+    /// for the remainder. The warm-up loop runs at most ~17 iterations
+    /// regardless of prior encoder state.
+    #[inline]
+    pub fn put_n(&mut self, value: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut remaining = count;
+        // Feed values individually until the encoder enters RLE accumulation
+        // mode for this value, or until we've encoded everything.
+        while remaining > 0 && !self.is_accumulating(value) {
+            self.put(value);
+            remaining -= 1;
+        }
+        // If we're now in accumulation mode, bulk-extend the rest.
+        if remaining > 0 {
+            self.extend_run(remaining);
+        }
+    }
+
     /// Encodes `value`, which must be representable with `bit_width` bits.
     #[inline]
     pub fn put(&mut self, value: u64) {
@@ -1096,6 +1120,47 @@ mod tests {
             let bit_width = bit_util::num_required_bits(values.len() as u64);
             assert!(bit_width < 64);
             test_round_trip(&values[..], bit_width);
+        }
+    }
+
+    #[test]
+    fn test_put_n_after_bit_packed_state() {
+        // Regression test: put_n with warmup=9 can fail to reach
+        // accumulation mode when the encoder has existing bit-packed state.
+        let bit_width = 2; // enough for values 0-3
+        let mut encoder = RleEncoder::new(bit_width, 1024);
+
+        // Put some mixed values to create bit-packed state
+        encoder.put(0);
+        encoder.put(1);
+        encoder.put(2);
+        // Now num_buffered_values=3, bit_packed_count=0
+
+        // Put a large uniform run via put_n
+        let uniform_count = 100;
+        encoder.put_n(3, uniform_count);
+
+        // Flush and decode
+        let encoded = encoder.consume();
+        let mut decoder = RleDecoder::new(bit_width);
+        decoder.set_data(encoded.into()).unwrap();
+
+        let mut decoded = vec![0i32; 3 + uniform_count];
+        let num_read = decoder.get_batch::<i32>(&mut decoded).unwrap();
+        assert_eq!(
+            num_read,
+            3 + uniform_count,
+            "Expected {} values but only decoded {}",
+            3 + uniform_count,
+            num_read
+        );
+
+        // Verify values
+        assert_eq!(decoded[0], 0);
+        assert_eq!(decoded[1], 1);
+        assert_eq!(decoded[2], 2);
+        for i in 3..3 + uniform_count {
+            assert_eq!(decoded[i], 3, "Mismatch at index {i}");
         }
     }
 }

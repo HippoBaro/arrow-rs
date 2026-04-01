@@ -100,6 +100,18 @@ impl ColumnWriter<'_> {
         downcast_writer!(self, typed, typed.get_estimated_total_bytes())
     }
 
+    /// Fast path for entirely-null columns. See
+    /// [`GenericColumnWriter::write_uniform_null_batch`].
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_uniform_null_batch(
+        &mut self,
+        def_val: i16,
+        rep_val: i16,
+        count: usize,
+    ) -> Result<usize> {
+        downcast_writer!(self, typed, typed.write_uniform_null_batch(def_val, rep_val, count))
+    }
+
     /// Close this [`ColumnWriter`], returning the metadata for the column chunk.
     pub fn close(self) -> Result<ColumnCloseResult> {
         downcast_writer!(self, typed, typed.close())
@@ -487,6 +499,45 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         // Return total number of values processed.
         Ok(values_offset)
+    }
+
+    /// Fast path for entirely-null columns: encodes `count` uniform
+    /// def/rep levels via [`LevelEncoder::put_n_with_observer`] without
+    /// materializing any level Vec or chunking into mini-batches.
+    ///
+    /// Returns 0 (zero non-null values written).
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_uniform_null_batch(
+        &mut self,
+        def_val: i16,
+        rep_val: i16,
+        count: usize,
+    ) -> Result<usize> {
+        if self.descr.max_def_level() > 0 {
+            self.def_levels_encoder
+                .put_n_with_observer(def_val, count, |level, cnt| {
+                    if let Some(ref mut h) = self.page_metrics.definition_level_histogram {
+                        h.update_n(level, cnt as i64);
+                    }
+                });
+            self.page_metrics.num_page_nulls += count as u64;
+        }
+        if self.descr.max_rep_level() > 0 {
+            self.rep_levels_encoder
+                .put_n_with_observer(rep_val, count, |level, cnt| {
+                    if let Some(ref mut h) = self.page_metrics.repetition_level_histogram {
+                        h.update_n(level, cnt as i64);
+                    }
+                });
+            self.page_metrics.num_buffered_rows += if rep_val == 0 { count as u32 } else { 0 };
+        } else {
+            self.page_metrics.num_buffered_rows += count as u32;
+        }
+        self.page_metrics.num_buffered_values += count as u32;
+        if self.should_add_data_page() {
+            self.add_data_page()?;
+        }
+        Ok(0)
     }
 
     /// Writes batch of values, definition levels and repetition levels.

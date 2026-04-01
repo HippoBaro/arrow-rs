@@ -267,6 +267,33 @@ impl LevelInfoBuilder {
         nulls: Option<&NullBuffer>,
         range: Range<usize>,
     ) {
+        // Fast path: entire list array is null — emit bulk null rep/def levels
+        if let Some(nulls) = nulls {
+            if nulls.null_count() == nulls.len() {
+                let count = range.end - range.start;
+                let rep_val = ctx.rep_level - 1;
+                let def_val = ctx.def_level - 2;
+                child.visit_leaves(|leaf| {
+                    if leaf.def_levels.as_ref().is_none_or(|d| d.is_empty())
+                        && leaf.rep_levels.as_ref().is_none_or(|r| r.is_empty())
+                        && leaf.non_null_indices.is_empty()
+                    {
+                        leaf.uniform_levels = Some((def_val, rep_val, count));
+                    } else {
+                        leaf.rep_levels
+                            .as_mut()
+                            .unwrap()
+                            .extend(std::iter::repeat_n(rep_val, count));
+                        leaf.def_levels
+                            .as_mut()
+                            .unwrap()
+                            .extend(std::iter::repeat_n(def_val, count));
+                    }
+                });
+                return;
+            }
+        }
+
         let offsets = &offsets[range.start..range.end + 1];
 
         let write_non_null_slice =
@@ -378,6 +405,34 @@ impl LevelInfoBuilder {
         nulls: Option<&NullBuffer>,
         range: Range<usize>,
     ) {
+        // Fast path: entire struct array is null — emit bulk null def/rep levels
+        if let Some(nulls) = nulls {
+            if nulls.null_count() == nulls.len() {
+                let len = range.end - range.start;
+                let def_val = ctx.def_level - 1;
+                let rep_val = ctx.rep_level;
+                for child in children.iter_mut() {
+                    child.visit_leaves(|info| {
+                        if info.def_levels.as_ref().is_none_or(|d| d.is_empty())
+                            && info.rep_levels.as_ref().is_none_or(|r| r.is_empty())
+                            && info.non_null_indices.is_empty()
+                        {
+                            info.uniform_levels = Some((def_val, rep_val, len));
+                        } else {
+                            info.def_levels
+                                .as_mut()
+                                .unwrap()
+                                .extend(std::iter::repeat_n(def_val, len));
+                            if let Some(rep_levels) = info.rep_levels.as_mut() {
+                                rep_levels.extend(std::iter::repeat_n(rep_val, len));
+                            }
+                        }
+                    });
+                }
+                return;
+            }
+        }
+
         let write_null = |children: &mut [LevelInfoBuilder], range: Range<usize>| {
             for child in children {
                 child.visit_leaves(|info| {
@@ -442,6 +497,33 @@ impl LevelInfoBuilder {
         nulls: Option<&NullBuffer>,
         range: Range<usize>,
     ) {
+        // Fast path: entire fixed-size list array is null
+        if let Some(nulls) = nulls {
+            if nulls.null_count() == nulls.len() {
+                let count = range.end - range.start;
+                let rep_val = ctx.rep_level - 1;
+                let def_val = ctx.def_level - 2;
+                child.visit_leaves(|leaf| {
+                    if leaf.def_levels.as_ref().is_none_or(|d| d.is_empty())
+                        && leaf.rep_levels.as_ref().is_none_or(|r| r.is_empty())
+                        && leaf.non_null_indices.is_empty()
+                    {
+                        leaf.uniform_levels = Some((def_val, rep_val, count));
+                    } else {
+                        leaf.rep_levels
+                            .as_mut()
+                            .unwrap()
+                            .extend(std::iter::repeat_n(rep_val, count));
+                        leaf.def_levels
+                            .as_mut()
+                            .unwrap()
+                            .extend(std::iter::repeat_n(def_val, count));
+                    }
+                });
+                return;
+            }
+        }
+
         let write_non_null = |child: &mut LevelInfoBuilder, start_idx: usize, end_idx: usize| {
             let values_start = start_idx * fixed_size;
             let values_end = end_idx * fixed_size;
@@ -527,10 +609,26 @@ impl LevelInfoBuilder {
         match &mut info.def_levels {
             Some(def_levels) => {
                 def_levels.reserve(len);
-                info.non_null_indices.reserve(len);
 
                 match &info.logical_nulls {
+                    Some(nulls) if nulls.null_count() == nulls.len() => {
+                        // Fast path: entire array is null
+                        let def_val = info.max_def_level - 1;
+                        let rep_val = info.max_rep_level;
+                        // Use uniform_levels (O(1)) if Vecs are still empty
+                        if def_levels.is_empty()
+                            && info.rep_levels.as_ref().is_none_or(|r| r.is_empty())
+                            && info.non_null_indices.is_empty()
+                        {
+                            info.uniform_levels = Some((def_val, rep_val, len));
+                            return;
+                        }
+                        // Fallback: materialization for incremental writes
+                        def_levels.extend(std::iter::repeat_n(def_val, len));
+                        // non_null_indices: nothing to add (all null)
+                    }
                     Some(nulls) => {
+                        info.non_null_indices.reserve(len);
                         assert!(range.end <= nulls.len());
                         let nulls = nulls.inner();
                         def_levels.extend(range.clone().map(|i| {
@@ -544,6 +642,7 @@ impl LevelInfoBuilder {
                         );
                     }
                     None => {
+                        info.non_null_indices.reserve(len);
                         let iter = std::iter::repeat_n(info.max_def_level, len);
                         def_levels.extend(iter);
                         info.non_null_indices.extend(range);
@@ -648,6 +747,11 @@ pub(crate) struct ArrayLevels {
 
     /// cached logical nulls of the array.
     logical_nulls: Option<NullBuffer>,
+
+    /// When set, all def/rep levels are a single repeated value and the
+    /// Vec fields above are empty. Tuple: (def_value, rep_value, count).
+    /// This avoids materializing large Vecs for entirely-null columns.
+    uniform_levels: Option<(i16, i16, usize)>,
 }
 
 impl PartialEq for ArrayLevels {
@@ -659,6 +763,7 @@ impl PartialEq for ArrayLevels {
             && self.max_rep_level == other.max_rep_level
             && self.array.as_ref() == other.array.as_ref()
             && self.logical_nulls.as_ref() == other.logical_nulls.as_ref()
+            && self.uniform_levels == other.uniform_levels
     }
 }
 impl Eq for ArrayLevels {}
@@ -681,6 +786,7 @@ impl ArrayLevels {
             max_rep_level,
             array,
             logical_nulls,
+            uniform_levels: None,
         }
     }
 
@@ -698,6 +804,12 @@ impl ArrayLevels {
 
     pub fn non_null_indices(&self) -> &[usize] {
         &self.non_null_indices
+    }
+
+    /// If all levels are uniform (e.g., column is entirely null), returns
+    /// `(def_level_value, rep_level_value, count)` without materializing any Vec.
+    pub fn uniform_levels(&self) -> Option<(i16, i16, usize)> {
+        self.uniform_levels
     }
 }
 
@@ -755,6 +867,7 @@ mod tests {
             max_rep_level: 2,
             array: Arc::new(primitives),
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected);
     }
@@ -776,6 +889,7 @@ mod tests {
             max_rep_level: 0,
             array,
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected_levels);
     }
@@ -804,6 +918,7 @@ mod tests {
             max_rep_level: 0,
             array,
             logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected_levels);
     }
@@ -839,6 +954,7 @@ mod tests {
             max_rep_level: 1,
             array: Arc::new(leaf_array),
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected_levels);
 
@@ -873,6 +989,7 @@ mod tests {
             max_rep_level: 1,
             array: Arc::new(leaf_array),
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected_levels);
     }
@@ -923,6 +1040,7 @@ mod tests {
             max_rep_level: 1,
             array: Arc::new(leaf),
             logical_nulls: None,
+            uniform_levels: None,
         };
 
         assert_eq!(&levels[0], &expected_levels);
@@ -974,6 +1092,7 @@ mod tests {
             max_rep_level: 2,
             array: Arc::new(leaf),
             logical_nulls: None,
+            uniform_levels: None,
         };
 
         assert_eq!(&levels[0], &expected_levels);
@@ -1012,6 +1131,7 @@ mod tests {
             max_rep_level: 1,
             array: Arc::new(leaf),
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected_levels);
 
@@ -1045,6 +1165,7 @@ mod tests {
             max_rep_level: 1,
             array: Arc::new(leaf),
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected_levels);
 
@@ -1094,6 +1215,7 @@ mod tests {
             max_rep_level: 2,
             array: Arc::new(leaf),
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected_levels);
     }
@@ -1135,6 +1257,7 @@ mod tests {
             max_rep_level: 0,
             array: leaf,
             logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(&levels[0], &expected_levels);
     }
@@ -1175,6 +1298,7 @@ mod tests {
             max_rep_level: 1,
             array: Arc::new(a_values),
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
     }
@@ -1268,6 +1392,7 @@ mod tests {
             max_rep_level: 0,
             array: Arc::new(a),
             logical_nulls: None,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
 
@@ -1283,6 +1408,7 @@ mod tests {
             max_rep_level: 0,
             array: Arc::new(b),
             logical_nulls: b_logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
 
@@ -1298,6 +1424,7 @@ mod tests {
             max_rep_level: 0,
             array: Arc::new(d),
             logical_nulls: d_logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
 
@@ -1313,6 +1440,7 @@ mod tests {
             max_rep_level: 0,
             array: Arc::new(f),
             logical_nulls: f_logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
     }
@@ -1421,6 +1549,7 @@ mod tests {
             max_rep_level: 1,
             array: map.keys().clone(),
             logical_nulls: map_keys_logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
 
@@ -1436,6 +1565,7 @@ mod tests {
             max_rep_level: 1,
             array: map.values().clone(),
             logical_nulls: map_values_logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
     }
@@ -1523,6 +1653,7 @@ mod tests {
             max_rep_level: 1,
             array: values,
             logical_nulls,
+            uniform_levels: None,
         };
 
         assert_eq!(list_level, &expected_level);
@@ -1565,6 +1696,7 @@ mod tests {
             max_rep_level: 1,
             array: values,
             logical_nulls,
+            uniform_levels: None,
         };
 
         assert_eq!(&levels[0], &expected_level);
@@ -1652,6 +1784,7 @@ mod tests {
             max_rep_level: 2,
             array: a1_values,
             logical_nulls: a1_logical_nulls,
+            uniform_levels: None,
         };
 
         assert_eq!(&levels[0], &expected_level);
@@ -1665,6 +1798,7 @@ mod tests {
             max_rep_level: 1,
             array: a2_values,
             logical_nulls: a2_logical_nulls,
+            uniform_levels: None,
         };
 
         assert_eq!(&levels[1], &expected_level);
@@ -1705,6 +1839,7 @@ mod tests {
             max_rep_level: 1,
             array: values,
             logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
     }
@@ -1857,6 +1992,7 @@ mod tests {
             max_rep_level: 1,
             array: values_a,
             logical_nulls: values_a_logical_nulls,
+            uniform_levels: None,
         };
         // [[{b: 2}, null], null, [null, null], [{b: 3}, {b: 4}]]
         let values_b_logical_nulls = values_b.logical_nulls();
@@ -1868,6 +2004,7 @@ mod tests {
             max_rep_level: 1,
             array: values_b,
             logical_nulls: values_b_logical_nulls,
+            uniform_levels: None,
         };
 
         assert_eq!(a_levels, &expected_a);
@@ -1901,6 +2038,7 @@ mod tests {
             max_rep_level: 1,
             array: values,
             logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(list_level, &expected_level);
     }
@@ -1938,6 +2076,7 @@ mod tests {
             max_rep_level: 2,
             array: values,
             logical_nulls,
+            uniform_levels: None,
         };
 
         assert_eq!(levels[0], expected_level);
@@ -1971,6 +2110,7 @@ mod tests {
             max_rep_level: 0,
             array: Arc::new(dict),
             logical_nulls,
+            uniform_levels: None,
         };
         assert_eq!(levels[0], expected_level);
     }

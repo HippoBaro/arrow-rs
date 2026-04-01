@@ -182,6 +182,28 @@ impl LevelEncoder {
         buffer.len()
     }
 
+    /// Encode `count` repetitions of a single level value, calling
+    /// `observer(value, count)` exactly once.
+    ///
+    /// This is O(1) amortized for RLE-based encoders (after a small warmup).
+    #[inline]
+    pub fn put_n_with_observer<F>(&mut self, value: i16, count: usize, mut observer: F)
+    where
+        F: FnMut(i16, usize),
+    {
+        match *self {
+            LevelEncoder::Rle(ref mut encoder) | LevelEncoder::RleV2(ref mut encoder) => {
+                encoder.put_n(value as u64, count);
+            }
+            LevelEncoder::BitPacked(bit_width, ref mut encoder) => {
+                for _ in 0..count {
+                    encoder.put_value(value as u64, bit_width as usize);
+                }
+            }
+        }
+        observer(value, count);
+    }
+
     /// Finalizes level encoder, flush all intermediate buffers and return resulting
     /// encoded buffer. Returned buffer is already truncated to encoded bytes only.
     #[inline]
