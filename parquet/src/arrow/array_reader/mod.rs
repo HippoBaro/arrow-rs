@@ -132,6 +132,14 @@ pub trait ArrayReader: Send {
     ///
     /// This is used by parent [`ArrayReader`] to compute their array offsets
     fn get_rep_levels(&self) -> Option<&[i16]>;
+
+    /// Enable or disable null padding in the underlying record reader.
+    /// When disabled, the reader produces compact (non-null-padded) value buffers.
+    /// Returns true if the setting was applied, false if this reader does not
+    /// support skip-padding mode.
+    fn set_skip_padding(&mut self, _skip: bool) -> bool {
+        false
+    }
 }
 
 /// Interface for reading data pages from the columns of one or more RowGroups.

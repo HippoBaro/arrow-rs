@@ -256,7 +256,7 @@ impl<'a> ArrayReaderBuilder<'a> {
         assert_eq!(children.len(), 1);
 
         let reader = match self.build_reader(&children[0], mask)? {
-            Some(item_reader) => {
+            Some(mut item_reader) => {
                 // Need to retrieve underlying data type to handle projection
                 let item_type = item_reader.get_data_type().clone();
                 let data_type = match &field.arrow_type {
@@ -269,21 +269,35 @@ impl<'a> ArrayReaderBuilder<'a> {
                     _ => unreachable!(),
                 };
 
+                // Try to enable skip_padding on the child reader. If the child
+                // supports it (leaf readers with a record reader), it will
+                // produce compact (unpadded) values and the list reader uses
+                // the direct offset-building path.
+                let unpadded = item_reader.set_skip_padding(true);
+
                 let reader = match is_large {
-                    false => Box::new(ListArrayReader::<i32>::new(
-                        item_reader,
-                        data_type,
-                        field.def_level,
-                        field.rep_level,
-                        field.nullable,
-                    )) as _,
-                    true => Box::new(ListArrayReader::<i64>::new(
-                        item_reader,
-                        data_type,
-                        field.def_level,
-                        field.rep_level,
-                        field.nullable,
-                    )) as _,
+                    false => {
+                        let mut r = ListArrayReader::<i32>::new(
+                            item_reader,
+                            data_type,
+                            field.def_level,
+                            field.rep_level,
+                            field.nullable,
+                        );
+                        r.set_unpadded_child(unpadded);
+                        Box::new(r) as _
+                    }
+                    true => {
+                        let mut r = ListArrayReader::<i64>::new(
+                            item_reader,
+                            data_type,
+                            field.def_level,
+                            field.rep_level,
+                            field.nullable,
+                        );
+                        r.set_unpadded_child(unpadded);
+                        Box::new(r) as _
+                    }
                 };
                 Some(reader)
             }

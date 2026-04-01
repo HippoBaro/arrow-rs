@@ -58,6 +58,13 @@ pub struct GenericRecordReader<V, CV> {
     num_values: usize,
     /// Number of buffered records
     num_records: usize,
+    /// Number of actual values written to the values buffer (excluding null padding).
+    /// Only differs from num_values when `skip_padding` is true.
+    values_written: usize,
+    /// When true, `pad_nulls` is skipped and the values buffer contains only
+    /// actual (non-null) values. Used by ListArrayReader to avoid the
+    /// pad-then-filter round-trip.
+    skip_padding: bool,
 }
 
 impl<V, CV> GenericRecordReader<V, CV>
@@ -80,6 +87,8 @@ where
             column_desc: desc,
             num_values: 0,
             num_records: 0,
+            values_written: 0,
+            skip_padding: false,
         }
     }
 
@@ -185,6 +194,29 @@ where
     pub fn reset(&mut self) {
         self.num_values = 0;
         self.num_records = 0;
+        self.values_written = 0;
+    }
+
+    /// Enable or disable null padding. When disabled, the values buffer contains
+    /// only actual (non-null) values and `values_written()` returns their count.
+    pub fn set_skip_padding(&mut self, skip: bool) {
+        self.skip_padding = skip;
+    }
+
+    /// Returns true if null padding is being skipped.
+    pub fn skip_padding(&self) -> bool {
+        self.skip_padding
+    }
+
+    /// Returns the number of actual values in the values buffer.
+    /// When `skip_padding` is false, this equals `num_values`.
+    /// When `skip_padding` is true, this is the count of non-null values only.
+    pub fn values_written(&self) -> usize {
+        if self.skip_padding {
+            self.values_written
+        } else {
+            self.num_values
+        }
     }
 
     /// Returns bitmap data for nullable columns.
@@ -216,7 +248,7 @@ where
                 &mut self.values,
             )?;
 
-        if values_read < levels_read {
+        if values_read < levels_read && !self.skip_padding {
             let def_levels = self.def_levels.as_ref().ok_or_else(|| {
                 general_err!("Definition levels should exist when data is less than levels!")
             })?;
@@ -231,6 +263,7 @@ where
 
         self.num_records += records_read;
         self.num_values += levels_read;
+        self.values_written += values_read;
         Ok(records_read)
     }
 }

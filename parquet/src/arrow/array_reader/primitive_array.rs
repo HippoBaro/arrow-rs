@@ -212,10 +212,19 @@ where
             .consume_record_data()
             .into_buffer(target_type);
 
+        let len = self.record_reader.values_written();
+        // When skip_padding is active, suppress the null bitmap — the parent
+        // list reader handles nullness via def/rep levels.
+        let null_bitmap = if self.record_reader.skip_padding() {
+            None
+        } else {
+            self.record_reader.consume_bitmap_buffer()
+        };
+
         let array_data = ArrayDataBuilder::new(arrow_data_type)
-            .len(self.record_reader.num_values())
+            .len(len)
             .add_buffer(record_data)
-            .null_bit_buffer(self.record_reader.consume_bitmap_buffer());
+            .null_bit_buffer(null_bitmap);
 
         let array_data = unsafe { array_data.build_unchecked() };
         let array: ArrayRef = match T::get_physical_type() {
@@ -501,6 +510,11 @@ where
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
         self.rep_levels_buffer.as_deref()
+    }
+
+    fn set_skip_padding(&mut self, skip: bool) -> bool {
+        self.record_reader.set_skip_padding(skip);
+        true
     }
 }
 

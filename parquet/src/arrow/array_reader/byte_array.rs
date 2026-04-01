@@ -114,7 +114,13 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
         let buffer = self.record_reader.consume_record_data();
-        let null_buffer = self.record_reader.consume_bitmap_buffer();
+        // When skip_padding is active, suppress the null bitmap — the parent
+        // list reader handles nullness via def/rep levels.
+        let null_buffer = if self.record_reader.skip_padding() {
+            None
+        } else {
+            self.record_reader.consume_bitmap_buffer()
+        };
         self.def_levels_buffer = self.record_reader.consume_def_levels();
         self.rep_levels_buffer = self.record_reader.consume_rep_levels();
         self.record_reader.reset();
@@ -163,6 +169,11 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
         self.rep_levels_buffer.as_deref()
+    }
+
+    fn set_skip_padding(&mut self, skip: bool) -> bool {
+        self.record_reader.set_skip_padding(skip);
+        true
     }
 }
 

@@ -41,6 +41,9 @@ pub struct ListArrayReader<OffsetSize: OffsetSizeTrait> {
     rep_level: i16,
     /// If this list is nullable
     nullable: bool,
+    /// When true, the child reader produces unpadded (compact) values and
+    /// consume_batch builds the list directly without MutableArrayData.
+    unpadded_child: bool,
     _marker: PhantomData<OffsetSize>,
 }
 
@@ -59,29 +62,21 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             def_level,
             rep_level,
             nullable,
+            unpadded_child: false,
             _marker: PhantomData,
         }
     }
-}
 
-/// Implementation of ListArrayReader. Nested lists and lists of structs are not yet supported.
-impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
-    fn as_any(&self) -> &dyn Any {
-        self
+    /// Enable unpadded child mode. When set, the child reader is expected to
+    /// produce compact (non-null-padded) arrays, and consume_batch will build
+    /// the list directly without the MutableArrayData filtering pass.
+    pub fn set_unpadded_child(&mut self, unpadded: bool) {
+        self.unpadded_child = unpadded;
     }
 
-    /// Returns data type.
-    /// This must be a List.
-    fn get_data_type(&self) -> &ArrowType {
-        &self.data_type
-    }
-
-    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
-        let size = self.item_reader.read_records(batch_size)?;
-        Ok(size)
-    }
-
-    fn consume_batch(&mut self) -> Result<ArrayRef> {
+    /// Consume batch when the child reader produces padded (null-expanded) values.
+    /// This is the original code path using MutableArrayData to filter out padding.
+    fn consume_batch_padded(&mut self) -> Result<ArrayRef> {
         let next_batch_array = self.item_reader.consume_batch()?;
         if next_batch_array.is_empty() {
             return Ok(new_empty_array(&self.data_type));
@@ -105,43 +100,19 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
         }
 
         if !rep_levels.is_empty() && rep_levels[0] != 0 {
-            // This implies either the source data was invalid, or the leaf column
-            // reader did not correctly delimit semantic records
             return Err(general_err!("first repetition level of batch must be 0"));
         }
 
-        // A non-nullable list has a single definition level indicating if the list is empty
-        //
-        // A nullable list has two definition levels associated with it:
-        //
-        // The first identifies if the list is null
-        // The second identifies if the list is empty
-        //
-        // The child data returned above is padded with a value for each not-fully defined level.
-        // Therefore null and empty lists will correspond to a value in the child array.
-        //
-        // Whilst nulls may have a non-zero slice in the offsets array, empty lists must
-        // be of zero length. As a result we MUST filter out values corresponding to empty
-        // lists, and for consistency we do the same for nulls.
-
-        // The output offsets for the computed ListArray
         let mut list_offsets: Vec<OffsetSize> = Vec::with_capacity(next_batch_array.len() + 1);
 
-        // The validity mask of the computed ListArray if nullable
         let mut validity = self
             .nullable
             .then(|| BooleanBufferBuilder::new(next_batch_array.len()));
 
-        // The offset into the filtered child data of the current level being considered
         let mut cur_offset = 0;
-
-        // Identifies the start of a run of values to copy from the source child data
         let mut filter_start = None;
-
-        // The number of child values skipped due to empty lists or nulls
         let mut skipped = 0;
 
-        // Builder used to construct the filtered child data, skipping empty lists and nulls
         let data = next_batch_array.to_data();
         let mut child_data_builder =
             MutableArrayData::new(vec![&data], false, next_batch_array.len());
@@ -149,7 +120,6 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
         def_levels.iter().zip(rep_levels).try_for_each(|(d, r)| {
             match r.cmp(&self.rep_level) {
                 Ordering::Greater => {
-                    // Repetition level greater than current => already handled by inner array
                     if *d < self.def_level {
                         return Err(general_err!(
                             "Encountered repetition level too large for definition level"
@@ -157,33 +127,24 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                     }
                 }
                 Ordering::Equal => {
-                    // New value in the current list
                     cur_offset += 1;
                 }
                 Ordering::Less => {
-                    // Create new array slice
-                    // Already checked that this cannot overflow
                     list_offsets.push(OffsetSize::from_usize(cur_offset).unwrap());
 
                     if *d >= self.def_level {
-                        // Fully defined value
-
-                        // Record current offset if it is None
                         filter_start.get_or_insert(cur_offset + skipped);
-
                         cur_offset += 1;
 
                         if let Some(validity) = validity.as_mut() {
                             validity.append(true)
                         }
                     } else {
-                        // Flush the current slice of child values if any
                         if let Some(start) = filter_start.take() {
                             child_data_builder.extend(0, start, cur_offset + skipped);
                         }
 
                         if let Some(validity) = validity.as_mut() {
-                            // Valid if empty list
                             validity.append(*d + 1 == self.def_level)
                         }
 
@@ -197,10 +158,8 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
         list_offsets.push(OffsetSize::from_usize(cur_offset).unwrap());
 
         let child_data = if skipped == 0 {
-            // No filtered values - can reuse original array
             next_batch_array.to_data()
         } else {
-            // One or more filtered values - must build new array
             if let Some(start) = filter_start.take() {
                 child_data_builder.extend(0, start, cur_offset + skipped)
             }
@@ -228,6 +187,188 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
 
         let result_array = GenericListArray::<OffsetSize>::from(list_data);
         Ok(Arc::new(result_array))
+    }
+
+    /// Consume batch when the child reader produces unpadded (compact) values.
+    ///
+    /// The compact child array contains only values where def == max_def_level.
+    /// Entries for null lists are absent, and entries for null items within
+    /// non-null lists are also absent. This method reconstructs the list
+    /// structure using def/rep levels, re-inserting null item entries via a
+    /// MutableArrayData sized to the compact array (much smaller than the
+    /// fully-padded size for sparse columns).
+    fn consume_batch_unpadded(&mut self) -> Result<ArrayRef> {
+        let compact_array = self.item_reader.consume_batch()?;
+
+        let def_levels = self
+            .item_reader
+            .get_def_levels()
+            .ok_or_else(|| general_err!("item_reader def levels are None."))?;
+
+        let rep_levels = self
+            .item_reader
+            .get_rep_levels()
+            .ok_or_else(|| general_err!("item_reader rep levels are None."))?;
+
+        if def_levels.is_empty() {
+            return Ok(new_empty_array(&self.data_type));
+        }
+
+        if rep_levels[0] != 0 {
+            return Err(general_err!("first repetition level of batch must be 0"));
+        }
+
+        // Max definition level for the leaf. Only entries at this level have
+        // actual values in the compact array.
+        let max_def_level = def_levels.iter().max().copied().unwrap_or(self.def_level);
+
+        // Whether items within non-null lists can themselves be null.
+        let items_nullable = max_def_level > self.def_level;
+
+        let mut list_offsets: Vec<OffsetSize> = Vec::new();
+        let mut validity = self
+            .nullable
+            .then(|| BooleanBufferBuilder::new(def_levels.len()));
+
+        let mut cur_offset: usize = 0; // position in output child array
+        let mut compact_idx: usize = 0; // position in compact input array
+
+        // When items are nullable, use MutableArrayData to re-insert null entries.
+        // Sized to the compact array length (not the full padded row count).
+        let compact_data = compact_array.to_data();
+        let mut child_builder = items_nullable.then(|| {
+            MutableArrayData::new(vec![&compact_data], true, compact_array.len())
+        });
+
+        // Track the start of a run of consecutive compact values for batched extends.
+        let mut run_start: Option<usize> = None;
+
+        for (d, r) in def_levels.iter().zip(rep_levels) {
+            let is_list_boundary = *r < self.rep_level;
+            let list_exists = *d >= self.def_level;
+            let value_exists = *d >= max_def_level;
+
+            if is_list_boundary {
+                // Flush any pending run of values before starting a new record.
+                if let (Some(builder), Some(start)) =
+                    (child_builder.as_mut(), run_start.take())
+                {
+                    builder.extend(0, start, compact_idx);
+                }
+
+                list_offsets.push(
+                    OffsetSize::from_usize(cur_offset)
+                        .ok_or_else(|| general_err!("offset overflow"))?,
+                );
+
+                if list_exists {
+                    if let Some(v) = validity.as_mut() {
+                        v.append(true);
+                    }
+                    if value_exists {
+                        run_start.get_or_insert(compact_idx);
+                        compact_idx += 1;
+                        cur_offset += 1;
+                    } else if items_nullable {
+                        child_builder.as_mut().unwrap().extend_nulls(1);
+                        cur_offset += 1;
+                    }
+                } else {
+                    if let Some(v) = validity.as_mut() {
+                        v.append(*d + 1 == self.def_level);
+                    }
+                }
+            } else if list_exists {
+                // Continuation within a non-null list
+                if value_exists {
+                    run_start.get_or_insert(compact_idx);
+                    compact_idx += 1;
+                    cur_offset += 1;
+                } else if items_nullable {
+                    // Null item — flush run and insert null
+                    if let (Some(builder), Some(start)) =
+                        (child_builder.as_mut(), run_start.take())
+                    {
+                        builder.extend(0, start, compact_idx);
+                    }
+                    child_builder.as_mut().unwrap().extend_nulls(1);
+                    cur_offset += 1;
+                }
+            }
+        }
+
+        list_offsets.push(
+            OffsetSize::from_usize(cur_offset)
+                .ok_or_else(|| general_err!("offset overflow"))?,
+        );
+
+        assert_eq!(
+            compact_idx,
+            compact_array.len(),
+            "not all compact values consumed: used {compact_idx}, have {}",
+            compact_array.len()
+        );
+
+        let child_data = if let Some(mut builder) = child_builder {
+            // Flush final run
+            if let Some(start) = run_start {
+                builder.extend(0, start, compact_idx);
+            }
+            builder.freeze()
+        } else {
+            // No nullable items — compact array IS the child data
+            compact_array.to_data()
+        };
+
+        if cur_offset != child_data.len() {
+            return Err(general_err!(
+                "Failed to reconstruct list from level data: \
+                 expected {} child values but got {}",
+                cur_offset,
+                child_data.len()
+            ));
+        }
+
+        let value_offsets = Buffer::from(list_offsets.to_byte_slice());
+
+        let mut data_builder = ArrayData::builder(self.get_data_type().clone())
+            .len(list_offsets.len() - 1)
+            .add_buffer(value_offsets)
+            .add_child_data(child_data);
+
+        if let Some(builder) = validity {
+            assert_eq!(builder.len(), list_offsets.len() - 1);
+            data_builder = data_builder.null_bit_buffer(Some(builder.into()));
+        }
+
+        let list_data = unsafe { data_builder.build_unchecked() };
+        Ok(Arc::new(GenericListArray::<OffsetSize>::from(list_data)))
+    }
+}
+
+/// Implementation of ListArrayReader. Nested lists and lists of structs are not yet supported.
+impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    /// Returns data type.
+    /// This must be a List.
+    fn get_data_type(&self) -> &ArrowType {
+        &self.data_type
+    }
+
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        let size = self.item_reader.read_records(batch_size)?;
+        Ok(size)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        if self.unpadded_child {
+            self.consume_batch_unpadded()
+        } else {
+            self.consume_batch_padded()
+        }
     }
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
