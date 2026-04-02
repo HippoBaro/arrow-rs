@@ -160,10 +160,34 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
                 let start = levels.len();
                 let (values_read, levels_read) = decoder.read_def_levels(levels, num_levels)?;
 
-                nulls.reserve(levels_read);
-                for i in &levels[start..] {
-                    nulls.append(i == max_level);
+                // Build the null bitmap from decoded levels in bulk.
+                // Instead of calling nulls.append() per level (which does
+                // advance + conditional set_bit_raw each time), we pack 8
+                // comparison results into a byte and append via
+                // append_packed_range, amortizing the BooleanBufferBuilder
+                // overhead.
+                let decoded = &levels[start..start + levels_read];
+                let num_full_bytes = decoded.len() / 8;
+                let remainder = decoded.len() % 8;
+
+                let mut packed = Vec::with_capacity(num_full_bytes + (remainder > 0) as usize);
+                let chunks = decoded.chunks_exact(8);
+                let tail = chunks.remainder();
+                for chunk in chunks {
+                    let mut byte = 0u8;
+                    for (j, val) in chunk.iter().enumerate() {
+                        byte |= ((*val == *max_level) as u8) << j;
+                    }
+                    packed.push(byte);
                 }
+                if !tail.is_empty() {
+                    let mut byte = 0u8;
+                    for (j, val) in tail.iter().enumerate() {
+                        byte |= ((*val == *max_level) as u8) << j;
+                    }
+                    packed.push(byte);
+                }
+                nulls.append_packed_range(0..decoded.len(), &packed);
 
                 Ok((values_read, levels_read))
             }

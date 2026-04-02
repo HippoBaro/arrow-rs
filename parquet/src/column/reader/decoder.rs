@@ -394,19 +394,59 @@ impl RepetitionLevelDecoderImpl {
     /// A "complete" record is one where the buffer contains a subsequent repetition level of 0
     fn count_records(&mut self, records_to_read: usize, num_levels: usize) -> (bool, usize, usize) {
         let mut records_read = 0;
-
         let levels = num_levels.min(self.buffer_len - self.buffer_offset);
-        let buf = self.buffer.iter().skip(self.buffer_offset);
-        for (idx, item) in buf.take(levels).enumerate() {
-            if *item == 0 && (idx != 0 || self.has_partial) {
-                records_read += 1;
+        let buf = &self.buffer[self.buffer_offset..self.buffer_offset + levels];
 
+        // Process 4 i16 values at a time by reading them as a u64 word.
+        // A word contains a zero i16 iff any of its 16-bit lanes is zero,
+        // which we detect with the standard "has zero byte" trick adapted
+        // for 16-bit lanes. Words with no zeros are skipped entirely.
+        const LANES: usize = 4; // 4 × i16 = 8 bytes = 1 × u64
+        let mut idx = 0;
+
+        while idx + LANES <= buf.len() {
+            // Safety: buf is &[i16] aligned to at least 2 bytes; reading 4
+            // contiguous i16 values as a u64 is safe via ptr::read_unaligned.
+            let word = unsafe {
+                (buf.as_ptr().add(idx) as *const u64).read_unaligned()
+            };
+
+            // Check if any 16-bit lane is zero using the "has zero word" trick:
+            // For 16-bit lanes: a lane is zero iff subtracting 1 produces a
+            // borrow into the high bit AND the original lane had no high bit set.
+            const LO: u64 = 0x0001_0001_0001_0001;
+            const HI: u64 = 0x8000_8000_8000_8000;
+            let has_zero = (word.wrapping_sub(LO)) & !word & HI;
+
+            if has_zero == 0 {
+                // No zeros in this word — skip all 4 elements
+                idx += LANES;
+                continue;
+            }
+
+            // At least one zero — inspect elements individually
+            for j in 0..LANES {
+                if buf[idx + j] == 0 && (idx + j != 0 || self.has_partial) {
+                    records_read += 1;
+                    if records_read == records_to_read {
+                        return (false, records_read, idx + j);
+                    }
+                }
+            }
+            idx += LANES;
+        }
+
+        // Handle remaining elements
+        while idx < buf.len() {
+            if buf[idx] == 0 && (idx != 0 || self.has_partial) {
+                records_read += 1;
                 if records_read == records_to_read {
                     return (false, records_read, idx);
                 }
             }
+            idx += 1;
         }
-        // Either ran out of space in `num_levels` or data in `self.buffer`
+
         (true, records_read, levels)
     }
 }
