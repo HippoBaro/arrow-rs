@@ -230,101 +230,140 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             .nullable
             .then(|| BooleanBufferBuilder::new(def_levels.len()));
 
-        let mut cur_offset: usize = 0; // position in output child array
-        let mut compact_idx: usize = 0; // position in compact input array
+        let child_data;
 
-        // When items are nullable, use MutableArrayData to re-insert null entries.
-        // Sized to the compact array length (not the full padded row count).
-        let compact_data = compact_array.to_data();
-        let mut child_builder = items_nullable.then(|| {
-            MutableArrayData::new(vec![&compact_data], true, compact_array.len())
-        });
+        if !items_nullable {
+            // Fast path: items within non-null lists cannot be null.
+            // The compact array maps 1:1 to the output child array — no
+            // MutableArrayData needed, no run tracking, no null re-insertion.
+            let mut cur_offset: usize = 0;
 
-        // Track the start of a run of consecutive compact values for batched extends.
-        let mut run_start: Option<usize> = None;
-
-        for (d, r) in def_levels.iter().zip(rep_levels) {
-            let is_list_boundary = *r < self.rep_level;
-            let list_exists = *d >= self.def_level;
-            let value_exists = *d >= max_def_level;
-
-            if is_list_boundary {
-                // Flush any pending run of values before starting a new record.
-                if let (Some(builder), Some(start)) =
-                    (child_builder.as_mut(), run_start.take())
-                {
-                    builder.extend(0, start, compact_idx);
-                }
-
-                list_offsets.push(
-                    OffsetSize::from_usize(cur_offset)
-                        .ok_or_else(|| general_err!("offset overflow"))?,
-                );
-
-                if list_exists {
-                    if let Some(v) = validity.as_mut() {
-                        v.append(true);
+            for (d, r) in def_levels.iter().zip(rep_levels) {
+                if *r < self.rep_level {
+                    // New record boundary
+                    list_offsets.push(
+                        OffsetSize::from_usize(cur_offset)
+                            .ok_or_else(|| general_err!("offset overflow"))?,
+                    );
+                    if *d >= self.def_level {
+                        // Non-null list with a value
+                        if let Some(v) = validity.as_mut() {
+                            v.append(true);
+                        }
+                        cur_offset += 1;
+                    } else {
+                        // Null or empty list
+                        if let Some(v) = validity.as_mut() {
+                            v.append(*d + 1 == self.def_level);
+                        }
                     }
+                } else if *d >= self.def_level {
+                    // Continuation value within a non-null list
+                    cur_offset += 1;
+                }
+            }
+
+            list_offsets.push(
+                OffsetSize::from_usize(cur_offset)
+                    .ok_or_else(|| general_err!("offset overflow"))?,
+            );
+
+            assert_eq!(
+                cur_offset,
+                compact_array.len(),
+                "not all compact values consumed: used {cur_offset}, have {}",
+                compact_array.len()
+            );
+
+            child_data = compact_array.to_data();
+        } else {
+            // Slow path: items within non-null lists can be null.
+            // Use MutableArrayData (sized to the compact array, not the
+            // full padded row count) to re-insert null entries.
+            let mut cur_offset: usize = 0;
+            let mut compact_idx: usize = 0;
+
+            let compact_data = compact_array.to_data();
+            let mut child_builder =
+                MutableArrayData::new(vec![&compact_data], true, compact_array.len());
+
+            // Track the start of a run of consecutive compact values for batched extends.
+            let mut run_start: Option<usize> = None;
+
+            for (d, r) in def_levels.iter().zip(rep_levels) {
+                let is_list_boundary = *r < self.rep_level;
+                let list_exists = *d >= self.def_level;
+                let value_exists = *d >= max_def_level;
+
+                if is_list_boundary {
+                    // Flush any pending run of values before starting a new record.
+                    if let Some(start) = run_start.take() {
+                        child_builder.extend(0, start, compact_idx);
+                    }
+
+                    list_offsets.push(
+                        OffsetSize::from_usize(cur_offset)
+                            .ok_or_else(|| general_err!("offset overflow"))?,
+                    );
+
+                    if list_exists {
+                        if let Some(v) = validity.as_mut() {
+                            v.append(true);
+                        }
+                        if value_exists {
+                            run_start.get_or_insert(compact_idx);
+                            compact_idx += 1;
+                            cur_offset += 1;
+                        } else {
+                            child_builder.extend_nulls(1);
+                            cur_offset += 1;
+                        }
+                    } else {
+                        if let Some(v) = validity.as_mut() {
+                            v.append(*d + 1 == self.def_level);
+                        }
+                    }
+                } else if list_exists {
+                    // Continuation within a non-null list
                     if value_exists {
                         run_start.get_or_insert(compact_idx);
                         compact_idx += 1;
                         cur_offset += 1;
-                    } else if items_nullable {
-                        child_builder.as_mut().unwrap().extend_nulls(1);
+                    } else {
+                        // Null item — flush run and insert null
+                        if let Some(start) = run_start.take() {
+                            child_builder.extend(0, start, compact_idx);
+                        }
+                        child_builder.extend_nulls(1);
                         cur_offset += 1;
                     }
-                } else {
-                    if let Some(v) = validity.as_mut() {
-                        v.append(*d + 1 == self.def_level);
-                    }
-                }
-            } else if list_exists {
-                // Continuation within a non-null list
-                if value_exists {
-                    run_start.get_or_insert(compact_idx);
-                    compact_idx += 1;
-                    cur_offset += 1;
-                } else if items_nullable {
-                    // Null item — flush run and insert null
-                    if let (Some(builder), Some(start)) =
-                        (child_builder.as_mut(), run_start.take())
-                    {
-                        builder.extend(0, start, compact_idx);
-                    }
-                    child_builder.as_mut().unwrap().extend_nulls(1);
-                    cur_offset += 1;
                 }
             }
-        }
 
-        list_offsets.push(
-            OffsetSize::from_usize(cur_offset)
-                .ok_or_else(|| general_err!("offset overflow"))?,
-        );
+            list_offsets.push(
+                OffsetSize::from_usize(cur_offset)
+                    .ok_or_else(|| general_err!("offset overflow"))?,
+            );
 
-        assert_eq!(
-            compact_idx,
-            compact_array.len(),
-            "not all compact values consumed: used {compact_idx}, have {}",
-            compact_array.len()
-        );
+            assert_eq!(
+                compact_idx,
+                compact_array.len(),
+                "not all compact values consumed: used {compact_idx}, have {}",
+                compact_array.len()
+            );
 
-        let child_data = if let Some(mut builder) = child_builder {
             // Flush final run
             if let Some(start) = run_start {
-                builder.extend(0, start, compact_idx);
+                child_builder.extend(0, start, compact_idx);
             }
-            builder.freeze()
-        } else {
-            // No nullable items — compact array IS the child data
-            compact_array.to_data()
-        };
+            child_data = child_builder.freeze();
+        }
 
-        if cur_offset != child_data.len() {
+        if list_offsets.last().map(|o| o.as_usize()) != Some(child_data.len()) {
             return Err(general_err!(
                 "Failed to reconstruct list from level data: \
                  expected {} child values but got {}",
-                cur_offset,
+                list_offsets.last().map(|o| o.as_usize()).unwrap_or(0),
                 child_data.len()
             ));
         }
