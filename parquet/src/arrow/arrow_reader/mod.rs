@@ -5899,4 +5899,183 @@ pub(crate) mod tests {
 
         (Bytes::from(buf), metadata)
     }
+
+    /// Test that reading a file where a nullable column is entirely null
+    /// short-circuits without reading the column chunk data.
+    #[test]
+    fn test_all_null_column_short_circuit() {
+        // Write a parquet file with two columns: one with values, one entirely null
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", ArrowDataType::Int32, false),
+            Field::new("nulls", ArrowDataType::Int32, true),
+        ]));
+
+        let num_rows = 1000;
+        let values = Int32Array::from_iter_values(0..num_rows);
+        let nulls = Int32Array::new_null(num_rows as usize);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(values), Arc::new(nulls)],
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Read it back
+        let bytes = bytes::Bytes::from(buf);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+
+        // The "values" column should be intact
+        let values_col = result.column(0).as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(values_col.len(), num_rows as usize);
+        assert_eq!(values_col.null_count(), 0);
+        assert_eq!(values_col.value(0), 0);
+        assert_eq!(values_col.value(999), 999);
+
+        // The "nulls" column should be entirely null
+        let nulls_col = result.column(1).as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(nulls_col.len(), num_rows as usize);
+        assert_eq!(nulls_col.null_count(), num_rows as usize);
+    }
+
+    /// Test that reading a file with multiple row groups where some are all-null
+    /// produces correct results.
+    #[test]
+    fn test_mixed_null_row_groups() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("val", ArrowDataType::Int64, true),
+        ]));
+
+        let mut buf = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(100)
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+
+        // Row group 1: all nulls for "val"
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int64Array::new_null(100)),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch1).unwrap();
+        writer.flush().unwrap();
+
+        // Row group 2: non-null values for "val"
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(100..200)),
+                Arc::new(Int64Array::from_iter_values(1000..1100)),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch2).unwrap();
+        writer.flush().unwrap();
+
+        // Row group 3: all nulls for "val" again
+        let batch3 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(200..300)),
+                Arc::new(Int64Array::new_null(100)),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch3).unwrap();
+        writer.close().unwrap();
+
+        let bytes = bytes::Bytes::from(buf);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .with_batch_size(1024) // large enough to span all row groups
+            .build()
+            .unwrap();
+
+        let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();
+        let result = concat_batches(&schema, &batches).unwrap();
+
+        assert_eq!(result.num_rows(), 300);
+
+        let id_col = result.column(0).as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(299), 299);
+
+        let val_col = result.column(1).as_primitive::<arrow_array::types::Int64Type>();
+        // First 100 rows: all null
+        for i in 0..100 {
+            assert!(val_col.is_null(i), "row {i} should be null");
+        }
+        // Next 100 rows: non-null
+        for i in 100..200 {
+            assert!(!val_col.is_null(i), "row {i} should not be null");
+            assert_eq!(val_col.value(i), 1000 + (i as i64 - 100));
+        }
+        // Last 100 rows: all null
+        for i in 200..300 {
+            assert!(val_col.is_null(i), "row {i} should be null");
+        }
+    }
+
+    /// Test all-null short-circuit with string columns.
+    #[test]
+    fn test_all_null_string_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("name", ArrowDataType::Utf8, true),
+        ]));
+
+        let num_rows = 500;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows)),
+                Arc::new(StringArray::new_null(num_rows as usize)),
+            ],
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let bytes = bytes::Bytes::from(buf);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();
+        let result = &batches[0];
+
+        let name_col = result.column(1).as_string::<i32>();
+        assert_eq!(name_col.len(), num_rows as usize);
+        assert_eq!(name_col.null_count(), num_rows as usize);
+    }
 }

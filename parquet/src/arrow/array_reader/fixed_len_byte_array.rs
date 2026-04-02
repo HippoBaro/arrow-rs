@@ -320,6 +320,11 @@ impl ValuesBuffer for FixedLenByteArrayBuffer {
             move_values(&mut self.buffer, byte_length, values_range, valid_mask, op);
         }
     }
+
+    fn fill_nulls(&mut self, count: usize) {
+        let byte_length = self.byte_length.unwrap_or_default();
+        self.buffer.resize(self.buffer.len() + count * byte_length, 0);
+    }
 }
 
 struct ValueDecoder {

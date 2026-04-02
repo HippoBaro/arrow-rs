@@ -219,6 +219,32 @@ where
         }
     }
 
+    /// Fill `count` null records into the buffer without decoding any pages.
+    ///
+    /// This is used when a column chunk is known to be entirely null (based on
+    /// statistics). It appends null definition levels, zero repetition levels,
+    /// and default-valued entries in the values buffer, advancing the record
+    /// and value counters accordingly.
+    ///
+    /// Only valid for columns with `max_def_level <= 1` and `max_rep_level == 0`.
+    pub fn fill_null_records(&mut self, count: usize) {
+        debug_assert!(self.column_desc.max_def_level() <= 1);
+        debug_assert_eq!(self.column_desc.max_rep_level(), 0);
+
+        if let Some(def_levels) = &mut self.def_levels {
+            def_levels.pad_null_records(count);
+        }
+        if let Some(rep_levels) = &mut self.rep_levels {
+            rep_levels.extend(std::iter::repeat(0i16).take(count));
+        }
+        if !self.skip_padding {
+            self.values.fill_nulls(count);
+        }
+        self.num_values += count;
+        self.num_records += count;
+        // values_written unchanged — no actual values written
+    }
+
     /// Returns bitmap data for nullable columns.
     /// For non-nullable columns, the bitmap is discarded.
     pub fn consume_bitmap(&mut self) -> Option<Buffer> {

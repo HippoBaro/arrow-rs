@@ -107,6 +107,10 @@ impl ValuesBuffer for ViewBuffer {
         self.views
             .pad_nulls(read_offset, values_read, levels_read, valid_mask);
     }
+
+    fn fill_nulls(&mut self, count: usize) {
+        self.views.fill_nulls(count);
+    }
 }
 
 #[cfg(test)]

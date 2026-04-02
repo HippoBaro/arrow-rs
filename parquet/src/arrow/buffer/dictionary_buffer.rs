@@ -211,6 +211,13 @@ impl<K: ArrowNativeType, V: OffsetSizeTrait> ValuesBuffer for DictionaryBuffer<K
             }
         }
     }
+
+    fn fill_nulls(&mut self, count: usize) {
+        match self {
+            Self::Dict { keys, .. } => keys.fill_nulls(count),
+            Self::Values { values, .. } => values.fill_nulls(count),
+        }
+    }
 }
 
 #[cfg(test)]

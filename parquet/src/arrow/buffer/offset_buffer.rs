@@ -186,6 +186,13 @@ impl<I: OffsetSizeTrait> ValuesBuffer for OffsetBuffer<I> {
             *x = last_start_offset
         }
     }
+
+    fn fill_nulls(&mut self, count: usize) {
+        // Null byte-array entries have zero length, so just repeat the current
+        // last offset for `count` new entries.
+        let last = *self.offsets.last().unwrap_or(&I::default());
+        self.offsets.extend(std::iter::repeat(last).take(count));
+    }
 }
 
 #[cfg(test)]

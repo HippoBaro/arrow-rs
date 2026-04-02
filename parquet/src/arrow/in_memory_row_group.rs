@@ -20,12 +20,37 @@ use crate::arrow::array_reader::RowGroups;
 use crate::arrow::arrow_reader::RowSelection;
 use crate::column::page::{PageIterator, PageReader};
 use crate::errors::ParquetError;
-use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use crate::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use crate::file::reader::{ChunkReader, Length, SerializedPageReader};
 use bytes::{Buf, Bytes};
 use std::ops::Range;
 use std::sync::Arc;
+
+/// Returns `true` if the given column chunk is known to be entirely null.
+///
+/// We only short-circuit for simple nullable columns (`max_def_level <= 1`,
+/// `max_rep_level == 0`) where the definition levels can be trivially
+/// synthesized (all zeros). For deeper nesting we would need the actual
+/// level data, which lives inside the column chunk pages.
+fn is_column_chunk_all_null(col: &ColumnChunkMetaData, row_count: usize) -> bool {
+    let desc = col.column_descr();
+    if desc.max_def_level() > 1 || desc.max_rep_level() != 0 {
+        return false;
+    }
+    // Required columns (max_def_level == 0) can never be all-null.
+    if desc.max_def_level() == 0 {
+        return false;
+    }
+    // Sanity: num_values must equal row count for non-repeated columns.
+    if col.num_values() != row_count as i64 {
+        return false;
+    }
+    matches!(
+        col.statistics().and_then(|s| s.null_count_opt()),
+        Some(nc) if nc == row_count as u64
+    )
+}
 
 /// An in-memory collection of column chunks
 #[derive(Debug)]
@@ -77,8 +102,10 @@ impl InMemoryRowGroup<'_> {
                 .iter()
                 .zip(metadata.columns())
                 .enumerate()
-                .filter(|&(idx, (chunk, _chunk_meta))| {
-                    chunk.is_none() && projection.leaf_included(idx)
+                .filter(|&(idx, (chunk, chunk_meta))| {
+                    chunk.is_none()
+                        && projection.leaf_included(idx)
+                        && !is_column_chunk_all_null(chunk_meta, self.row_count)
                 })
                 .flat_map(|(idx, (_chunk, chunk_meta))| {
                     // If the first page does not start at the beginning of the column,
@@ -116,7 +143,11 @@ impl InMemoryRowGroup<'_> {
                 .column_chunks
                 .iter()
                 .enumerate()
-                .filter(|&(idx, chunk)| chunk.is_none() && projection.leaf_included(idx))
+                .filter(|&(idx, chunk)| {
+                    chunk.is_none()
+                        && projection.leaf_included(idx)
+                        && !is_column_chunk_all_null(metadata.column(idx), self.row_count)
+                })
                 .map(|(idx, _chunk)| {
                     let column = metadata.column(idx);
                     let (start, length) = column.byte_range();
@@ -150,7 +181,10 @@ impl InMemoryRowGroup<'_> {
             let mut page_start_offsets = page_start_offsets.into_iter();
 
             for (idx, chunk) in self.column_chunks.iter_mut().enumerate() {
-                if chunk.is_some() || !projection.leaf_included(idx) {
+                if chunk.is_some()
+                    || !projection.leaf_included(idx)
+                    || is_column_chunk_all_null(metadata.column(idx), self.row_count)
+                {
                     continue;
                 }
 
@@ -172,7 +206,10 @@ impl InMemoryRowGroup<'_> {
             }
         } else {
             for (idx, chunk) in self.column_chunks.iter_mut().enumerate() {
-                if chunk.is_some() || !projection.leaf_included(idx) {
+                if chunk.is_some()
+                    || !projection.leaf_included(idx)
+                    || is_column_chunk_all_null(metadata.column(idx), self.row_count)
+                {
                     continue;
                 }
 
@@ -195,9 +232,20 @@ impl RowGroups for InMemoryRowGroup<'_> {
     /// Return chunks for column i
     fn column_chunks(&self, i: usize) -> crate::errors::Result<Box<dyn PageIterator>> {
         match &self.column_chunks[i] {
-            None => Err(ParquetError::General(format!(
-                "Invalid column index {i}, column was not fetched"
-            ))),
+            None => {
+                // Column data was not fetched — check if it was skipped because
+                // it is all-null.
+                let col_meta = self.metadata.row_group(self.row_group_idx).column(i);
+                if is_column_chunk_all_null(col_meta, self.row_count) {
+                    return Ok(Box::new(ColumnChunkIterator {
+                        reader: None,
+                        null_row_count: Some(self.row_count),
+                    }));
+                }
+                Err(ParquetError::General(format!(
+                    "Invalid column index {i}, column was not fetched"
+                )))
+            }
             Some(data) => {
                 let page_locations = self
                     .offset_index
@@ -222,6 +270,7 @@ impl RowGroups for InMemoryRowGroup<'_> {
 
                 Ok(Box::new(ColumnChunkIterator {
                     reader: Some(Ok(page_reader)),
+                    null_row_count: None,
                 }))
             }
         }
@@ -304,6 +353,9 @@ impl ChunkReader for ColumnChunkData {
 /// Implements [`PageIterator`] for a single column chunk, yielding a single [`PageReader`]
 struct ColumnChunkIterator {
     reader: Option<crate::errors::Result<Box<dyn PageReader>>>,
+    /// When `Some`, the column chunk is entirely null and contains this many rows.
+    /// No page data exists — the null signal is consumed via [`PageIterator::take_null_chunk`].
+    null_row_count: Option<usize>,
 }
 
 impl Iterator for ColumnChunkIterator {
@@ -314,4 +366,8 @@ impl Iterator for ColumnChunkIterator {
     }
 }
 
-impl PageIterator for ColumnChunkIterator {}
+impl PageIterator for ColumnChunkIterator {
+    fn take_null_chunk(&mut self) -> Option<usize> {
+        self.null_row_count.take()
+    }
+}
