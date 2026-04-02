@@ -200,6 +200,10 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
     fn consume_batch_unpadded(&mut self) -> Result<ArrayRef> {
         let compact_array = self.item_reader.consume_batch()?;
 
+        // Get def level runs if available (O(runs) max computation),
+        // otherwise fall back to materialized &[i16].
+        let def_level_runs = self.item_reader.get_def_level_runs();
+
         let def_levels = self
             .item_reader
             .get_def_levels()
@@ -218,9 +222,13 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             return Err(general_err!("first repetition level of batch must be 0"));
         }
 
-        // Max definition level for the leaf. Only entries at this level have
-        // actual values in the compact array.
-        let max_def_level = def_levels.iter().max().copied().unwrap_or(self.def_level);
+        // Max definition level for the leaf. Use runs if available (O(runs))
+        // instead of scanning the full materialized slice (O(rows)).
+        let max_def_level = if let Some(runs) = def_level_runs {
+            runs.iter().map(|(v, _)| *v).max().unwrap_or(self.def_level)
+        } else {
+            def_levels.iter().max().copied().unwrap_or(self.def_level)
+        };
 
         // Whether items within non-null lists can themselves be null.
         let items_nullable = max_def_level > self.def_level;

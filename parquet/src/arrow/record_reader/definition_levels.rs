@@ -92,6 +92,14 @@ impl DefinitionLevelBuffer {
         }
     }
 
+    /// Returns the runs as `&[(i16, u32)]` without materializing.
+    pub fn runs(&self) -> Option<&[(i16, u32)]> {
+        match &self.inner {
+            BufferInner::Full { levels, .. } => Some(levels.runs()),
+            BufferInner::Mask { .. } => None,
+        }
+    }
+
     /// Returns the built null bitmask
     pub fn consume_bitmask(&mut self) -> Buffer {
         self.len = 0;

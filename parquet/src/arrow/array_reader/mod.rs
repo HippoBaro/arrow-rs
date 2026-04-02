@@ -140,6 +140,17 @@ pub trait ArrayReader: Send {
     fn set_skip_padding(&mut self, _skip: bool) -> bool {
         false
     }
+
+    /// Returns definition levels as run-length encoded `(value, count)` pairs
+    /// from the last call to `consume_batch`, if available.
+    ///
+    /// This preserves the RLE structure from the Parquet encoding and allows
+    /// consumers to operate in O(runs) instead of O(rows). Returns `None` if
+    /// the reader does not support run-level access (in which case, use
+    /// `get_def_levels()` for the materialized `&[i16]` instead).
+    fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        None
+    }
 }
 
 /// Interface for reading data pages from the columns of one or more RowGroups.

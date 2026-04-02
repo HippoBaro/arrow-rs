@@ -169,6 +169,11 @@ where
         self.def_levels.as_mut().and_then(|x| x.consume_levels())
     }
 
+    /// Returns definition level runs as `&[(i16, u32)]` without materializing.
+    pub fn def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.def_levels.as_ref().and_then(|x| x.runs())
+    }
+
     /// Return repetition level data.
     /// The side effect is similar to `consume_def_levels`.
     pub fn consume_rep_levels(&mut self) -> Option<Vec<i16>> {
