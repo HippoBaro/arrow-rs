@@ -4037,7 +4037,8 @@ mod tests {
         let mut reader = get_test_column_reader::<T>(page_reader, max_def_level, max_rep_level);
 
         let mut actual_values = Vec::with_capacity(max_batch_size);
-        let mut actual_def_levels = def_levels.map(|_| Vec::with_capacity(max_batch_size));
+        let mut actual_def_levels = def_levels
+            .map(|_| crate::column::reader::run_level_buffer::RunLevelBuffer::new());
         let mut actual_rep_levels = rep_levels.map(|_| Vec::with_capacity(max_batch_size));
 
         let (_, values_read, levels_read) = reader
@@ -4053,7 +4054,10 @@ mod tests {
 
         assert_eq!(&actual_values[..values_read], values);
         match actual_def_levels {
-            Some(ref vec) => assert_eq!(Some(&vec[..levels_read]), def_levels),
+            Some(ref mut buf) => {
+                let flat = buf.take_flat();
+                assert_eq!(Some(&flat[..levels_read]), def_levels);
+            }
             None => assert_eq!(None, def_levels),
         }
         match actual_rep_levels {

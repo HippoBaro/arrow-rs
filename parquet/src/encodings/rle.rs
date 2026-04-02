@@ -570,6 +570,63 @@ impl RleDecoder {
         Ok(values_read)
     }
 
+    /// Returns the next RLE or bit-packed run as `(value, count)` pairs
+    /// appended to `out`. For RLE runs this is a single `(value, count)` entry.
+    /// For bit-packed runs, each distinct value-group is appended separately.
+    ///
+    /// Returns the total number of values in the run(s), or 0 if exhausted.
+    ///
+    /// `max_values` limits how many values to consume (the run may be partially
+    /// consumed; the remainder stays buffered for the next call).
+    #[inline(never)]
+    pub fn get_batch_as_runs(
+        &mut self,
+        out: &mut Vec<(i16, u32)>,
+        max_values: usize,
+    ) -> Result<usize> {
+        let mut values_read = 0;
+        while values_read < max_values {
+            if self.rle_left > 0 {
+                let count = (max_values - values_read).min(self.rle_left as usize);
+                let value = self.current_value.unwrap() as i16;
+                // Merge with the last run if it has the same value
+                if let Some(last) = out.last_mut().filter(|r| r.0 == value) {
+                    last.1 += count as u32;
+                } else {
+                    out.push((value, count as u32));
+                }
+                self.rle_left -= count as u32;
+                values_read += count;
+            } else if self.bit_packed_left > 0 {
+                // Bit-packed: must decode one value at a time into runs
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+
+                let count = (max_values - values_read).min(self.bit_packed_left as usize);
+                for _ in 0..count {
+                    let value = bit_reader
+                        .get_value::<i16>(self.bit_width as usize)
+                        .ok_or_else(|| {
+                            general_err!("not enough data for bit-packed RLE run")
+                        })?;
+                    // Merge with the last run if same value
+                    if let Some(last) = out.last_mut().filter(|r| r.0 == value) {
+                        last.1 += 1;
+                    } else {
+                        out.push((value, 1));
+                    }
+                }
+                self.bit_packed_left -= count as u32;
+                values_read += count;
+            } else if !self.reload()? {
+                break;
+            }
+        }
+        Ok(values_read)
+    }
+
     #[inline]
     fn reload(&mut self) -> Result<bool> {
         let bit_reader = self

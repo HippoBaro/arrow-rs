@@ -31,6 +31,7 @@ use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{ceil, num_required_bits, read_num_bytes};
 
 pub(crate) mod decoder;
+pub(crate) mod run_level_buffer;
 
 /// Column reader for a Parquet type.
 pub enum ColumnReader {
@@ -1316,7 +1317,8 @@ mod tests {
             let mut typed_column_reader = get_typed_column_reader::<T>(column_reader);
 
             let mut values = Vec::new();
-            let mut def_levels = Vec::new();
+            let mut def_levels =
+                crate::column::reader::run_level_buffer::RunLevelBuffer::new();
             let mut rep_levels = Vec::new();
 
             let mut curr_values_read = 0;
@@ -1342,8 +1344,9 @@ mod tests {
             assert_eq!(values, self.values, "values content doesn't match");
 
             if max_def_level > 0 {
+                let def_levels_flat = def_levels.take_flat();
                 assert_eq!(
-                    def_levels, self.def_levels,
+                    def_levels_flat, self.def_levels,
                     "definition levels content doesn't match"
                 );
             }

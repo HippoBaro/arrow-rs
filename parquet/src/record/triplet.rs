@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::basic::Type as PhysicalType;
+use crate::column::reader::run_level_buffer::RunLevelBuffer;
 use crate::column::reader::{ColumnReader, ColumnReaderImpl, get_typed_column_reader};
 use crate::data_type::*;
 use crate::errors::{ParquetError, Result};
@@ -180,8 +181,10 @@ pub struct TypedTripletIter<T: DataType> {
     max_rep_level: i16,
     // values and levels
     values: Vec<T::T>,
-    def_levels: Option<Vec<i16>>,
+    def_levels: Option<RunLevelBuffer>,
     rep_levels: Option<Vec<i16>>,
+    /// Materialized def levels for indexed access
+    def_levels_flat: Option<Vec<i16>>,
     // current index for the triplet (value, def, rep)
     curr_triplet_index: usize,
     // how many triplets are left before we need to buffer
@@ -205,7 +208,7 @@ impl<T: DataType> TypedTripletIter<T> {
         let def_levels = if max_def_level == 0 {
             None
         } else {
-            Some(vec![0; batch_size])
+            Some(RunLevelBuffer::new())
         };
         let rep_levels = if max_rep_level == 0 {
             None
@@ -222,6 +225,7 @@ impl<T: DataType> TypedTripletIter<T> {
             values: vec![T::T::default(); batch_size],
             def_levels,
             rep_levels,
+            def_levels_flat: None,
             curr_triplet_index: 0,
             triplets_left: 0,
             has_next: false,
@@ -263,7 +267,7 @@ impl<T: DataType> TypedTripletIter<T> {
     /// If field is required, then maximum definition level is returned.
     #[inline]
     fn current_def_level(&self) -> i16 {
-        match self.def_levels {
+        match self.def_levels_flat {
             Some(ref vec) => vec[self.curr_triplet_index],
             None => self.max_def_level,
         }
@@ -298,8 +302,9 @@ impl<T: DataType> TypedTripletIter<T> {
             let (records_read, values_read, levels_read) = {
                 self.values.clear();
                 if let Some(x) = &mut self.def_levels {
-                    x.clear()
+                    x.clear();
                 }
+                self.def_levels_flat = None;
                 if let Some(x) = &mut self.rep_levels {
                     x.clear()
                 }
@@ -332,9 +337,13 @@ impl<T: DataType> TypedTripletIter<T> {
                 // Values and levels are guaranteed to line up, because of
                 // the column reader method.
 
+                // Materialize def levels for indexed access
+                self.def_levels_flat =
+                    Some(self.def_levels.as_mut().unwrap().take_flat());
+
                 // Note: if values_read == 0, then spacing will not be triggered
                 let mut idx = values_read;
-                let def_levels = self.def_levels.as_ref().unwrap();
+                let def_levels = self.def_levels_flat.as_ref().unwrap();
                 self.values.resize(levels_read, T::T::default());
                 for i in 0..levels_read {
                     if def_levels[levels_read - i - 1] == self.max_def_level {

@@ -25,13 +25,14 @@ use crate::basic::Encoding;
 use crate::column::reader::decoder::{
     ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
 };
+use crate::column::reader::run_level_buffer::RunLevelBuffer;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
 enum BufferInner {
-    /// Compute levels and null mask
+    /// Compute levels and null mask, preserving RLE run structure
     Full {
-        levels: Vec<i16>,
+        levels: RunLevelBuffer,
         nulls: BooleanBufferBuilder,
         max_level: i16,
     },
@@ -73,7 +74,7 @@ impl DefinitionLevelBuffer {
                 }
             }
             false => BufferInner::Full {
-                levels: Vec::new(),
+                levels: RunLevelBuffer::new(),
                 nulls: BooleanBufferBuilder::new(0),
                 max_level: desc.max_def_level(),
             },
@@ -82,10 +83,11 @@ impl DefinitionLevelBuffer {
         Self { inner, len: 0 }
     }
 
-    /// Returns the built level data
+    /// Returns the built level data as a flat `Vec<i16>`.
+    /// Materializes from the run-length representation if needed.
     pub fn consume_levels(&mut self) -> Option<Vec<i16>> {
         match &mut self.inner {
-            BufferInner::Full { levels, .. } => Some(std::mem::take(levels)),
+            BufferInner::Full { levels, .. } => Some(levels.take_flat()),
             BufferInner::Mask { .. } => None,
         }
     }
@@ -157,20 +159,19 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
             ) => {
                 assert_eq!(self.max_level, *max_level);
 
-                let start = levels.len();
                 let (values_read, levels_read) = decoder.read_def_levels(levels, num_levels)?;
 
-                // Build the null bitmap from decoded levels in bulk.
-                // Instead of calling nulls.append() per level (which does
-                // advance + conditional set_bit_raw each time), we pack 8
+                // Build the null bitmap from the decoded runs in bulk.
+                // Instead of calling nulls.append() per level, we pack 8
                 // comparison results into a byte and append via
-                // append_packed_range, amortizing the BooleanBufferBuilder
-                // overhead.
-                let decoded = &levels[start..start + levels_read];
-                let num_full_bytes = decoded.len() / 8;
-                let remainder = decoded.len() % 8;
+                // append_packed_range.
+                // For now, materialize the levels to build the bitmap.
+                // Phase 2 will consume runs directly.
+                let decoded = levels.as_slice();
+                let start = decoded.len() - levels_read;
+                let decoded = &decoded[start..];
 
-                let mut packed = Vec::with_capacity(num_full_bytes + (remainder > 0) as usize);
+                let mut packed = Vec::with_capacity(decoded.len() / 8 + 1);
                 let chunks = decoded.chunks_exact(8);
                 let tail = chunks.remainder();
                 for chunk in chunks {

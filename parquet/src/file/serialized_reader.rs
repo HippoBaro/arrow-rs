@@ -2608,7 +2608,8 @@ mod tests {
         match row_group_reader.get_column_reader(0).unwrap() {
             ColumnReader::Int64ColumnReader(mut reader) => {
                 let mut buffer = Vec::with_capacity(1024);
-                let mut def_levels = Vec::with_capacity(1024);
+                let mut def_levels =
+                    crate::column::reader::run_level_buffer::RunLevelBuffer::new();
                 let (num_records, num_values, num_levels) = reader
                     .read_records(1024, Some(&mut def_levels), None, &mut buffer)
                     .unwrap();

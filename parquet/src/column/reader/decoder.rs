@@ -18,6 +18,7 @@
 use bytes::Bytes;
 
 use crate::basic::{Encoding, EncodingMask};
+use crate::column::reader::run_level_buffer::RunLevelBuffer;
 use crate::data_type::DataType;
 use crate::encodings::{
     decoding::{Decoder, DictDecoder, PlainDecoder, get_decoder},
@@ -287,6 +288,29 @@ impl LevelDecoder {
             Self::Rle(reader) => Ok(reader.get_batch(out)?),
         }
     }
+
+    fn read_as_runs(
+        &mut self,
+        out: &mut Vec<(i16, u32)>,
+        max_values: usize,
+    ) -> Result<usize> {
+        match self {
+            Self::Rle(reader) => reader.get_batch_as_runs(out, max_values),
+            Self::Packed(reader, bit_width) => {
+                // Bit-packed: decode to a temp buffer, then convert to runs
+                let mut buf = vec![0i16; max_values];
+                let n = reader.get_batch::<i16>(&mut buf, *bit_width as usize);
+                for &v in &buf[..n] {
+                    if let Some(last) = out.last_mut().filter(|r| r.0 == v) {
+                        last.1 += 1;
+                    } else {
+                        out.push((v, 1));
+                    }
+                }
+                Ok(n)
+            }
+        }
+    }
 }
 
 /// An implementation of [`DefinitionLevelDecoder`] for `[i16]`
@@ -308,7 +332,7 @@ impl DefinitionLevelDecoderImpl {
 }
 
 impl ColumnLevelDecoder for DefinitionLevelDecoderImpl {
-    type Buffer = Vec<i16>;
+    type Buffer = RunLevelBuffer;
 
     fn set_data(&mut self, encoding: Encoding, data: Bytes) -> Result<()> {
         self.decoder = Some(LevelDecoder::new(encoding, data, self.bit_width)?);
@@ -322,26 +346,38 @@ impl DefinitionLevelDecoder for DefinitionLevelDecoderImpl {
         out: &mut Self::Buffer,
         num_levels: usize,
     ) -> Result<(usize, usize)> {
-        // TODO: Push vec into decoder (#5177)
-        let start = out.len();
-        out.resize(start + num_levels, 0);
-        let levels_read = self.decoder.as_mut().unwrap().read(&mut out[start..])?;
-        out.truncate(start + levels_read);
+        // Decode new runs into a temporary vector so we can count values
+        // without worrying about merging with pre-existing runs.
+        let mut new_runs = Vec::new();
+        let levels_read = self
+            .decoder
+            .as_mut()
+            .unwrap()
+            .read_as_runs(&mut new_runs, num_levels)?;
 
-        let iter = out.iter().skip(start);
-        let values_read = iter.filter(|x| **x == self.max_level).count();
+        let values_read: usize = new_runs
+            .iter()
+            .filter(|(v, _)| *v == self.max_level)
+            .map(|(_, c)| *c as usize)
+            .sum();
+
+        // Append new runs to the buffer, merging with the last existing run
+        // if it has the same value.
+        out.append_runs(&new_runs);
+        let new_total = out.len() + levels_read;
+        out.set_total_len(new_total);
         Ok((values_read, levels_read))
     }
 
     fn skip_def_levels(&mut self, num_levels: usize) -> Result<(usize, usize)> {
         let mut level_skip = 0;
         let mut value_skip = 0;
-        let mut buf: Vec<i16> = vec![];
+        let mut buf = RunLevelBuffer::new();
         while level_skip < num_levels {
             let remaining_levels = num_levels - level_skip;
 
             let to_read = remaining_levels.min(SKIP_BUFFER_SIZE);
-            buf.resize(to_read, 0);
+            buf.clear();
             let (values_read, levels_read) = self.read_def_levels(&mut buf, to_read)?;
             if levels_read == 0 {
                 // Reached end of page
