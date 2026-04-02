@@ -105,13 +105,15 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
 
         let mut list_offsets: Vec<OffsetSize> = Vec::with_capacity(next_batch_array.len() + 1);
 
-        let mut validity = self
-            .nullable
-            .then(|| BooleanBufferBuilder::new(next_batch_array.len()));
-
         let mut cur_offset = 0;
         let mut filter_start = None;
         let mut skipped = 0;
+
+        // Build validity bitmap as packed bytes to avoid per-element
+        // BooleanBufferBuilder::append() overhead.
+        let mut validity_byte: u8 = 0;
+        let mut validity_bit_idx: usize = 0;
+        let mut validity_packed: Vec<u8> = Vec::new();
 
         let data = next_batch_array.to_data();
         let mut child_data_builder =
@@ -136,19 +138,25 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
                         filter_start.get_or_insert(cur_offset + skipped);
                         cur_offset += 1;
 
-                        if let Some(validity) = validity.as_mut() {
-                            validity.append(true)
+                        if self.nullable {
+                            validity_byte |= 1 << (validity_bit_idx & 7);
                         }
+                        validity_bit_idx += 1;
                     } else {
                         if let Some(start) = filter_start.take() {
                             child_data_builder.extend(0, start, cur_offset + skipped);
                         }
 
-                        if let Some(validity) = validity.as_mut() {
-                            validity.append(*d + 1 == self.def_level)
+                        if self.nullable && *d + 1 == self.def_level {
+                            validity_byte |= 1 << (validity_bit_idx & 7);
                         }
+                        validity_bit_idx += 1;
 
                         skipped += 1;
+                    }
+                    if self.nullable && validity_bit_idx & 7 == 0 {
+                        validity_packed.push(validity_byte);
+                        validity_byte = 0;
                     }
                 }
             }
@@ -173,14 +181,26 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
 
         let value_offsets = Buffer::from(list_offsets.to_byte_slice());
 
+        // Flush remaining validity bits and build the null buffer
+        let validity_buffer = if self.nullable {
+            if validity_bit_idx & 7 != 0 {
+                validity_packed.push(validity_byte);
+            }
+            let mut builder = BooleanBufferBuilder::new(0);
+            builder.append_packed_range(0..validity_bit_idx, &validity_packed);
+            assert_eq!(builder.len(), list_offsets.len() - 1);
+            Some(builder.finish().into_inner())
+        } else {
+            None
+        };
+
         let mut data_builder = ArrayData::builder(self.get_data_type().clone())
             .len(list_offsets.len() - 1)
             .add_buffer(value_offsets)
             .add_child_data(child_data);
 
-        if let Some(builder) = validity {
-            assert_eq!(builder.len(), list_offsets.len() - 1);
-            data_builder = data_builder.null_bit_buffer(Some(builder.into()))
+        if let Some(buf) = validity_buffer {
+            data_builder = data_builder.null_bit_buffer(Some(buf))
         }
 
         let list_data = unsafe { data_builder.build_unchecked() };
@@ -236,7 +256,14 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             // Fast path: items within non-null lists cannot be null.
             // The compact array maps 1:1 to the output child array — no
             // MutableArrayData needed, no run tracking, no null re-insertion.
+            //
+            // Validity bitmap is built as packed bytes and bulk-appended at
+            // the end, avoiding per-element BooleanBufferBuilder::append()
+            // overhead (advance + set_bit_raw per bit).
             let mut cur_offset: usize = 0;
+            let mut validity_byte: u8 = 0;
+            let mut validity_bit_idx: usize = 0;
+            let mut validity_packed: Vec<u8> = Vec::new();
 
             for (d, r) in def_levels.iter().zip(rep_levels) {
                 if *r < self.rep_level {
@@ -247,15 +274,21 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
                     );
                     if *d >= self.def_level {
                         // Non-null list with a value
-                        if let Some(v) = validity.as_mut() {
-                            v.append(true);
+                        if self.nullable {
+                            validity_byte |= 1 << (validity_bit_idx & 7);
                         }
+                        validity_bit_idx += 1;
                         cur_offset += 1;
                     } else {
-                        // Null or empty list
-                        if let Some(v) = validity.as_mut() {
-                            v.append(*d + 1 == self.def_level);
+                        // Null or empty list — valid only if empty (not null)
+                        if self.nullable && *d + 1 == self.def_level {
+                            validity_byte |= 1 << (validity_bit_idx & 7);
                         }
+                        validity_bit_idx += 1;
+                    }
+                    if self.nullable && validity_bit_idx & 7 == 0 {
+                        validity_packed.push(validity_byte);
+                        validity_byte = 0;
                     }
                 } else if *d >= self.def_level {
                     // Continuation value within a non-null list
@@ -267,6 +300,14 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
                 OffsetSize::from_usize(cur_offset)
                     .ok_or_else(|| general_err!("offset overflow"))?,
             );
+
+            // Flush remaining validity bits and bulk-append
+            if let Some(v) = validity.as_mut() {
+                if validity_bit_idx & 7 != 0 {
+                    validity_packed.push(validity_byte);
+                }
+                v.append_packed_range(0..validity_bit_idx, &validity_packed);
+            }
 
             assert_eq!(
                 cur_offset,
@@ -280,8 +321,13 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             // Slow path: items within non-null lists can be null.
             // Use MutableArrayData (sized to the compact array, not the
             // full padded row count) to re-insert null entries.
+            // Validity bitmap is packed manually and bulk-appended at the
+            // end to avoid per-element BooleanBufferBuilder::append() cost.
             let mut cur_offset: usize = 0;
             let mut compact_idx: usize = 0;
+            let mut validity_byte: u8 = 0;
+            let mut validity_bit_idx: usize = 0;
+            let mut validity_packed: Vec<u8> = Vec::new();
 
             let compact_data = compact_array.to_data();
             let mut child_builder =
@@ -307,9 +353,10 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
                     );
 
                     if list_exists {
-                        if let Some(v) = validity.as_mut() {
-                            v.append(true);
+                        if self.nullable {
+                            validity_byte |= 1 << (validity_bit_idx & 7);
                         }
+                        validity_bit_idx += 1;
                         if value_exists {
                             run_start.get_or_insert(compact_idx);
                             compact_idx += 1;
@@ -319,9 +366,14 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
                             cur_offset += 1;
                         }
                     } else {
-                        if let Some(v) = validity.as_mut() {
-                            v.append(*d + 1 == self.def_level);
+                        if self.nullable && *d + 1 == self.def_level {
+                            validity_byte |= 1 << (validity_bit_idx & 7);
                         }
+                        validity_bit_idx += 1;
+                    }
+                    if self.nullable && validity_bit_idx & 7 == 0 {
+                        validity_packed.push(validity_byte);
+                        validity_byte = 0;
                     }
                 } else if list_exists {
                     // Continuation within a non-null list
@@ -356,6 +408,15 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             if let Some(start) = run_start {
                 child_builder.extend(0, start, compact_idx);
             }
+
+            // Flush remaining validity bits and bulk-append
+            if let Some(v) = validity.as_mut() {
+                if validity_bit_idx & 7 != 0 {
+                    validity_packed.push(validity_byte);
+                }
+                v.append_packed_range(0..validity_bit_idx, &validity_packed);
+            }
+
             child_data = child_builder.freeze();
         }
 
