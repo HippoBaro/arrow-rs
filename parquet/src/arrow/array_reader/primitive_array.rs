@@ -110,6 +110,7 @@ where
     def_levels_buffer: Option<Vec<i16>>,
     def_level_runs_buffer: Option<Vec<(i16, u32)>>,
     rep_levels_buffer: Option<Vec<i16>>,
+    rep_level_runs_buffer: Option<Vec<(i16, u32)>>,
     record_reader: RecordReader<T>,
 }
 
@@ -141,6 +142,7 @@ where
             def_levels_buffer: None,
             def_level_runs_buffer: None,
             rep_levels_buffer: None,
+            rep_level_runs_buffer: None,
             record_reader,
         })
     }
@@ -502,6 +504,10 @@ where
             .map(|r| r.to_vec());
         self.def_levels_buffer = self.record_reader.consume_def_levels();
         self.rep_levels_buffer = self.record_reader.consume_rep_levels();
+        self.rep_level_runs_buffer = self
+            .rep_levels_buffer
+            .as_deref()
+            .map(crate::column::reader::run_level_buffer::levels_to_runs);
         self.record_reader.reset();
         Ok(array)
     }
@@ -525,6 +531,10 @@ where
 
     fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
         self.def_level_runs_buffer.as_deref()
+    }
+
+    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.rep_level_runs_buffer.as_deref()
     }
 }
 

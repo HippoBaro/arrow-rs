@@ -146,3 +146,16 @@ impl RunLevelBuffer {
         self.materialized = None;
     }
 }
+
+/// Convert a flat `&[i16]` slice to run-length encoded `(value, count)` pairs.
+pub fn levels_to_runs(levels: &[i16]) -> Vec<(i16, u32)> {
+    let mut runs = Vec::new();
+    for &v in levels {
+        if let Some(last) = runs.last_mut().filter(|r: &&mut (i16, u32)| r.0 == v) {
+            last.1 += 1;
+        } else {
+            runs.push((v, 1));
+        }
+    }
+    runs
+}
