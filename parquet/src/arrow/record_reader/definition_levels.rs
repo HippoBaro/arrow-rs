@@ -161,34 +161,32 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
 
                 let (values_read, levels_read) = decoder.read_def_levels(levels, num_levels)?;
 
-                // Build the null bitmap from the decoded runs in bulk.
-                // Instead of calling nulls.append() per level, we pack 8
-                // comparison results into a byte and append via
-                // append_packed_range.
-                // For now, materialize the levels to build the bitmap.
-                // Phase 2 will consume runs directly.
-                let decoded = levels.as_slice();
-                let start = decoded.len() - levels_read;
-                let decoded = &decoded[start..];
-
-                let mut packed = Vec::with_capacity(decoded.len() / 8 + 1);
-                let chunks = decoded.chunks_exact(8);
-                let tail = chunks.remainder();
-                for chunk in chunks {
-                    let mut byte = 0u8;
-                    for (j, val) in chunk.iter().enumerate() {
-                        byte |= ((*val == *max_level) as u8) << j;
+                // Build the null bitmap directly from the new runs — O(runs)
+                // instead of O(rows). We use the decoder's last batch of new
+                // runs (before they're merged into the buffer) to avoid
+                // tracking merge boundaries.
+                //
+                // The new runs were decoded into a temporary inside
+                // read_def_levels and then appended. We can reconstruct the
+                // bitmap from the total run structure by tracking levels_read:
+                // walk backward from the end for exactly levels_read entries.
+                let runs = levels.runs();
+                let mut remaining = levels_read;
+                // Collect the runs that contribute to the new levels_read,
+                // walking backward from the end
+                let mut new_runs: Vec<(i16, usize)> = Vec::new();
+                for &(value, count) in runs.iter().rev() {
+                    if remaining == 0 {
+                        break;
                     }
-                    packed.push(byte);
+                    let take = (count as usize).min(remaining);
+                    new_runs.push((value, take));
+                    remaining -= take;
                 }
-                if !tail.is_empty() {
-                    let mut byte = 0u8;
-                    for (j, val) in tail.iter().enumerate() {
-                        byte |= ((*val == *max_level) as u8) << j;
-                    }
-                    packed.push(byte);
+                // Now append in forward order
+                for &(value, count) in new_runs.iter().rev() {
+                    nulls.append_n(count, value == *max_level);
                 }
-                nulls.append_packed_range(0..decoded.len(), &packed);
 
                 Ok((values_read, levels_read))
             }
