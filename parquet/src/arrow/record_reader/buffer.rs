@@ -40,11 +40,6 @@ pub trait ValuesBuffer: Default {
         levels_read: usize,
         valid_mask: &[u8],
     );
-
-    /// Extend the buffer with `count` null-equivalent (default) entries.
-    /// Used when an entire column chunk is known to be all-null, so no actual
-    /// values need to be decoded but the buffer must be sized correctly.
-    fn fill_nulls(&mut self, count: usize);
 }
 
 impl<T: Copy + Default> ValuesBuffer for Vec<T> {
@@ -65,9 +60,5 @@ impl<T: Copy + Default> ValuesBuffer for Vec<T> {
             }
             self[level_pos] = self[value_pos];
         }
-    }
-
-    fn fill_nulls(&mut self, count: usize) {
-        self.resize(self.len() + count, T::default());
     }
 }

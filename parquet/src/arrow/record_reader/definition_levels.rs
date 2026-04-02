@@ -105,21 +105,6 @@ impl DefinitionLevelBuffer {
             BufferInner::Mask { nulls } => nulls,
         }
     }
-
-    /// Append `count` null entries (def_level = 0) to the buffer.
-    /// Used when an entire column chunk is known to be all-null.
-    pub fn pad_null_records(&mut self, count: usize) {
-        match &mut self.inner {
-            BufferInner::Full { levels, nulls, .. } => {
-                levels.extend(std::iter::repeat(0i16).take(count));
-                nulls.append_n(count, false);
-            }
-            BufferInner::Mask { nulls } => {
-                nulls.append_n(count, false);
-            }
-        }
-        self.len += count;
-    }
 }
 
 enum MaybePacked {

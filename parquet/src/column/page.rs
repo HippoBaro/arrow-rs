@@ -429,18 +429,7 @@ pub trait PageWriter: Send {
 }
 
 /// An iterator over pages of one specific column in a parquet file.
-pub trait PageIterator: Iterator<Item = Result<Box<dyn PageReader>>> + Send {
-    /// If the next column chunk is known to be entirely null (based on column
-    /// chunk statistics), consume it and return the number of null rows.
-    ///
-    /// Returns `Some(row_count)` if the chunk was all-null and was consumed,
-    /// `None` if the next chunk is not all-null or no more chunks remain.
-    /// When `Some` is returned, `next()` will not yield a `PageReader` for
-    /// the consumed chunk.
-    fn take_null_chunk(&mut self) -> Option<usize> {
-        None
-    }
-}
+pub trait PageIterator: Iterator<Item = Result<Box<dyn PageReader>>> + Send {}
 
 #[cfg(test)]
 mod tests {

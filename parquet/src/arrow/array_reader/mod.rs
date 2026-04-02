@@ -203,14 +203,6 @@ where
 
         // Record reader exhausted
         if records_read_once < records_to_read {
-            // Check if the next column chunk is all-null before fetching pages
-            if let Some(null_rows) = pages.take_null_chunk() {
-                let to_fill = null_rows.min(batch_size - records_read);
-                record_reader.fill_null_records(to_fill);
-                records_read += to_fill;
-                continue;
-            }
-
             if let Some(page_reader) = pages.next() {
                 // Read from new page reader (i.e. column chunk)
                 record_reader.set_page_reader(page_reader?)?;
@@ -245,13 +237,6 @@ where
 
         // Record reader exhausted
         if records_skipped_once < records_to_read {
-            // All-null chunks can be skipped without any decoding
-            if let Some(null_rows) = pages.take_null_chunk() {
-                let to_skip = null_rows.min(batch_size - records_skipped);
-                records_skipped += to_skip;
-                continue;
-            }
-
             if let Some(page_reader) = pages.next() {
                 // Read from new page reader (i.e. column chunk)
                 record_reader.set_page_reader(page_reader?)?;
