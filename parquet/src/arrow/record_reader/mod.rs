@@ -52,7 +52,7 @@ pub struct GenericRecordReader<V, CV> {
 
     values: V,
     def_levels: Option<DefinitionLevelBuffer>,
-    rep_levels: Option<Vec<i16>>,
+    rep_levels: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     column_reader: Option<ColumnReader<CV>>,
     /// Number of buffered levels / null-padded values
     num_values: usize,
@@ -77,7 +77,8 @@ where
         let def_levels = (desc.max_def_level() > 0)
             .then(|| DefinitionLevelBuffer::new(&desc, packed_null_mask(&desc)));
 
-        let rep_levels = (desc.max_rep_level() > 0).then(Vec::new);
+        let rep_levels = (desc.max_rep_level() > 0)
+            .then(crate::column::reader::run_level_buffer::RunLevelBuffer::new);
 
         Self {
             values: V::default(),
@@ -183,9 +184,15 @@ where
             .and_then(|x| x.take_run_level_buffer())
     }
 
-    /// Return repetition level data.
-    /// The side effect is similar to `consume_def_levels`.
+    /// Return repetition level data as flat Vec<i16>.
     pub fn consume_rep_levels(&mut self) -> Option<Vec<i16>> {
+        self.rep_levels.as_mut().map(|r| r.take_flat())
+    }
+
+    /// Takes the RunLevelBuffer for repetition levels without materializing.
+    pub fn consume_rep_level_runs(
+        &mut self,
+    ) -> Option<crate::column::reader::run_level_buffer::RunLevelBuffer> {
         self.rep_levels.as_mut().map(std::mem::take)
     }
 

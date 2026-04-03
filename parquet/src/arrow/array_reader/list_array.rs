@@ -92,11 +92,8 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
         let child_array = self.item_reader.consume_batch()?;
 
         // Get def and rep level runs, falling back to flat conversion
-        let def_level_runs = self.item_reader.get_def_level_runs();
-        let rep_levels_flat = self.item_reader.get_rep_levels();
-
         let def_level_runs_owned;
-        let def_runs = if let Some(runs) = def_level_runs {
+        let def_runs = if let Some(runs) = self.item_reader.get_def_level_runs() {
             runs
         } else {
             let flat = self
@@ -107,18 +104,25 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
             &def_level_runs_owned
         };
 
-        let rep_levels = rep_levels_flat
-            .ok_or_else(|| general_err!("item_reader rep levels are None."))?;
+        let rep_level_runs_owned;
+        let rep_runs = if let Some(runs) = self.item_reader.get_rep_level_runs() {
+            runs
+        } else {
+            let flat = self
+                .item_reader
+                .get_rep_levels()
+                .ok_or_else(|| general_err!("item_reader rep levels are None."))?;
+            rep_level_runs_owned = levels_to_runs(flat);
+            &rep_level_runs_owned
+        };
 
-        if rep_levels.is_empty() {
+        if rep_runs.is_empty() {
             return Ok(new_empty_array(&self.data_type));
         }
 
-        if rep_levels[0] != 0 {
+        if rep_runs[0].0 != 0 {
             return Err(general_err!("first repetition level of batch must be 0"));
         }
-
-        let rep_runs = levels_to_runs(rep_levels);
 
         // Max definition level from runs — O(runs) not O(rows).
         let max_def_level = def_runs

@@ -182,9 +182,10 @@ pub struct TypedTripletIter<T: DataType> {
     // values and levels
     values: Vec<T::T>,
     def_levels: Option<RunLevelBuffer>,
-    rep_levels: Option<Vec<i16>>,
-    /// Materialized def levels for indexed access
+    rep_levels: Option<RunLevelBuffer>,
+    /// Materialized levels for indexed access
     def_levels_flat: Option<Vec<i16>>,
+    rep_levels_flat: Option<Vec<i16>>,
     // current index for the triplet (value, def, rep)
     curr_triplet_index: usize,
     // how many triplets are left before we need to buffer
@@ -213,7 +214,7 @@ impl<T: DataType> TypedTripletIter<T> {
         let rep_levels = if max_rep_level == 0 {
             None
         } else {
-            Some(vec![0; batch_size])
+            Some(RunLevelBuffer::new())
         };
 
         Self {
@@ -226,6 +227,7 @@ impl<T: DataType> TypedTripletIter<T> {
             def_levels,
             rep_levels,
             def_levels_flat: None,
+            rep_levels_flat: None,
             curr_triplet_index: 0,
             triplets_left: 0,
             has_next: false,
@@ -277,7 +279,7 @@ impl<T: DataType> TypedTripletIter<T> {
     /// If field is required, then maximum repetition level is returned.
     #[inline]
     fn current_rep_level(&self) -> i16 {
-        match self.rep_levels {
+        match self.rep_levels_flat {
             Some(ref vec) => vec[self.curr_triplet_index],
             None => self.max_rep_level,
         }
@@ -306,8 +308,9 @@ impl<T: DataType> TypedTripletIter<T> {
                 }
                 self.def_levels_flat = None;
                 if let Some(x) = &mut self.rep_levels {
-                    x.clear()
+                    x.clear();
                 }
+                self.rep_levels_flat = None;
 
                 // Buffer triplets
                 self.reader.read_records(
@@ -328,6 +331,13 @@ impl<T: DataType> TypedTripletIter<T> {
             if levels_read == 0 || values_read == levels_read {
                 // There are no definition levels to read, column is required
                 // or definition levels match values, so it does not require spacing
+                self.def_levels_flat =
+                    self.def_levels.as_mut().and_then(|d| {
+                        let flat = d.take_flat();
+                        if flat.is_empty() { None } else { Some(flat) }
+                    });
+                self.rep_levels_flat =
+                    self.rep_levels.as_mut().map(|r| r.take_flat());
                 self.curr_triplet_index = 0;
                 self.triplets_left = values_read;
             } else if values_read < levels_read {
@@ -337,9 +347,11 @@ impl<T: DataType> TypedTripletIter<T> {
                 // Values and levels are guaranteed to line up, because of
                 // the column reader method.
 
-                // Materialize def levels for indexed access
+                // Materialize levels for indexed access
                 self.def_levels_flat =
                     Some(self.def_levels.as_mut().unwrap().take_flat());
+                self.rep_levels_flat =
+                    self.rep_levels.as_mut().map(|r| r.take_flat());
 
                 // Note: if values_read == 0, then spacing will not be triggered
                 let mut idx = values_read;

@@ -109,7 +109,8 @@ where
     pages: Box<dyn PageIterator>,
     /// Definition levels stored as runs — no flat Vec<i16> materialization.
     def_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
-    rep_levels_buffer: Option<Vec<i16>>,
+    /// Repetition levels stored as runs — no flat Vec<i16> materialization.
+    rep_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     record_reader: RecordReader<T>,
 }
 
@@ -139,7 +140,7 @@ where
             data_type,
             pages,
             def_level_runs: None,
-            rep_levels_buffer: None,
+            rep_level_runs: None,
             record_reader,
         })
     }
@@ -496,7 +497,7 @@ where
 
         // Take definition level runs directly — no flat Vec<i16> materialization.
         self.def_level_runs = self.record_reader.consume_def_level_runs();
-        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
+        self.rep_level_runs = self.record_reader.consume_rep_level_runs();
         self.record_reader.reset();
         Ok(array)
     }
@@ -512,7 +513,7 @@ where
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
-        self.rep_levels_buffer.as_deref()
+        self.rep_level_runs.as_ref().map(|r| r.as_slice())
     }
 
     fn set_skip_padding(&mut self, skip: bool) -> bool {
@@ -522,6 +523,10 @@ where
 
     fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
         self.def_level_runs.as_ref().map(|r| r.runs())
+    }
+
+    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.rep_level_runs.as_ref().map(|r| r.runs())
     }
 }
 

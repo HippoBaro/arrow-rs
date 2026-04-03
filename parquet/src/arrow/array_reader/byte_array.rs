@@ -79,7 +79,7 @@ struct ByteArrayReader<I: OffsetSizeTrait> {
     data_type: ArrowType,
     pages: Box<dyn PageIterator>,
     def_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
-    rep_levels_buffer: Option<Vec<i16>>,
+    rep_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     record_reader: GenericRecordReader<OffsetBuffer<I>, ByteArrayColumnValueDecoder<I>>,
 }
 
@@ -93,7 +93,7 @@ impl<I: OffsetSizeTrait> ByteArrayReader<I> {
             data_type,
             pages,
             def_level_runs: None,
-            rep_levels_buffer: None,
+            rep_level_runs: None,
             record_reader,
         }
     }
@@ -122,7 +122,7 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
             self.record_reader.consume_bitmap_buffer()
         };
         self.def_level_runs = self.record_reader.consume_def_level_runs();
-        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
+        self.rep_level_runs = self.record_reader.consume_rep_level_runs();
         self.record_reader.reset();
 
         let array: ArrayRef = match self.data_type {
@@ -168,7 +168,7 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
-        self.rep_levels_buffer.as_deref()
+        self.rep_level_runs.as_ref().map(|r| r.as_slice())
     }
 
     fn set_skip_padding(&mut self, skip: bool) -> bool {
@@ -178,6 +178,10 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
 
     fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
         self.def_level_runs.as_ref().map(|r| r.runs())
+    }
+
+    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.rep_level_runs.as_ref().map(|r| r.runs())
     }
 }
 

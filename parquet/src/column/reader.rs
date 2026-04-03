@@ -1319,7 +1319,8 @@ mod tests {
             let mut values = Vec::new();
             let mut def_levels =
                 crate::column::reader::run_level_buffer::RunLevelBuffer::new();
-            let mut rep_levels = Vec::new();
+            let mut rep_levels =
+                crate::column::reader::run_level_buffer::RunLevelBuffer::new();
 
             let mut curr_values_read = 0;
             let mut curr_levels_read = 0;
@@ -1352,8 +1353,9 @@ mod tests {
             }
 
             if max_rep_level > 0 {
+                let rep_levels_flat = rep_levels.take_flat();
                 assert_eq!(
-                    rep_levels, self.rep_levels,
+                    rep_levels_flat, self.rep_levels,
                     "repetition levels content doesn't match"
                 );
             }

@@ -4039,7 +4039,8 @@ mod tests {
         let mut actual_values = Vec::with_capacity(max_batch_size);
         let mut actual_def_levels = def_levels
             .map(|_| crate::column::reader::run_level_buffer::RunLevelBuffer::new());
-        let mut actual_rep_levels = rep_levels.map(|_| Vec::with_capacity(max_batch_size));
+        let mut actual_rep_levels = rep_levels
+            .map(|_| crate::column::reader::run_level_buffer::RunLevelBuffer::new());
 
         let (_, values_read, levels_read) = reader
             .read_records(
@@ -4060,20 +4061,22 @@ mod tests {
             }
             None => assert_eq!(None, def_levels),
         }
-        match actual_rep_levels {
-            Some(ref vec) => assert_eq!(Some(&vec[..levels_read]), rep_levels),
-            None => assert_eq!(None, rep_levels),
-        }
+        let rep_flat = match actual_rep_levels {
+            Some(ref mut buf) => {
+                let flat = buf.take_flat();
+                assert_eq!(Some(&flat[..levels_read]), rep_levels);
+                Some(flat)
+            }
+            None => {
+                assert_eq!(None, rep_levels);
+                None
+            }
+        };
 
         // Assert written rows.
 
-        if let Some(levels) = actual_rep_levels {
-            let mut actual_rows_written = 0;
-            for l in levels {
-                if l == 0 {
-                    actual_rows_written += 1;
-                }
-            }
+        if let Some(flat) = rep_flat {
+            let actual_rows_written = flat.iter().filter(|&&l| l == 0).count() as u64;
             assert_eq!(actual_rows_written, result.rows_written);
         } else if actual_def_levels.is_some() {
             assert_eq!(levels_read as u64, result.rows_written);
