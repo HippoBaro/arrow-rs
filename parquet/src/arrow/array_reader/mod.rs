@@ -42,6 +42,7 @@ mod list_array;
 mod map_array;
 mod null_array;
 mod primitive_array;
+mod ree_array;
 mod row_group_cache;
 mod row_number;
 mod struct_array;
