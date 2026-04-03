@@ -528,6 +528,20 @@ where
     fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
         self.rep_level_runs.as_ref().map(|r| r.runs())
     }
+
+    fn peek_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.record_reader.def_level_runs()
+    }
+
+    fn discard_batch(&mut self) -> Result<usize> {
+        let n = self.record_reader.num_values();
+        self.def_level_runs = self.record_reader.consume_def_level_runs();
+        self.rep_level_runs = self.record_reader.consume_rep_level_runs();
+        let _ = self.record_reader.consume_record_data();
+        self.record_reader.consume_bitmap_buffer();
+        self.record_reader.reset();
+        Ok(n)
+    }
 }
 
 #[cfg(test)]

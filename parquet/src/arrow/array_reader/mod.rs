@@ -157,6 +157,23 @@ pub trait ArrayReader: Send {
     fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
         None
     }
+
+    /// Returns the buffered definition level runs BEFORE consume_batch.
+    /// This allows callers to inspect the level data (e.g., to detect
+    /// all-null batches) without triggering array materialization.
+    /// Returns None if not supported.
+    fn peek_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        None
+    }
+
+    /// Discard the current buffered batch without materializing an array.
+    /// Resets internal state so the reader is ready for the next
+    /// read_records call. Returns the number of records discarded.
+    /// Default implementation calls consume_batch and drops the result.
+    fn discard_batch(&mut self) -> Result<usize> {
+        let array = self.consume_batch()?;
+        Ok(array.len())
+    }
 }
 
 /// Interface for reading data pages from the columns of one or more RowGroups.

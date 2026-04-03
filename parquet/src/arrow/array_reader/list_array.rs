@@ -416,4 +416,12 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
     fn get_rep_levels(&self) -> Option<&[i16]> {
         self.item_reader.get_rep_levels()
     }
+
+    fn peek_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.item_reader.peek_def_level_runs()
+    }
+
+    fn discard_batch(&mut self) -> Result<usize> {
+        self.item_reader.discard_batch()
+    }
 }

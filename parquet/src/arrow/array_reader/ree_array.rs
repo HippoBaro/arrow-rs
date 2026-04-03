@@ -432,6 +432,22 @@ impl ReeWrappingReader {
     }
 }
 
+impl ReeWrappingReader {
+    /// Check if the buffered batch is entirely null by inspecting the
+    /// inner reader's def level runs. Returns Some(num_rows) if all-null.
+    fn check_all_null(&self) -> Option<usize> {
+        let runs = self.inner.peek_def_level_runs()?;
+        // All null if every run has def_level == 0
+        if runs.iter().all(|(def, _)| *def == 0) {
+            let total: usize = runs.iter().map(|(_, c)| *c as usize).sum();
+            if total > 0 {
+                return Some(total);
+            }
+        }
+        None
+    }
+}
+
 impl ArrayReader for ReeWrappingReader {
     fn as_any(&self) -> &dyn Any {
         self
@@ -446,6 +462,26 @@ impl ArrayReader for ReeWrappingReader {
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
+        // Short-circuit: if the entire batch is null, produce a compact
+        // REE null array directly WITHOUT materializing the dense array.
+        // This avoids the O(rows) allocation that List/ByteArray columns
+        // incur even when all-null.
+        if let Some(num_rows) = self.check_all_null() {
+            // Discard the buffered data without materializing
+            self.inner.discard_batch()?;
+
+            // Produce a single-run REE null array (~9 bytes)
+            let run_ends = Int32Array::from(vec![num_rows as i32]);
+            let inner_type = match &self.ree_data_type {
+                ArrowType::RunEndEncoded(_, v) => v.data_type(),
+                _ => unreachable!(),
+            };
+            let null_value = arrow_array::new_null_array(inner_type, 1);
+            let run_array =
+                RunArray::<ArrowInt32Type>::try_new(&run_ends, &null_value)?;
+            return Ok(Arc::new(run_array));
+        }
+
         let dense = self.inner.consume_batch()?;
         dense_to_ree(dense)
     }
