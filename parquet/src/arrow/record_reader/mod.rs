@@ -174,6 +174,15 @@ where
         self.def_levels.as_ref().and_then(|x| x.runs())
     }
 
+    /// Takes the RunLevelBuffer for definition levels without materializing.
+    pub fn consume_def_level_runs(
+        &mut self,
+    ) -> Option<crate::column::reader::run_level_buffer::RunLevelBuffer> {
+        self.def_levels
+            .as_mut()
+            .and_then(|x| x.take_run_level_buffer())
+    }
+
     /// Return repetition level data.
     /// The side effect is similar to `consume_def_levels`.
     pub fn consume_rep_levels(&mut self) -> Option<Vec<i16>> {

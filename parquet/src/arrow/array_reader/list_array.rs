@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::arrow::array_reader::ArrayReader;
+use crate::column::reader::run_level_buffer::RunCursor;
 use crate::errors::ParquetError;
 use crate::errors::Result;
 use arrow_array::{
@@ -82,10 +83,7 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             return Ok(new_empty_array(&self.data_type));
         }
 
-        let def_levels = self
-            .item_reader
-            .get_def_levels()
-            .ok_or_else(|| general_err!("item_reader def levels are None."))?;
+        let def_level_runs = self.item_reader.get_def_level_runs();
 
         let rep_levels = self
             .item_reader
@@ -117,10 +115,28 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
         let mut child_data_builder =
             MutableArrayData::new(vec![&data], false, next_batch_array.len());
 
-        def_levels.iter().zip(rep_levels).try_for_each(|(d, r)| {
+        // Use a run cursor for def levels to avoid flat materialization.
+        // Fall back to get_def_levels() if runs aren't available.
+        let def_level_runs_owned;
+        let mut def_cursor = if let Some(runs) = def_level_runs {
+            Some(RunCursor::new(runs))
+        } else {
+            // Fallback: get flat def levels and convert to runs for the cursor
+            let flat = self
+                .item_reader
+                .get_def_levels()
+                .ok_or_else(|| general_err!("item_reader def levels are None."))?;
+            def_level_runs_owned =
+                crate::column::reader::run_level_buffer::levels_to_runs(flat);
+            Some(RunCursor::new(&def_level_runs_owned))
+        };
+
+        let cursor = def_cursor.as_mut().unwrap();
+        for r in rep_levels {
+            let d = cursor.next();
             match r.cmp(&self.rep_level) {
                 Ordering::Greater => {
-                    if *d < self.def_level {
+                    if d < self.def_level {
                         return Err(general_err!(
                             "Encountered repetition level too large for definition level"
                         ));
@@ -132,7 +148,7 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
                 Ordering::Less => {
                     list_offsets.push(OffsetSize::from_usize(cur_offset).unwrap());
 
-                    if *d >= self.def_level {
+                    if d >= self.def_level {
                         filter_start.get_or_insert(cur_offset + skipped);
                         cur_offset += 1;
 
@@ -145,15 +161,14 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
                         }
 
                         if let Some(validity) = validity.as_mut() {
-                            validity.append(*d + 1 == self.def_level)
+                            validity.append(d + 1 == self.def_level)
                         }
 
                         skipped += 1;
                     }
                 }
             }
-            Ok(())
-        })?;
+        }
 
         list_offsets.push(OffsetSize::from_usize(cur_offset).unwrap());
 
@@ -200,21 +215,14 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
     fn consume_batch_unpadded(&mut self) -> Result<ArrayRef> {
         let compact_array = self.item_reader.consume_batch()?;
 
-        // Get def level runs if available (O(runs) max computation),
-        // otherwise fall back to materialized &[i16].
         let def_level_runs = self.item_reader.get_def_level_runs();
-
-        let def_levels = self
-            .item_reader
-            .get_def_levels()
-            .ok_or_else(|| general_err!("item_reader def levels are None."))?;
 
         let rep_levels = self
             .item_reader
             .get_rep_levels()
             .ok_or_else(|| general_err!("item_reader rep levels are None."))?;
 
-        if def_levels.is_empty() {
+        if rep_levels.is_empty() {
             return Ok(new_empty_array(&self.data_type));
         }
 
@@ -222,13 +230,27 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             return Err(general_err!("first repetition level of batch must be 0"));
         }
 
-        // Max definition level for the leaf. Use runs if available (O(runs))
-        // instead of scanning the full materialized slice (O(rows)).
-        let max_def_level = if let Some(runs) = def_level_runs {
-            runs.iter().map(|(v, _)| *v).max().unwrap_or(self.def_level)
+        // Build a run cursor for def levels. If runs aren't available,
+        // fall back to materializing from get_def_levels().
+        let def_level_runs_owned;
+        let def_runs = if let Some(runs) = def_level_runs {
+            runs
         } else {
-            def_levels.iter().max().copied().unwrap_or(self.def_level)
+            let flat = self
+                .item_reader
+                .get_def_levels()
+                .ok_or_else(|| general_err!("item_reader def levels are None."))?;
+            def_level_runs_owned =
+                crate::column::reader::run_level_buffer::levels_to_runs(flat);
+            &def_level_runs_owned
         };
+
+        // Max definition level from runs — O(runs) not O(rows).
+        let max_def_level = def_runs
+            .iter()
+            .map(|(v, _)| *v)
+            .max()
+            .unwrap_or(self.def_level);
 
         // Whether items within non-null lists can themselves be null.
         let items_nullable = max_def_level > self.def_level;
@@ -236,37 +258,33 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
         let mut list_offsets: Vec<OffsetSize> = Vec::new();
         let mut validity = self
             .nullable
-            .then(|| BooleanBufferBuilder::new(def_levels.len()));
+            .then(|| BooleanBufferBuilder::new(rep_levels.len()));
+
+        let mut def_cursor = RunCursor::new(def_runs);
 
         let child_data;
 
         if !items_nullable {
-            // Fast path: items within non-null lists cannot be null.
-            // The compact array maps 1:1 to the output child array — no
-            // MutableArrayData needed, no run tracking, no null re-insertion.
             let mut cur_offset: usize = 0;
 
-            for (d, r) in def_levels.iter().zip(rep_levels) {
+            for r in rep_levels {
+                let d = def_cursor.next();
                 if *r < self.rep_level {
-                    // New record boundary
                     list_offsets.push(
                         OffsetSize::from_usize(cur_offset)
                             .ok_or_else(|| general_err!("offset overflow"))?,
                     );
-                    if *d >= self.def_level {
-                        // Non-null list with a value
+                    if d >= self.def_level {
                         if let Some(v) = validity.as_mut() {
                             v.append(true);
                         }
                         cur_offset += 1;
                     } else {
-                        // Null or empty list
                         if let Some(v) = validity.as_mut() {
-                            v.append(*d + 1 == self.def_level);
+                            v.append(d + 1 == self.def_level);
                         }
                     }
-                } else if *d >= self.def_level {
-                    // Continuation value within a non-null list
+                } else if d >= self.def_level {
                     cur_offset += 1;
                 }
             }
@@ -285,9 +303,6 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
 
             child_data = compact_array.to_data();
         } else {
-            // Slow path: items within non-null lists can be null.
-            // Use MutableArrayData (sized to the compact array, not the
-            // full padded row count) to re-insert null entries.
             let mut cur_offset: usize = 0;
             let mut compact_idx: usize = 0;
 
@@ -295,16 +310,15 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             let mut child_builder =
                 MutableArrayData::new(vec![&compact_data], true, compact_array.len());
 
-            // Track the start of a run of consecutive compact values for batched extends.
             let mut run_start: Option<usize> = None;
 
-            for (d, r) in def_levels.iter().zip(rep_levels) {
+            for r in rep_levels {
+                let d = def_cursor.next();
                 let is_list_boundary = *r < self.rep_level;
-                let list_exists = *d >= self.def_level;
-                let value_exists = *d >= max_def_level;
+                let list_exists = d >= self.def_level;
+                let value_exists = d >= max_def_level;
 
                 if is_list_boundary {
-                    // Flush any pending run of values before starting a new record.
                     if let Some(start) = run_start.take() {
                         child_builder.extend(0, start, compact_idx);
                     }
@@ -328,17 +342,15 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
                         }
                     } else {
                         if let Some(v) = validity.as_mut() {
-                            v.append(*d + 1 == self.def_level);
+                            v.append(d + 1 == self.def_level);
                         }
                     }
                 } else if list_exists {
-                    // Continuation within a non-null list
                     if value_exists {
                         run_start.get_or_insert(compact_idx);
                         compact_idx += 1;
                         cur_offset += 1;
                     } else {
-                        // Null item — flush run and insert null
                         if let Some(start) = run_start.take() {
                             child_builder.extend(0, start, compact_idx);
                         }

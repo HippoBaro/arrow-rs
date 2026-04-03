@@ -152,13 +152,6 @@ pub trait ArrayReader: Send {
         None
     }
 
-    /// Returns repetition levels as run-length encoded `(value, count)` pairs
-    /// from the last call to `consume_batch`, if available.
-    ///
-    /// Same semantics as [`get_def_level_runs`](ArrayReader::get_def_level_runs).
-    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
-        None
-    }
 }
 
 /// Interface for reading data pages from the columns of one or more RowGroups.

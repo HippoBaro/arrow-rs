@@ -100,6 +100,15 @@ impl DefinitionLevelBuffer {
         }
     }
 
+    /// Takes the RunLevelBuffer without materializing to Vec<i16>.
+    /// Returns None for Mask mode.
+    pub fn take_run_level_buffer(&mut self) -> Option<RunLevelBuffer> {
+        match &mut self.inner {
+            BufferInner::Full { levels, .. } => Some(std::mem::take(levels)),
+            BufferInner::Mask { .. } => None,
+        }
+    }
+
     /// Returns the built null bitmask
     pub fn consume_bitmask(&mut self) -> Buffer {
         self.len = 0;

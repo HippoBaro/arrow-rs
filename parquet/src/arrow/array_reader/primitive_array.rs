@@ -107,10 +107,9 @@ where
 {
     data_type: ArrowType,
     pages: Box<dyn PageIterator>,
-    def_levels_buffer: Option<Vec<i16>>,
-    def_level_runs_buffer: Option<Vec<(i16, u32)>>,
+    /// Definition levels stored as runs — no flat Vec<i16> materialization.
+    def_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     rep_levels_buffer: Option<Vec<i16>>,
-    rep_level_runs_buffer: Option<Vec<(i16, u32)>>,
     record_reader: RecordReader<T>,
 }
 
@@ -139,10 +138,8 @@ where
         Ok(Self {
             data_type,
             pages,
-            def_levels_buffer: None,
-            def_level_runs_buffer: None,
+            def_level_runs: None,
             rep_levels_buffer: None,
-            rep_level_runs_buffer: None,
             record_reader,
         })
     }
@@ -497,17 +494,9 @@ where
             _ => arrow_cast::cast(&array, target_type)?,
         };
 
-        // save definition level runs (before materializing) and repetition buffers
-        self.def_level_runs_buffer = self
-            .record_reader
-            .def_level_runs()
-            .map(|r| r.to_vec());
-        self.def_levels_buffer = self.record_reader.consume_def_levels();
+        // Take definition level runs directly — no flat Vec<i16> materialization.
+        self.def_level_runs = self.record_reader.consume_def_level_runs();
         self.rep_levels_buffer = self.record_reader.consume_rep_levels();
-        self.rep_level_runs_buffer = self
-            .rep_levels_buffer
-            .as_deref()
-            .map(crate::column::reader::run_level_buffer::levels_to_runs);
         self.record_reader.reset();
         Ok(array)
     }
@@ -517,7 +506,9 @@ where
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
-        self.def_levels_buffer.as_deref()
+        // Lazily materialize from runs via OnceCell.
+        // Prefer get_def_level_runs() to avoid materialization.
+        self.def_level_runs.as_ref().map(|r| r.as_slice())
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
@@ -530,11 +521,7 @@ where
     }
 
     fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
-        self.def_level_runs_buffer.as_deref()
-    }
-
-    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
-        self.rep_level_runs_buffer.as_deref()
+        self.def_level_runs.as_ref().map(|r| r.runs())
     }
 }
 

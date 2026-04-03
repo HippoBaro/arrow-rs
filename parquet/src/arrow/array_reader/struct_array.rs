@@ -138,29 +138,51 @@ impl ArrayReader for StructArrayReader {
             // calculate struct def level data
 
             // children should have consistent view of parent, only need to inspect first child
-            let def_levels = self.children[0]
-                .get_def_levels()
-                .expect("child with nullable parents must have definition level");
-
-            // calculate bitmap for current array
             let mut bitmap_builder = BooleanBufferBuilder::new(children_array_len);
 
-            match self.children[0].get_rep_levels() {
-                Some(rep_levels) => {
-                    // Sanity check
-                    assert_eq!(rep_levels.len(), def_levels.len());
-
-                    for (rep_level, def_level) in rep_levels.iter().zip(def_levels) {
-                        if rep_level > &self.struct_rep_level {
-                            // Already handled by inner list - SKIP
+            match (
+                self.children[0].get_def_level_runs(),
+                self.children[0].get_rep_levels(),
+            ) {
+                (Some(def_runs), Some(rep_levels)) => {
+                    // Use run cursor for def levels, flat for rep levels
+                    let mut def_cursor =
+                        crate::column::reader::run_level_buffer::RunCursor::new(
+                            def_runs,
+                        );
+                    for rep_level in rep_levels {
+                        let def_level = def_cursor.next();
+                        if *rep_level > self.struct_rep_level {
                             continue;
                         }
-                        bitmap_builder.append(*def_level >= self.struct_def_level)
+                        bitmap_builder.append(def_level >= self.struct_def_level)
                     }
                 }
-                None => {
-                    for def_level in def_levels {
-                        bitmap_builder.append(*def_level >= self.struct_def_level)
+                (Some(def_runs), None) => {
+                    // No rep levels — build bitmap directly from def runs
+                    for &(value, count) in def_runs {
+                        bitmap_builder
+                            .append_n(count as usize, value >= self.struct_def_level);
+                    }
+                }
+                (None, rep_levels_opt) => {
+                    // Fallback: use flat def levels
+                    let def_levels = self.children[0]
+                        .get_def_levels()
+                        .expect("child with nullable parents must have definition level");
+
+                    if let Some(rep_levels) = rep_levels_opt {
+                        assert_eq!(rep_levels.len(), def_levels.len());
+                        for (rep_level, def_level) in rep_levels.iter().zip(def_levels) {
+                            if rep_level > &self.struct_rep_level {
+                                continue;
+                            }
+                            bitmap_builder.append(*def_level >= self.struct_def_level)
+                        }
+                    } else {
+                        for def_level in def_levels {
+                            bitmap_builder.append(*def_level >= self.struct_def_level)
+                        }
                     }
                 }
             }
