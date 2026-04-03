@@ -144,6 +144,17 @@ impl<'a> ArrayReaderBuilder<'a> {
         field: &ParquetField,
         mask: &ProjectionMask,
     ) -> Result<Option<Box<dyn ArrayReader>>> {
+        // If the field is REE-wrapped, unwrap it, build the inner reader
+        // for the original type, then wrap in ReeWrappingReader.
+        if let DataType::RunEndEncoded(_, ref values_field) = field.arrow_type {
+            let mut inner_field = field.clone();
+            inner_field.arrow_type = values_field.data_type().clone();
+            let inner_reader = self.build_reader(&inner_field, mask)?;
+            return Ok(inner_reader.map(|r| {
+                Box::new(ree_array::ReeWrappingReader::new(r)) as Box<dyn ArrayReader>
+            }));
+        }
+
         match field.field_type {
             ParquetFieldType::Primitive { col_idx, .. } => {
                 let Some(reader) = self.build_primitive_reader(field, mask)? else {

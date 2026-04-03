@@ -167,36 +167,37 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
 /// in `DataType::RunEndEncoded(...)`. Eligible fields are:
 /// - Nullable (`def_level > 0`)
 /// - Not repeated (`rep_level == 0`)
-/// - Primitive type (not Group or Virtual)
-/// - Arrow type is a primitive width type (not ByteArray, List, etc.)
+/// - Not a Null type
+///
+/// For top-level Group fields (List, Map, Struct), the group itself is
+/// wrapped in REE — its children are NOT recursively transformed, since
+/// the REE wrapping applies to the entire composite value.
 fn transform_fields_for_ree(field: &ParquetField) -> ParquetField {
-    match &field.field_type {
-        ParquetFieldType::Primitive { .. } => {
-            // Check eligibility: nullable, non-repeated, primitive Arrow type
-            let eligible = field.def_level > 0
-                && field.rep_level == 0
-                && !matches!(field.arrow_type, ArrowType::Null)
-                && field.arrow_type.primitive_width().is_some();
+    // Check if this field should be REE-wrapped: nullable, non-repeated
+    let eligible = field.def_level > 0
+        && field.rep_level == 0
+        && !matches!(field.arrow_type, ArrowType::Null);
 
-            if eligible {
-                let mut transformed = field.clone();
-                transformed.arrow_type = ArrowType::RunEndEncoded(
-                    Arc::new(arrow_schema::Field::new(
-                        "run_ends",
-                        ArrowType::Int32,
-                        false,
-                    )),
-                    Arc::new(arrow_schema::Field::new(
-                        "values",
-                        field.arrow_type.clone(),
-                        true,
-                    )),
-                );
-                transformed
-            } else {
-                field.clone()
-            }
-        }
+    if eligible {
+        let mut transformed = field.clone();
+        transformed.arrow_type = ArrowType::RunEndEncoded(
+            Arc::new(arrow_schema::Field::new(
+                "run_ends",
+                ArrowType::Int32,
+                false,
+            )),
+            Arc::new(arrow_schema::Field::new(
+                "values",
+                field.arrow_type.clone(),
+                true,
+            )),
+        );
+        return transformed;
+    }
+
+    // For non-eligible groups (e.g. the root struct, or repeated groups),
+    // recurse into children to find eligible nested fields.
+    match &field.field_type {
         ParquetFieldType::Group { children } => {
             let transformed_children: Vec<ParquetField> =
                 children.iter().map(transform_fields_for_ree).collect();
@@ -210,7 +211,8 @@ fn transform_fields_for_ree(field: &ParquetField) -> ParquetField {
                 },
             }
         }
-        ParquetFieldType::Virtual(_) => field.clone(),
+        // Primitive or Virtual fields that weren't eligible for REE
+        _ => field.clone(),
     }
 }
 

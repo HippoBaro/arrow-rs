@@ -347,3 +347,126 @@ where
         self.rep_level_runs.as_ref().map(|r| r.runs())
     }
 }
+
+/// Convert a dense array (which may contain nulls) into a RunEndEncoded
+/// array by collapsing consecutive null entries into single runs.
+/// Non-null entries get one REE entry each.
+///
+/// For an all-null array of 100K entries, this produces a RunArray with
+/// 1 physical entry (~9 bytes) instead of 100K dense entries.
+pub(crate) fn dense_to_ree(dense: ArrayRef) -> Result<ArrayRef> {
+    let len = dense.len();
+    if len == 0 {
+        let run_ends = Int32Array::from(Vec::<i32>::new());
+        let values = arrow_array::new_empty_array(dense.data_type());
+        let run_array = RunArray::<ArrowInt32Type>::try_new(&run_ends, &values)?;
+        return Ok(Arc::new(run_array));
+    }
+
+    // Scan the validity bitmap to identify null and non-null runs.
+    let mut run_ends: Vec<i32> = Vec::new();
+    let mut value_indices: Vec<Option<usize>> = Vec::new();
+
+    let mut i = 0;
+    while i < len {
+        if dense.is_null(i) {
+            // Start of a null run — find how far it extends
+            let start = i;
+            while i < len && dense.is_null(i) {
+                i += 1;
+            }
+            // One REE entry for the entire null run
+            run_ends.push(i as i32);
+            value_indices.push(None);
+        } else {
+            // Single non-null entry
+            run_ends.push((i + 1) as i32);
+            value_indices.push(Some(i));
+            i += 1;
+        }
+    }
+
+    // Build the values array using MutableArrayData
+    let dense_data = dense.to_data();
+    let mut values_builder =
+        arrow_data::transform::MutableArrayData::new(vec![&dense_data], true, value_indices.len());
+
+    for idx in &value_indices {
+        match idx {
+            Some(i) => values_builder.extend(0, *i, *i + 1),
+            None => values_builder.extend_nulls(1),
+        }
+    }
+
+    let values_data = values_builder.freeze();
+    let values_array = arrow_array::make_array(values_data);
+    let run_ends_array = Int32Array::from(run_ends);
+
+    let run_array = RunArray::<ArrowInt32Type>::try_new(&run_ends_array, &values_array)?;
+    Ok(Arc::new(run_array))
+}
+
+/// A generic [`ArrayReader`] wrapper that converts any inner reader's
+/// dense output into RunEndEncoded (REE) arrays.
+///
+/// Delegates all operations to the inner reader, then wraps the output
+/// of `consume_batch` in a `RunArray` by collapsing null runs.
+///
+/// Works for any column type: List, ByteArray, Primitive, Struct, etc.
+pub struct ReeWrappingReader {
+    inner: Box<dyn ArrayReader>,
+    ree_data_type: ArrowType,
+}
+
+impl ReeWrappingReader {
+    pub fn new(inner: Box<dyn ArrayReader>) -> Self {
+        let inner_type = inner.get_data_type().clone();
+        let ree_data_type = ArrowType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", ArrowType::Int32, false)),
+            Arc::new(Field::new("values", inner_type, true)),
+        );
+        Self {
+            inner,
+            ree_data_type,
+        }
+    }
+}
+
+impl ArrayReader for ReeWrappingReader {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn get_data_type(&self) -> &ArrowType {
+        &self.ree_data_type
+    }
+
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        self.inner.read_records(batch_size)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        let dense = self.inner.consume_batch()?;
+        dense_to_ree(dense)
+    }
+
+    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+        self.inner.skip_records(num_records)
+    }
+
+    fn get_def_levels(&self) -> Option<&[i16]> {
+        self.inner.get_def_levels()
+    }
+
+    fn get_rep_levels(&self) -> Option<&[i16]> {
+        self.inner.get_rep_levels()
+    }
+
+    fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.inner.get_def_level_runs()
+    }
+
+    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.inner.get_rep_level_runs()
+    }
+}
