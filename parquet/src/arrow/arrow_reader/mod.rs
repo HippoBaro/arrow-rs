@@ -29,7 +29,8 @@ use std::sync::Arc;
 pub use crate::arrow::array_reader::RowGroups;
 use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder};
 use crate::arrow::schema::{
-    ParquetField, parquet_to_arrow_schema_and_fields, virtual_type::is_virtual_column,
+    ParquetField, ParquetFieldType, parquet_to_arrow_schema_and_fields,
+    virtual_type::is_virtual_column,
 };
 use crate::arrow::{FieldLevels, ProjectionMask, parquet_to_arrow_field_levels_with_virtual};
 use crate::basic::{BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash};
@@ -140,9 +141,6 @@ pub struct ArrowReaderBuilder<T> {
 
     pub(crate) max_predicate_cache_size: usize,
 
-    /// When true, eligible nullable primitive columns produce Arrow
-    /// RunEndEncoded arrays instead of dense arrays.
-    pub(crate) use_ree: bool,
 }
 
 impl<T: Debug> Debug for ArrowReaderBuilder<T> {
@@ -165,6 +163,57 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
     }
 }
 
+/// Transform a `ParquetField` tree to wrap eligible primitive fields
+/// in `DataType::RunEndEncoded(...)`. Eligible fields are:
+/// - Nullable (`def_level > 0`)
+/// - Not repeated (`rep_level == 0`)
+/// - Primitive type (not Group or Virtual)
+/// - Arrow type is a primitive width type (not ByteArray, List, etc.)
+fn transform_fields_for_ree(field: &ParquetField) -> ParquetField {
+    match &field.field_type {
+        ParquetFieldType::Primitive { .. } => {
+            // Check eligibility: nullable, non-repeated, primitive Arrow type
+            let eligible = field.def_level > 0
+                && field.rep_level == 0
+                && !matches!(field.arrow_type, ArrowType::Null)
+                && field.arrow_type.primitive_width().is_some();
+
+            if eligible {
+                let mut transformed = field.clone();
+                transformed.arrow_type = ArrowType::RunEndEncoded(
+                    Arc::new(arrow_schema::Field::new(
+                        "run_ends",
+                        ArrowType::Int32,
+                        false,
+                    )),
+                    Arc::new(arrow_schema::Field::new(
+                        "values",
+                        field.arrow_type.clone(),
+                        true,
+                    )),
+                );
+                transformed
+            } else {
+                field.clone()
+            }
+        }
+        ParquetFieldType::Group { children } => {
+            let transformed_children: Vec<ParquetField> =
+                children.iter().map(transform_fields_for_ree).collect();
+            ParquetField {
+                rep_level: field.rep_level,
+                def_level: field.def_level,
+                nullable: field.nullable,
+                arrow_type: field.arrow_type.clone(),
+                field_type: ParquetFieldType::Group {
+                    children: transformed_children,
+                },
+            }
+        }
+        ParquetFieldType::Virtual(_) => field.clone(),
+    }
+}
+
 impl<T> ArrowReaderBuilder<T> {
     pub(crate) fn new_builder(input: T, metadata: ArrowReaderMetadata) -> Self {
         Self {
@@ -182,7 +231,6 @@ impl<T> ArrowReaderBuilder<T> {
             offset: None,
             metrics: ArrowReaderMetrics::Disabled,
             max_predicate_cache_size: 100 * 1024 * 1024, // 100MB default cache size
-            use_ree: false,
         }
     }
 
@@ -202,15 +250,57 @@ impl<T> ArrowReaderBuilder<T> {
     }
 
     /// Enable RunEndEncoded (REE) output for eligible nullable primitive
-    /// columns. When set, sparse nullable columns produce Arrow `RunArray`
-    /// instead of dense arrays, preserving the RLE run structure from
-    /// Parquet encoding. This avoids dense materialization and
-    /// null-padding for sparse columns.
+    /// columns. When set, the schema is transformed to declare eligible
+    /// columns as `DataType::RunEndEncoded(...)`, and the reader produces
+    /// Arrow `RunArray` for those columns.
     ///
-    /// Defaults to `false`. Only applies to nullable, non-repeated
-    /// primitive columns (INT32, INT64, FLOAT, DOUBLE, BOOLEAN).
-    pub fn with_run_end_encoding(self, use_ree: bool) -> Self {
-        Self { use_ree, ..self }
+    /// Eligible columns are nullable (`def_level > 0`), non-repeated
+    /// (`rep_level == 0`), primitive type columns (INT32, INT64, FLOAT,
+    /// DOUBLE, BOOLEAN, INT96).
+    ///
+    /// The schema returned by [`Self::schema()`] will reflect the REE
+    /// types, ensuring the contract between schema and produced arrays
+    /// is consistent.
+    pub fn with_run_end_encoding(mut self, enable: bool) -> Self {
+        if !enable {
+            return self;
+        }
+        // Transform the ParquetField tree to wrap eligible fields in REE
+        if let Some(ref fields) = self.fields {
+            let transformed = transform_fields_for_ree(fields);
+            self.fields = Some(Arc::new(transformed));
+        }
+        // Transform the Arrow schema to match
+        let new_fields: arrow_schema::Fields = self
+            .schema
+            .fields()
+            .iter()
+            .zip(
+                self.fields
+                    .as_ref()
+                    .and_then(|f| f.children())
+                    .unwrap_or(&[])
+                    .iter(),
+            )
+            .map(|(schema_field, parquet_field)| {
+                if parquet_field.arrow_type != *schema_field.data_type() {
+                    // The ParquetField was transformed — update the schema field
+                    Arc::new(
+                        schema_field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(parquet_field.arrow_type.clone()),
+                    )
+                } else {
+                    Arc::clone(schema_field)
+                }
+            })
+            .collect();
+        self.schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            new_fields,
+            self.schema.metadata().clone(),
+        ));
+        self
     }
 
     /// Set the size of [`RecordBatch`] to produce. Defaults to 1024
@@ -1053,7 +1143,6 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             metrics,
             // Not used for the sync reader, see https://github.com/apache/arrow-rs/issues/8000
             max_predicate_cache_size: _,
-            use_ree,
         } = self;
 
         // Try to avoid allocate large buffer
@@ -1084,7 +1173,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
                 let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_parquet_metadata(&reader.metadata)
-                    .with_ree(use_ree)
+
                     .build_array_reader(fields.as_deref(), predicate.projection())?;
 
                 plan_builder = plan_builder.with_predicate(array_reader, predicate.as_mut())?;
@@ -1093,7 +1182,6 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
         let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
             .with_parquet_metadata(&reader.metadata)
-            .with_ree(use_ree)
             .build_array_reader(fields.as_deref(), &projection)?;
 
         let read_plan = plan_builder

@@ -157,8 +157,6 @@ pub(crate) struct RowGroupReaderBuilder {
     /// The metrics collector
     metrics: ArrowReaderMetrics,
 
-    /// Whether to use RunEndEncoded arrays for eligible columns
-    use_ree: bool,
 
     /// Strategy for materialising row selections
     row_selection_policy: RowSelectionPolicy,
@@ -188,7 +186,6 @@ impl RowGroupReaderBuilder {
         max_predicate_cache_size: usize,
         buffers: PushBuffers,
         row_selection_policy: RowSelectionPolicy,
-        use_ree: bool,
     ) -> Self {
         Self {
             batch_size,
@@ -203,7 +200,6 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             state: Some(RowGroupDecoderState::Finished),
             buffers,
-            use_ree,
         }
     }
 
@@ -440,7 +436,7 @@ impl RowGroupReaderBuilder {
                 let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
                     .with_cache_options(Some(&cache_options))
                     .with_parquet_metadata(&self.metadata)
-                    .with_ree(self.use_ree)
+
                     .build_array_reader(self.fields.as_deref(), predicate.projection())?;
 
                 // Prepare to evaluate the filter.
@@ -608,8 +604,7 @@ impl RowGroupReaderBuilder {
 
                 // if we have any cached results, connect them up
                 let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
-                    .with_parquet_metadata(&self.metadata)
-                    .with_ree(self.use_ree);
+                    .with_parquet_metadata(&self.metadata);
                 let array_reader = if let Some(cache_info) = cache_info.as_ref() {
                     let cache_options = cache_info.builder().consumer();
                     array_reader_builder

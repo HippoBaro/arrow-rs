@@ -96,30 +96,16 @@ pub struct ArrayReaderBuilder<'a> {
     parquet_metadata: Option<&'a ParquetMetaData>,
     /// metrics
     metrics: &'a ArrowReaderMetrics,
-    /// When true, nullable primitive columns produce RunEndEncoded arrays
-    /// instead of dense arrays. This preserves the RLE run structure from
-    /// Parquet through to Arrow, avoiding dense materialization for sparse
-    /// columns.
-    use_ree: bool,
 }
 
 impl<'a> ArrayReaderBuilder<'a> {
     pub fn new(row_groups: &'a dyn RowGroups, metrics: &'a ArrowReaderMetrics) -> Self {
         Self {
             row_groups,
-            use_ree: false,
             cache_options: None,
             parquet_metadata: None,
             metrics,
         }
-    }
-
-    /// Enable RunEndEncoded output for nullable primitive columns.
-    /// When set, sparse nullable columns produce Arrow REE arrays instead
-    /// of dense arrays, preserving the RLE run structure from Parquet.
-    pub fn with_ree(mut self, use_ree: bool) -> Self {
-        self.use_ree = use_ree;
-        self
     }
 
     /// Add cache options to the builder
@@ -381,66 +367,54 @@ impl<'a> ArrayReaderBuilder<'a> {
         ));
 
         let page_iterator = self.row_groups.column_chunks(col_idx)?;
-        let arrow_type = Some(field.arrow_type.clone());
 
-        // Use REE reader for eligible nullable primitive columns:
-        // - use_ree enabled
-        // - Column is nullable (max_def_level > 0)
-        // - Column is not inside a list (max_rep_level == 0)
-        // - Not a NULL type column
-        // - Not a BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY (handled separately)
-        let use_ree_for_column = self.use_ree
-            && field.def_level > 0
-            && field.rep_level == 0
-            && !matches!(field.arrow_type, DataType::Null)
-            && matches!(
-                physical_type,
-                PhysicalType::INT32
-                    | PhysicalType::INT64
-                    | PhysicalType::INT96
-                    | PhysicalType::FLOAT
-                    | PhysicalType::DOUBLE
-                    | PhysicalType::BOOLEAN
-            );
-
-        if use_ree_for_column {
-            let ree_arrow_type = field.arrow_type.clone();
+        // Check if the schema requests RunEndEncoded output for this column.
+        // The arrow_type is set to RunEndEncoded by with_run_end_encoding()
+        // for eligible columns.
+        if let DataType::RunEndEncoded(_, ref values_field) = field.arrow_type {
+            let inner_type = values_field.data_type().clone();
             let reader: Box<dyn ArrayReader> = match physical_type {
                 PhysicalType::BOOLEAN => Box::new(
                     ree_array::ReeArrayReader::<BoolType>::new(
-                        page_iterator, column_desc, ree_arrow_type,
+                        page_iterator, column_desc, inner_type,
                     )?,
                 ),
                 PhysicalType::INT32 => Box::new(
                     ree_array::ReeArrayReader::<Int32Type>::new(
-                        page_iterator, column_desc, ree_arrow_type,
+                        page_iterator, column_desc, inner_type,
                     )?,
                 ),
                 PhysicalType::INT64 => Box::new(
                     ree_array::ReeArrayReader::<Int64Type>::new(
-                        page_iterator, column_desc, ree_arrow_type,
+                        page_iterator, column_desc, inner_type,
                     )?,
                 ),
                 PhysicalType::INT96 => Box::new(
                     ree_array::ReeArrayReader::<Int96Type>::new(
-                        page_iterator, column_desc, ree_arrow_type,
+                        page_iterator, column_desc, inner_type,
                     )?,
                 ),
                 PhysicalType::FLOAT => Box::new(
                     ree_array::ReeArrayReader::<FloatType>::new(
-                        page_iterator, column_desc, ree_arrow_type,
+                        page_iterator, column_desc, inner_type,
                     )?,
                 ),
                 PhysicalType::DOUBLE => Box::new(
                     ree_array::ReeArrayReader::<DoubleType>::new(
-                        page_iterator, column_desc, ree_arrow_type,
+                        page_iterator, column_desc, inner_type,
                     )?,
                 ),
-                _ => unreachable!(),
+                _ => {
+                    return Err(general_err!(
+                        "RunEndEncoded not supported for physical type {:?}",
+                        physical_type
+                    ));
+                }
             };
             return Ok(Some(reader));
         }
 
+        let arrow_type = Some(field.arrow_type.clone());
         let reader = match physical_type {
             PhysicalType::BOOLEAN => Box::new(PrimitiveArrayReader::<BoolType>::new(
                 page_iterator,
