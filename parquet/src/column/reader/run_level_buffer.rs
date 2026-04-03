@@ -172,3 +172,68 @@ pub fn levels_to_runs(levels: &[i16]) -> Vec<(i16, u32)> {
     }
     runs
 }
+
+/// An iterator that aligns two run-length encoded streams, yielding
+/// `(def_value, rep_value, count)` triples where both the def and rep
+/// values are constant for `count` consecutive entries.
+///
+/// When a def run of `(0, 50000)` overlaps a rep run of `(0, 50000)`,
+/// this yields a single `(0, 0, 50000)` triple — enabling O(1) batch
+/// processing of 50K null records.
+pub struct AlignedRunIter<'a> {
+    def_runs: &'a [(i16, u32)],
+    rep_runs: &'a [(i16, u32)],
+    def_idx: usize,
+    rep_idx: usize,
+    def_remaining: u32,
+    rep_remaining: u32,
+}
+
+impl<'a> AlignedRunIter<'a> {
+    pub fn new(def_runs: &'a [(i16, u32)], rep_runs: &'a [(i16, u32)]) -> Self {
+        let def_remaining = def_runs.first().map(|r| r.1).unwrap_or(0);
+        let rep_remaining = rep_runs.first().map(|r| r.1).unwrap_or(0);
+        Self {
+            def_runs,
+            rep_runs,
+            def_idx: 0,
+            rep_idx: 0,
+            def_remaining,
+            rep_remaining,
+        }
+    }
+}
+
+impl Iterator for AlignedRunIter<'_> {
+    /// (def_value, rep_value, count)
+    type Item = (i16, i16, u32);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.def_remaining == 0 || self.rep_remaining == 0 {
+            return None;
+        }
+
+        let def_val = self.def_runs[self.def_idx].0;
+        let rep_val = self.rep_runs[self.rep_idx].0;
+        let count = self.def_remaining.min(self.rep_remaining);
+
+        self.def_remaining -= count;
+        self.rep_remaining -= count;
+
+        if self.def_remaining == 0 {
+            self.def_idx += 1;
+            if self.def_idx < self.def_runs.len() {
+                self.def_remaining = self.def_runs[self.def_idx].1;
+            }
+        }
+        if self.rep_remaining == 0 {
+            self.rep_idx += 1;
+            if self.rep_idx < self.rep_runs.len() {
+                self.rep_remaining = self.rep_runs[self.rep_idx].1;
+            }
+        }
+
+        Some((def_val, rep_val, count))
+    }
+}

@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::arrow::array_reader::ArrayReader;
-use crate::column::reader::run_level_buffer::RunCursor;
+use crate::column::reader::run_level_buffer::{AlignedRunIter, RunCursor, levels_to_runs};
 use crate::errors::ParquetError;
 use crate::errors::Result;
 use arrow_array::{
@@ -115,57 +115,56 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
         let mut child_data_builder =
             MutableArrayData::new(vec![&data], false, next_batch_array.len());
 
-        // Use a run cursor for def levels to avoid flat materialization.
-        // Fall back to get_def_levels() if runs aren't available.
+        // Get def level runs (or convert from flat) and rep level runs
         let def_level_runs_owned;
-        let mut def_cursor = if let Some(runs) = def_level_runs {
-            Some(RunCursor::new(runs))
+        let def_runs = if let Some(runs) = def_level_runs {
+            runs
         } else {
-            // Fallback: get flat def levels and convert to runs for the cursor
             let flat = self
                 .item_reader
                 .get_def_levels()
                 .ok_or_else(|| general_err!("item_reader def levels are None."))?;
-            def_level_runs_owned =
-                crate::column::reader::run_level_buffer::levels_to_runs(flat);
-            Some(RunCursor::new(&def_level_runs_owned))
+            def_level_runs_owned = levels_to_runs(flat);
+            &def_level_runs_owned
         };
+        let rep_runs = levels_to_runs(rep_levels);
 
-        let cursor = def_cursor.as_mut().unwrap();
-        for r in rep_levels {
-            let d = cursor.next();
-            match r.cmp(&self.rep_level) {
-                Ordering::Greater => {
-                    if d < self.def_level {
-                        return Err(general_err!(
-                            "Encountered repetition level too large for definition level"
-                        ));
-                    }
+        for (d, r, count) in AlignedRunIter::new(def_runs, &rep_runs) {
+            let count = count as usize;
+            if r > self.rep_level {
+                // Inner repetition — already handled by child
+                if d < self.def_level {
+                    return Err(general_err!(
+                        "Encountered repetition level too large for definition level"
+                    ));
                 }
-                Ordering::Equal => {
-                    cur_offset += 1;
-                }
-                Ordering::Less => {
-                    list_offsets.push(OffsetSize::from_usize(cur_offset).unwrap());
-
-                    if d >= self.def_level {
-                        filter_start.get_or_insert(cur_offset + skipped);
+            } else if r == self.rep_level {
+                // Continuation within current list
+                cur_offset += count;
+            } else {
+                // Record boundaries (r < rep_level)
+                if d >= self.def_level {
+                    // Non-null lists: each of the `count` boundaries starts
+                    // a new list with one value from the padded child.
+                    filter_start.get_or_insert(cur_offset + skipped);
+                    for _ in 0..count {
+                        list_offsets.push(OffsetSize::from_usize(cur_offset).unwrap());
                         cur_offset += 1;
-
-                        if let Some(validity) = validity.as_mut() {
-                            validity.append(true)
-                        }
-                    } else {
-                        if let Some(start) = filter_start.take() {
-                            child_data_builder.extend(0, start, cur_offset + skipped);
-                        }
-
-                        if let Some(validity) = validity.as_mut() {
-                            validity.append(d + 1 == self.def_level)
-                        }
-
-                        skipped += 1;
                     }
+                    if let Some(v) = validity.as_mut() {
+                        v.append_n(count, true);
+                    }
+                } else {
+                    // Null/empty lists — bulk operation
+                    if let Some(start) = filter_start.take() {
+                        child_data_builder.extend(0, start, cur_offset + skipped);
+                    }
+                    let offset = OffsetSize::from_usize(cur_offset).unwrap();
+                    list_offsets.extend(std::iter::repeat_n(offset, count));
+                    if let Some(v) = validity.as_mut() {
+                        v.append_n(count, d + 1 == self.def_level);
+                    }
+                    skipped += count;
                 }
             }
         }
@@ -260,32 +259,52 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             .nullable
             .then(|| BooleanBufferBuilder::new(rep_levels.len()));
 
-        let mut def_cursor = RunCursor::new(def_runs);
+        // Convert rep levels to runs for aligned iteration
+        let rep_runs = levels_to_runs(rep_levels);
 
         let child_data;
 
         if !items_nullable {
+            // Fast path using aligned run pairs — O(runs) for sparse data.
+            //
+            // For each aligned (def_val, rep_val, count) triple:
+            // - rep=0, def=0: `count` null records → bulk push offsets + bulk false bits
+            // - rep=0, def>=def_level: new non-null list (count=1 since next entry changes rep)
+            // - rep>0, def>=def_level: `count` continuation values → offset += count
+            // - rep>0, def<def_level: impossible for !items_nullable
             let mut cur_offset: usize = 0;
 
-            for r in rep_levels {
-                let d = def_cursor.next();
-                if *r < self.rep_level {
-                    list_offsets.push(
-                        OffsetSize::from_usize(cur_offset)
-                            .ok_or_else(|| general_err!("offset overflow"))?,
-                    );
+            for (d, r, count) in AlignedRunIter::new(def_runs, &rep_runs) {
+                let count = count as usize;
+                if r < self.rep_level {
+                    // Record boundaries: `count` new records all with the same
+                    // def level `d` and rep level `r` (which is < rep_level,
+                    // so each is a new list).
                     if d >= self.def_level {
-                        if let Some(v) = validity.as_mut() {
-                            v.append(true);
+                        // `count` non-null lists, each starting with one value
+                        for _ in 0..count {
+                            list_offsets.push(
+                                OffsetSize::from_usize(cur_offset)
+                                    .ok_or_else(|| general_err!("offset overflow"))?,
+                            );
+                            cur_offset += 1;
                         }
-                        cur_offset += 1;
-                    } else {
                         if let Some(v) = validity.as_mut() {
-                            v.append(d + 1 == self.def_level);
+                            v.append_n(count, true);
+                        }
+                    } else {
+                        // `count` null or empty lists — bulk push identical
+                        // offsets and bulk append validity bits.
+                        let offset = OffsetSize::from_usize(cur_offset)
+                            .ok_or_else(|| general_err!("offset overflow"))?;
+                        list_offsets.extend(std::iter::repeat_n(offset, count));
+                        if let Some(v) = validity.as_mut() {
+                            v.append_n(count, d + 1 == self.def_level);
                         }
                     }
                 } else if d >= self.def_level {
-                    cur_offset += 1;
+                    // Continuation values within a non-null list
+                    cur_offset += count;
                 }
             }
 
@@ -303,8 +322,12 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
 
             child_data = compact_array.to_data();
         } else {
+            // Slow path: items within non-null lists can be null.
+            // Still uses per-element RunCursor since MutableArrayData
+            // extend calls need precise index tracking.
             let mut cur_offset: usize = 0;
             let mut compact_idx: usize = 0;
+            let mut def_cursor = RunCursor::new(def_runs);
 
             let compact_data = compact_array.to_data();
             let mut child_builder =
