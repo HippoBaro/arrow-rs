@@ -173,7 +173,10 @@ where
     T::T: Copy + Default,
     Vec<T::T>: IntoBuffer,
 {
-    data_type: ArrowType,
+    /// The RunEndEncoded data type (returned by get_data_type)
+    ree_data_type: ArrowType,
+    /// The inner value type (used for building the compact values array)
+    inner_data_type: ArrowType,
     pages: Box<dyn PageIterator>,
     def_level_runs: Option<RunLevelBuffer>,
     rep_level_runs: Option<RunLevelBuffer>,
@@ -193,11 +196,17 @@ where
     ) -> Result<Self> {
         let max_def_level = column_desc.max_def_level();
         let mut record_reader = RecordReader::<T>::new(column_desc);
-        // Enable compact mode: only non-null values in the buffer
         record_reader.set_skip_padding(true);
 
+        // Wrap the inner type in RunEndEncoded
+        let ree_data_type = ArrowType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", ArrowType::Int32, false)),
+            Arc::new(Field::new("values", arrow_type.clone(), true)),
+        );
+
         Ok(Self {
-            data_type: arrow_type,
+            ree_data_type,
+            inner_data_type: arrow_type,
             pages,
             def_level_runs: None,
             rep_level_runs: None,
@@ -218,7 +227,7 @@ where
     }
 
     fn get_data_type(&self) -> &ArrowType {
-        &self.data_type
+        &self.ree_data_type
     }
 
     fn read_records(&mut self, batch_size: usize) -> Result<usize> {
@@ -226,7 +235,7 @@ where
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
-        let target_type = &self.data_type;
+        let target_type = &self.inner_data_type;
 
         // Get compact values (non-null only, thanks to skip_padding=true)
         let record_data = self

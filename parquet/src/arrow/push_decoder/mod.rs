@@ -176,6 +176,7 @@ impl ParquetPushDecoderBuilder {
             metrics,
             row_selection_policy,
             max_predicate_cache_size,
+            use_ree: _, // REE not yet supported for push decoder
         } = self;
 
         // If no row groups were specified, read all of them

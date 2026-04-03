@@ -139,6 +139,10 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) metrics: ArrowReaderMetrics,
 
     pub(crate) max_predicate_cache_size: usize,
+
+    /// When true, eligible nullable primitive columns produce Arrow
+    /// RunEndEncoded arrays instead of dense arrays.
+    pub(crate) use_ree: bool,
 }
 
 impl<T: Debug> Debug for ArrowReaderBuilder<T> {
@@ -178,6 +182,7 @@ impl<T> ArrowReaderBuilder<T> {
             offset: None,
             metrics: ArrowReaderMetrics::Disabled,
             max_predicate_cache_size: 100 * 1024 * 1024, // 100MB default cache size
+            use_ree: false,
         }
     }
 
@@ -194,6 +199,18 @@ impl<T> ArrowReaderBuilder<T> {
     /// Returns the arrow [`SchemaRef`] for this parquet file
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    /// Enable RunEndEncoded (REE) output for eligible nullable primitive
+    /// columns. When set, sparse nullable columns produce Arrow `RunArray`
+    /// instead of dense arrays, preserving the RLE run structure from
+    /// Parquet encoding. This avoids dense materialization and
+    /// null-padding for sparse columns.
+    ///
+    /// Defaults to `false`. Only applies to nullable, non-repeated
+    /// primitive columns (INT32, INT64, FLOAT, DOUBLE, BOOLEAN).
+    pub fn with_run_end_encoding(self, use_ree: bool) -> Self {
+        Self { use_ree, ..self }
     }
 
     /// Set the size of [`RecordBatch`] to produce. Defaults to 1024
@@ -1036,6 +1053,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             metrics,
             // Not used for the sync reader, see https://github.com/apache/arrow-rs/issues/8000
             max_predicate_cache_size: _,
+            use_ree,
         } = self;
 
         // Try to avoid allocate large buffer
@@ -1066,6 +1084,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
                 let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_parquet_metadata(&reader.metadata)
+                    .with_ree(use_ree)
                     .build_array_reader(fields.as_deref(), predicate.projection())?;
 
                 plan_builder = plan_builder.with_predicate(array_reader, predicate.as_mut())?;
@@ -1074,6 +1093,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
         let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
             .with_parquet_metadata(&reader.metadata)
+            .with_ree(use_ree)
             .build_array_reader(fields.as_deref(), &projection)?;
 
         let read_plan = plan_builder
