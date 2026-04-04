@@ -97,26 +97,32 @@ impl PushBuffers {
         }
     }
 
-    /// Push a new range and its associated buffer
+    /// Push a new range and its associated buffer.
+    ///
+    /// Ranges are maintained in sorted order by start offset to allow
+    /// binary search in [`Self::get_bytes`] and [`Self::has_range`].
     pub fn push_range(&mut self, range: Range<u64>, buffer: Bytes) {
         assert_eq!(
             (range.end - range.start) as usize,
             buffer.len(),
             "Range length must match buffer length"
         );
-        self.ranges.push(range);
-        self.buffers.push(buffer);
+        // Insert in sorted order by range start. Because ranges typically
+        // arrive already sorted, this search almost always hits the end,
+        // making the insert O(1) amortized.
+        let pos = self
+            .ranges
+            .partition_point(|r| r.start < range.start);
+        self.ranges.insert(pos, range);
+        self.buffers.insert(pos, buffer);
     }
 
     /// Returns true if the Buffers contains data for the given range
     pub fn has_range(&self, range: &Range<u64>) -> bool {
-        self.ranges
-            .iter()
-            .any(|r| r.start <= range.start && r.end >= range.end)
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (&Range<u64>, &Bytes)> {
-        self.ranges.iter().zip(self.buffers.iter())
+        // Binary search for the first range whose start could contain `range.start`.
+        let idx = self.ranges.partition_point(|r| r.start <= range.start);
+        // Check the candidate just before `idx` (the last range with start <= range.start).
+        idx > 0 && self.ranges[idx - 1].end >= range.end
     }
 
     /// return the file length of the Parquet file being read
@@ -139,20 +145,37 @@ impl PushBuffers {
     /// Clear any range and corresponding buffer that is exactly in the ranges_to_clear
     #[cfg(feature = "arrow")]
     pub fn clear_ranges(&mut self, ranges_to_clear: &[Range<u64>]) {
-        let mut new_ranges = Vec::new();
-        let mut new_buffers = Vec::new();
+        // Both self.ranges and ranges_to_clear are sorted by start, so we can
+        // do an efficient merge-based removal in O(N + M) instead of O(N * M).
+        if ranges_to_clear.is_empty() {
+            return;
+        }
 
-        for (range, buffer) in self.iter() {
-            if !ranges_to_clear
-                .iter()
-                .any(|r| r.start == range.start && r.end == range.end)
+        let mut clear_idx = 0;
+        let mut write = 0;
+        for read in 0..self.ranges.len() {
+            // Advance clear_idx past any ranges_to_clear that are before the current range
+            while clear_idx < ranges_to_clear.len()
+                && ranges_to_clear[clear_idx].start < self.ranges[read].start
             {
-                new_ranges.push(range.clone());
-                new_buffers.push(buffer.clone());
+                clear_idx += 1;
+            }
+            // Check if the current range matches the current clear candidate
+            let should_clear = clear_idx < ranges_to_clear.len()
+                && ranges_to_clear[clear_idx].start == self.ranges[read].start
+                && ranges_to_clear[clear_idx].end == self.ranges[read].end;
+            if should_clear {
+                clear_idx += 1;
+            } else {
+                if write != read {
+                    self.ranges.swap(write, read);
+                    self.buffers.swap(write, read);
+                }
+                write += 1;
             }
         }
-        self.ranges = new_ranges;
-        self.buffers = new_buffers;
+        self.ranges.truncate(write);
+        self.buffers.truncate(write);
     }
 }
 
@@ -165,30 +188,23 @@ impl Length for PushBuffers {
 /// less efficient implementation of Read for Buffers
 impl std::io::Read for PushBuffers {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // Find the range that contains the start offset
-        let mut found = false;
-        for (range, data) in self.iter() {
-            if range.start <= self.offset && range.end >= self.offset + buf.len() as u64 {
-                // Found the range, figure out the starting offset in the buffer
+        // Binary search for the range containing self.offset
+        let idx = self.ranges.partition_point(|r| r.start <= self.offset);
+        if idx > 0 {
+            let range = &self.ranges[idx - 1];
+            if range.end >= self.offset + buf.len() as u64 {
                 let start_offset = (self.offset - range.start) as usize;
                 let end_offset = start_offset + buf.len();
-                let slice = data.slice(start_offset..end_offset);
+                let slice = self.buffers[idx - 1].slice(start_offset..end_offset);
                 buf.copy_from_slice(slice.as_ref());
-                found = true;
-                break;
+                self.offset += buf.len() as u64;
+                return Ok(buf.len());
             }
         }
-        if found {
-            // If we found the range, we can return the number of bytes read
-            // advance our offset
-            self.offset += buf.len() as u64;
-            Ok(buf.len())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "No data available in Buffers",
-            ))
-        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "No data available in Buffers",
+        ))
     }
 }
 
@@ -200,12 +216,15 @@ impl ChunkReader for PushBuffers {
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes, ParquetError> {
-        // find the range that contains the start offset
-        for (range, data) in self.iter() {
-            if range.start <= start && range.end >= start + length as u64 {
-                // Found the range, figure out the starting offset in the buffer
+        // Binary search for the first range whose start could contain `start`.
+        // partition_point returns the first index where r.start > start,
+        // so the candidate is at idx - 1 (the last range with start <= start).
+        let idx = self.ranges.partition_point(|r| r.start <= start);
+        if idx > 0 {
+            let range = &self.ranges[idx - 1];
+            if range.end >= start + length as u64 {
                 let start_offset = (start - range.start) as usize;
-                return Ok(data.slice(start_offset..start_offset + length));
+                return Ok(self.buffers[idx - 1].slice(start_offset..start_offset + length));
             }
         }
         // Signal that we need more data
