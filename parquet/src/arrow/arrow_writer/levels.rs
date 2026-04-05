@@ -49,6 +49,27 @@ use arrow_schema::{DataType, Field};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Extract the physical values array from a `RunEndEncoded` array,
+/// dispatching on run-end type (Int16/Int32/Int64).
+fn ree_physical_values(array: &ArrayRef) -> Result<ArrayRef> {
+    use arrow_array::cast::as_run_array;
+    match array.data_type() {
+        DataType::RunEndEncoded(re_field, _) => match re_field.data_type() {
+            DataType::Int16 => Ok(as_run_array::<arrow_array::types::Int16Type>(array.as_ref())
+                .values()
+                .clone()),
+            DataType::Int32 => Ok(as_run_array::<arrow_array::types::Int32Type>(array.as_ref())
+                .values()
+                .clone()),
+            DataType::Int64 => Ok(as_run_array::<arrow_array::types::Int64Type>(array.as_ref())
+                .values()
+                .clone()),
+            other => Err(nyi_err!("RunEndEncoded with run-end type {}", other)),
+        },
+        other => Err(general_err!("Expected RunEndEncoded, got {}", other)),
+    }
+}
+
 /// Performs a depth-first scan of the children of `array`, constructing [`ArrayLevels`]
 /// for each leaf column encountered
 pub(crate) fn calculate_array_levels(array: &ArrayRef, field: &Field) -> Result<Vec<ArrayLevels>> {
@@ -133,6 +154,15 @@ enum LevelInfoBuilder {
     ),
     /// A struct array
     Struct(Vec<LevelInfoBuilder>, LevelContext, Option<NullBuffer>),
+    /// A run-end-encoded array wrapping a complex child type (List, Struct, Map).
+    /// The child builder operates on the physical values array; write_ree() handles
+    /// run iteration and replicates the child's output for each logical row.
+    Ree(
+        Box<LevelInfoBuilder>, // Child builder (built from physical values)
+        LevelContext,          // Parent context
+        bool,                  // is_nullable
+        ArrayRef,              // The original RunEndEncoded array
+    ),
 }
 
 impl LevelInfoBuilder {
@@ -157,6 +187,33 @@ impl LevelInfoBuilder {
             DataType::Dictionary(_, v) if is_leaf(v.as_ref()) => {
                 let levels = ArrayLevels::new(parent_ctx, is_nullable, array.clone());
                 Ok(Self::Primitive(levels))
+            }
+            DataType::RunEndEncoded(_, values_field) if is_leaf(values_field.data_type()) => {
+                // Leaf REE: store as Primitive. logical_nulls() handles REE correctly.
+                // non_null_indices are logical positions; mod.rs translates them to
+                // physical indices before accessing the compact values buffer.
+                let levels = ArrayLevels::new(parent_ctx, is_nullable, array.clone());
+                Ok(Self::Primitive(levels))
+            }
+            DataType::RunEndEncoded(_, values_field) => {
+                // Complex REE (List, Struct, Map): build child from physical values.
+                // The Ree variant's write_ree() handles run iteration and replicates
+                // the child builder's output for each logical row in the run.
+                //
+                // The child field uses the ORIGINAL field's name and nullability
+                // (not the REE values_field's, which is always nullable=true by
+                // convention). From Parquet's perspective, REE is transparent.
+                let phys_values = ree_physical_values(array)?;
+                let child_field = field
+                    .clone()
+                    .with_data_type(values_field.data_type().clone());
+                let child = Self::try_new(&child_field, parent_ctx, &phys_values)?;
+                Ok(Self::Ree(
+                    Box::new(child),
+                    parent_ctx,
+                    is_nullable,
+                    array.clone(),
+                ))
             }
             DataType::Struct(children) => {
                 let array = array.as_struct();
@@ -233,7 +290,8 @@ impl LevelInfoBuilder {
             LevelInfoBuilder::Primitive(v) => vec![v],
             LevelInfoBuilder::List(v, _, _, _)
             | LevelInfoBuilder::LargeList(v, _, _, _)
-            | LevelInfoBuilder::FixedSizeList(v, _, _, _) => v.finish(),
+            | LevelInfoBuilder::FixedSizeList(v, _, _, _)
+            | LevelInfoBuilder::Ree(v, _, _, _) => v.finish(),
             LevelInfoBuilder::Struct(v, _, _) => v.into_iter().flat_map(|l| l.finish()).collect(),
         }
     }
@@ -253,6 +311,9 @@ impl LevelInfoBuilder {
             }
             LevelInfoBuilder::Struct(children, ctx, nulls) => {
                 Self::write_struct(children, ctx, nulls.as_ref(), range)
+            }
+            LevelInfoBuilder::Ree(child, ctx, is_nullable, array) => {
+                Self::write_ree(child, ctx, *is_nullable, array, range)
             }
         }
     }
@@ -602,6 +663,132 @@ impl LevelInfoBuilder {
         }
     }
 
+    /// Write `range` logical elements from a RunEndEncoded array wrapping a complex type.
+    ///
+    /// For each physical run overlapping the range, processes the physical element
+    /// ONCE through the child builder, then replicates the resulting def/rep levels
+    /// and non_null_indices for each additional logical row using `extend_from_within`
+    /// (a fast memcpy). This avoids materializing the dense values array.
+    fn write_ree(
+        child: &mut LevelInfoBuilder,
+        ctx: &LevelContext,
+        is_nullable: bool,
+        array: &ArrayRef,
+        range: Range<usize>,
+    ) {
+        macro_rules! dispatch_write_ree {
+            ($run_end_type:ty, $array:expr) => {{
+                use arrow_array::cast::as_run_array;
+                use arrow_buffer::ArrowNativeType;
+                let run_array = as_run_array::<$run_end_type>($array);
+                let run_ends = run_array.run_ends();
+                let values = run_array.values();
+                let re_values = run_ends.values();
+                let logical_offset = run_ends.offset();
+                let logical_end = logical_offset + run_ends.len();
+                let start_phys = run_array.get_start_physical_index();
+                let end_phys = run_array.get_end_physical_index();
+
+                // Map the requested logical range to absolute positions
+                let abs_start = logical_offset + range.start;
+                let abs_end = logical_offset + range.end;
+
+                // A null REE value means the entire child structure is absent.
+                // The def_level is the parent context level (before the child adds
+                // its own levels). The Ree variant is transparent in the def_level
+                // hierarchy — nullability is encoded by the child field.
+                let null_def = ctx.def_level;
+
+                let mut prev_abs = logical_offset;
+                for phys_idx in start_phys..=end_phys {
+                    let raw_end = re_values[phys_idx].as_usize();
+                    let run_abs_end = raw_end.min(logical_end);
+                    let run_abs_start = prev_abs;
+                    prev_abs = run_abs_end;
+
+                    // Intersect this run with the requested range
+                    let eff_start = run_abs_start.max(abs_start);
+                    let eff_end = run_abs_end.min(abs_end);
+                    if eff_start >= eff_end {
+                        continue;
+                    }
+                    let run_len = eff_end - eff_start;
+
+                    if values.is_null(phys_idx) {
+                        // Null run: emit null def/rep levels for each logical row
+                        child.visit_leaves(|leaf| {
+                            if let Some(def) = leaf.def_levels.as_mut() {
+                                def.extend(std::iter::repeat_n(null_def, run_len));
+                            }
+                            if let Some(rep) = leaf.rep_levels.as_mut() {
+                                rep.extend(std::iter::repeat_n(ctx.rep_level, run_len));
+                            }
+                        });
+                    } else if run_len == 1 {
+                        // Single-row run: just process the physical element once
+                        child.write(phys_idx..phys_idx + 1);
+                    } else {
+                        // --- Capture phase ---
+                        // Record current lengths of all leaf accumulators.
+                        // Use a Cell for the index so the closure can be Copy.
+                        let snapshots = std::cell::RefCell::new(Vec::<(usize, usize, usize)>::new());
+                        child.visit_leaves(|leaf| {
+                            snapshots.borrow_mut().push((
+                                leaf.def_levels.as_ref().map_or(0, |v| v.len()),
+                                leaf.rep_levels.as_ref().map_or(0, |v| v.len()),
+                                leaf.non_null_indices.len(),
+                            ));
+                        });
+                        let snapshots = snapshots.into_inner();
+
+                        // Process ONE physical element through the child builder
+                        child.write(phys_idx..phys_idx + 1);
+
+                        // --- Replicate phase ---
+                        // Copy the delta (run_len - 1) more times via extend_from_within.
+                        let leaf_idx = std::cell::Cell::new(0usize);
+                        child.visit_leaves(|leaf| {
+                            let i = leaf_idx.get();
+                            let (old_def, old_rep, old_idx) = snapshots[i];
+                            leaf_idx.set(i + 1);
+
+                            if let Some(def) = leaf.def_levels.as_mut() {
+                                let def_range = old_def..def.len();
+                                for _ in 1..run_len {
+                                    def.extend_from_within(def_range.clone());
+                                }
+                            }
+                            if let Some(rep) = leaf.rep_levels.as_mut() {
+                                let rep_range = old_rep..rep.len();
+                                for _ in 1..run_len {
+                                    rep.extend_from_within(rep_range.clone());
+                                }
+                            }
+                            {
+                                let idx_range = old_idx..leaf.non_null_indices.len();
+                                for _ in 1..run_len {
+                                    leaf.non_null_indices
+                                        .extend_from_within(idx_range.clone());
+                                }
+                            }
+                        });
+                    }
+                }
+            }};
+        }
+
+        let arr = array.as_ref();
+        match arr.data_type() {
+            DataType::RunEndEncoded(re_field, _) => match re_field.data_type() {
+                DataType::Int16 => dispatch_write_ree!(arrow_array::types::Int16Type, arr),
+                DataType::Int32 => dispatch_write_ree!(arrow_array::types::Int32Type, arr),
+                DataType::Int64 => dispatch_write_ree!(arrow_array::types::Int64Type, arr),
+                _ => unreachable!("unsupported REE run-end type"),
+            },
+            _ => unreachable!("write_ree called on non-REE array"),
+        }
+    }
+
     /// Write a primitive array, as defined by [`is_leaf`]
     fn write_leaf(info: &mut ArrayLevels, range: Range<usize>) {
         let len = range.end - range.start;
@@ -663,7 +850,8 @@ impl LevelInfoBuilder {
             LevelInfoBuilder::Primitive(info) => visit(info),
             LevelInfoBuilder::List(c, _, _, _)
             | LevelInfoBuilder::LargeList(c, _, _, _)
-            | LevelInfoBuilder::FixedSizeList(c, _, _, _) => c.visit_leaves(visit),
+            | LevelInfoBuilder::FixedSizeList(c, _, _, _)
+            | LevelInfoBuilder::Ree(c, _, _, _) => c.visit_leaves(visit),
             LevelInfoBuilder::Struct(children, _, _) => {
                 for c in children {
                     c.visit_leaves(visit)
@@ -680,6 +868,20 @@ impl LevelInfoBuilder {
     fn types_compatible(a: &DataType, b: &DataType) -> bool {
         // if the Arrow data types are equal, the types are deemed compatible
         if a.equals_datatype(b) {
+            return true;
+        }
+
+        // unwrap RunEndEncoded to value types
+        let (a, b) = match (a, b) {
+            (DataType::RunEndEncoded(_, va), DataType::RunEndEncoded(_, vb)) => {
+                (va.data_type(), vb.data_type())
+            }
+            (DataType::RunEndEncoded(_, v), b) => (v.data_type(), b),
+            (a, DataType::RunEndEncoded(_, v)) => (a, v.data_type()),
+            _ => (a, b),
+        };
+
+        if a == b {
             return true;
         }
 

@@ -127,6 +127,23 @@ pub trait ColumnValueEncoder {
     /// Computes [`GeospatialStatistics`], if any, and resets internal state such that any internal
     /// accumulator is prepared to accumulate statistics for the next column chunk.
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>>;
+
+    /// Write the value at `index` in `values` repeated `count` times.
+    ///
+    /// This is the REE fast path: statistics and bloom filter are updated once
+    /// (not `count` times), and dictionary encoders intern the value once.
+    ///
+    /// The default implementation falls back to [`Self::write_gather`] with a
+    /// repeated index vector.
+    fn write_repeated(
+        &mut self,
+        values: &Self::Values,
+        index: usize,
+        count: usize,
+    ) -> Result<()> {
+        let indices: Vec<usize> = vec![index; count];
+        self.write_gather(values, &indices)
+    }
 }
 
 pub struct ColumnValueEncoderImpl<T: DataType> {
@@ -322,6 +339,57 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
 
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>> {
         self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
+    }
+
+    fn write_repeated(
+        &mut self,
+        values: &[T::T],
+        index: usize,
+        count: usize,
+    ) -> Result<()> {
+        self.num_values += count;
+        let value = &values[index];
+
+        // Update statistics once for this single distinct value
+        if self.statistics_enabled != EnabledStatistics::None
+            && self.descr.converted_type() != ConvertedType::INTERVAL
+        {
+            if let Some(accumulator) = self.geo_stats_accumulator.as_deref_mut() {
+                update_geo_stats_accumulator(accumulator, std::iter::once(value));
+            } else {
+                update_min(&self.descr, value, &mut self.min_value);
+                update_max(&self.descr, value, &mut self.max_value);
+            }
+            // variable_length_bytes: compute for single value and multiply by count
+            if let Some(var_bytes) =
+                T::T::variable_length_bytes(std::slice::from_ref(value))
+            {
+                *self.variable_length_bytes.get_or_insert(0) += var_bytes * count as i64;
+            }
+        }
+
+        // Bloom filter: insert once (duplicates are idempotent)
+        if let Some(bloom_filter) = &mut self.bloom_filter {
+            bloom_filter.insert(value);
+        }
+
+        // Encode the value `count` times
+        match &mut self.dict_encoder {
+            Some(encoder) => {
+                // Dictionary: intern once, push index `count` times.
+                // These identical indices will RLE-compress well in write_indices().
+                encoder.put_one_repeated(value, count);
+                Ok(())
+            }
+            None => {
+                // Non-dictionary: feed the single value `count` times
+                let single = std::slice::from_ref(value);
+                for _ in 0..count {
+                    self.encoder.put(single)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 

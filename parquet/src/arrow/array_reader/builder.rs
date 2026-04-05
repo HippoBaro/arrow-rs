@@ -149,9 +149,10 @@ impl<'a> ArrayReaderBuilder<'a> {
         if let DataType::RunEndEncoded(_, ref values_field) = field.arrow_type {
             let mut inner_field = field.clone();
             inner_field.arrow_type = values_field.data_type().clone();
+            let def_level = field.def_level;
             let inner_reader = self.build_reader(&inner_field, mask)?;
             return Ok(inner_reader.map(|r| {
-                Box::new(ree_array::ReeWrappingReader::new(r)) as Box<dyn ArrayReader>
+                Box::new(ree_array::ReeWrappingReader::new(r, def_level)) as Box<dyn ArrayReader>
             }));
         }
 

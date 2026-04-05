@@ -540,6 +540,106 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         Ok(0)
     }
 
+    /// Write a run of `count` null values from a RunEndEncoded array.
+    ///
+    /// Encodes def/rep levels via `put_n` without materializing any arrays.
+    /// Long runs that exceed the page row limit are split across pages.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_ree_null_run(
+        &mut self,
+        def_val: i16,
+        rep_val: i16,
+        count: usize,
+    ) -> Result<()> {
+        let mut remaining = count;
+        while remaining > 0 {
+            let page_limit = self.props.data_page_row_count_limit();
+            let rows_available = page_limit.saturating_sub(self.page_metrics.num_buffered_rows as usize);
+            let batch = if rows_available == 0 { remaining } else { remaining.min(rows_available) };
+
+            if self.descr.max_def_level() > 0 {
+                self.def_levels_encoder
+                    .put_n_with_observer(def_val, batch, |level, cnt| {
+                        if let Some(ref mut h) = self.page_metrics.definition_level_histogram {
+                            h.update_n(level, cnt as i64);
+                        }
+                    });
+                self.page_metrics.num_page_nulls += batch as u64;
+            }
+            if self.descr.max_rep_level() > 0 {
+                self.rep_levels_encoder
+                    .put_n_with_observer(rep_val, batch, |level, cnt| {
+                        if let Some(ref mut h) = self.page_metrics.repetition_level_histogram {
+                            h.update_n(level, cnt as i64);
+                        }
+                    });
+                self.page_metrics.num_buffered_rows += if rep_val == 0 { batch as u32 } else { 0 };
+            } else {
+                self.page_metrics.num_buffered_rows += batch as u32;
+            }
+            self.page_metrics.num_buffered_values += batch as u32;
+
+            remaining -= batch;
+            if self.should_add_data_page() {
+                self.add_data_page()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write a run of `count` identical non-null values from a RunEndEncoded array.
+    ///
+    /// Encodes def/rep levels via `put_n` and values via `write_repeated`
+    /// on the encoder. Long runs that exceed the page row limit are split.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_ree_value_run(
+        &mut self,
+        values: &E::Values,
+        index: usize,
+        def_val: i16,
+        rep_val: i16,
+        count: usize,
+    ) -> Result<()> {
+        let mut remaining = count;
+        while remaining > 0 {
+            let page_limit = self.props.data_page_row_count_limit();
+            let rows_available = page_limit.saturating_sub(self.page_metrics.num_buffered_rows as usize);
+            let batch = if rows_available == 0 { remaining } else { remaining.min(rows_available) };
+
+            if self.descr.max_def_level() > 0 {
+                self.def_levels_encoder
+                    .put_n_with_observer(def_val, batch, |level, cnt| {
+                        if let Some(ref mut h) = self.page_metrics.definition_level_histogram {
+                            h.update_n(level, cnt as i64);
+                        }
+                    });
+            }
+            if self.descr.max_rep_level() > 0 {
+                self.rep_levels_encoder
+                    .put_n_with_observer(rep_val, batch, |level, cnt| {
+                        if let Some(ref mut h) = self.page_metrics.repetition_level_histogram {
+                            h.update_n(level, cnt as i64);
+                        }
+                    });
+                self.page_metrics.num_buffered_rows += if rep_val == 0 { batch as u32 } else { 0 };
+            } else {
+                self.page_metrics.num_buffered_rows += batch as u32;
+            }
+
+            self.encoder.write_repeated(values, index, batch)?;
+            self.page_metrics.num_buffered_values += batch as u32;
+
+            remaining -= batch;
+            if self.should_add_data_page() {
+                self.add_data_page()?;
+            }
+            if self.should_dict_fallback() {
+                self.dict_fallback()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Writes batch of values, definition levels and repetition levels.
     /// Returns number of values processed (written).
     ///

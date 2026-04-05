@@ -853,9 +853,13 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             let dict_field = field.clone().with_data_type(value.as_ref().clone());
             arrow_to_parquet_type(&dict_field, coerce_types)
         }
-        DataType::RunEndEncoded(_, _) => Err(arrow_err!(
-            "Converting RunEndEncodedType to parquet not supported",
-        )),
+        DataType::RunEndEncoded(_, values_field) => {
+            // REE is a physical encoding, not a logical type -- unwrap to value type
+            let ree_field = field
+                .clone()
+                .with_data_type(values_field.data_type().clone());
+            arrow_to_parquet_type(&ree_field, coerce_types)
+        }
     }
 }
 

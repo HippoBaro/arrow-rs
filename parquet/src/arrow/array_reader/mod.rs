@@ -142,6 +142,15 @@ pub trait ArrayReader: Send {
         false
     }
 
+    /// Enable compact record output mode. When enabled, the reader produces
+    /// only non-null records (no null entries) and populates record-level
+    /// def runs accessible via `get_def_level_runs()`. This is distinct from
+    /// `set_skip_padding` which controls value-level padding within records.
+    /// Used by `ReeWrappingReader` to avoid dense intermediate arrays.
+    fn set_compact_record_output(&mut self, _compact: bool) -> bool {
+        false
+    }
+
     /// Returns definition levels as run-length encoded `(value, count)` pairs
     /// from the last call to `consume_batch`, if available.
     ///

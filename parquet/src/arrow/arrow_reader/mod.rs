@@ -173,9 +173,10 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
 /// wrapped in REE — its children are NOT recursively transformed, since
 /// the REE wrapping applies to the entire composite value.
 fn transform_fields_for_ree(field: &ParquetField) -> ParquetField {
-    // Check if this field should be REE-wrapped: nullable, non-repeated
+    // Check if this field should be REE-wrapped: nullable, not the Null type.
+    // List/Map columns (rep_level > 0) are also eligible — the ReeWrappingReader
+    // handles them via compact ListArrayReader output.
     let eligible = field.def_level > 0
-        && field.rep_level == 0
         && !matches!(field.arrow_type, ArrowType::Null);
 
     if eligible {

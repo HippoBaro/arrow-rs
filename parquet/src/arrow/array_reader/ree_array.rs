@@ -52,7 +52,7 @@ use crate::data_type::Int96;
 ///
 /// For a 99% sparse column with 100K rows and 1K values, this produces
 /// a RunArray with ~3 physical entries instead of 100K dense elements.
-fn build_ree_array(
+pub(crate) fn build_ree_array(
     def_runs: &[(i16, u32)],
     compact_values: ArrayRef,
     max_def_level: i16,
@@ -416,10 +416,16 @@ pub(crate) fn dense_to_ree(dense: ArrayRef) -> Result<ArrayRef> {
 pub struct ReeWrappingReader {
     inner: Box<dyn ArrayReader>,
     ree_data_type: ArrowType,
+    /// Whether the inner reader supports compact output (skip_padding).
+    compact_inner: bool,
+    /// The definition level at which this field is non-null.
+    /// Used as max_def_level for build_ree_array in compact mode.
+    def_level: i16,
 }
 
 impl ReeWrappingReader {
-    pub fn new(inner: Box<dyn ArrayReader>) -> Self {
+    pub fn new(mut inner: Box<dyn ArrayReader>, def_level: i16) -> Self {
+        let compact_inner = inner.set_compact_record_output(true);
         let inner_type = inner.get_data_type().clone();
         let ree_data_type = ArrowType::RunEndEncoded(
             Arc::new(Field::new("run_ends", ArrowType::Int32, false)),
@@ -428,6 +434,8 @@ impl ReeWrappingReader {
         Self {
             inner,
             ree_data_type,
+            compact_inner,
+            def_level,
         }
     }
 }
@@ -482,8 +490,16 @@ impl ArrayReader for ReeWrappingReader {
             return Ok(Arc::new(run_array));
         }
 
-        let dense = self.inner.consume_batch()?;
-        dense_to_ree(dense)
+        if self.compact_inner {
+            // Inner reader produced compact output (only non-null entries).
+            // Use build_ree_array with the record-level def runs.
+            let compact = self.inner.consume_batch()?;
+            let def_runs = self.inner.get_def_level_runs().unwrap_or(&[]);
+            build_ree_array(def_runs, compact, self.def_level)
+        } else {
+            let dense = self.inner.consume_batch()?;
+            dense_to_ree(dense)
+        }
     }
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {

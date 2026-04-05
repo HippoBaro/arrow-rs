@@ -144,6 +144,15 @@ impl<T: DataType> DictEncoder<T> {
         self.indices.push(self.interner.intern(value));
     }
 
+    /// Intern `value` once and push its dictionary index `count` times.
+    /// This avoids `count` hash lookups (only 1), while the resulting
+    /// identical indices will RLE-compress efficiently in `write_indices`.
+    pub(crate) fn put_one_repeated(&mut self, value: &T::T, count: usize) {
+        let idx = self.interner.intern(value);
+        self.indices.reserve(count);
+        self.indices.extend(std::iter::repeat_n(idx, count));
+    }
+
     #[inline]
     fn bit_width(&self) -> u8 {
         num_required_bits(self.num_entries().saturating_sub(1) as u64)
