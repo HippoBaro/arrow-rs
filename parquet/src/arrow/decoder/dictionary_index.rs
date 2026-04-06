@@ -57,10 +57,18 @@ impl DictIndexDecoder {
     }
 
     /// Read up to `len` values, returning the number of values read
-    /// and calling `f` with each decoded dictionary index
+    /// and calling `f` with each decoded dictionary index.
+    ///
+    /// If `runs` is `Some`, also captures `(dict_index, count)` runs from
+    /// the decoded indices, merging adjacent entries with the same index.
     ///
     /// Will short-circuit and return on error
-    pub fn read<F: FnMut(&[i32]) -> Result<()>>(&mut self, len: usize, mut f: F) -> Result<usize> {
+    pub fn read<F: FnMut(&[i32]) -> Result<()>>(
+        &mut self,
+        len: usize,
+        mut f: F,
+        mut runs: Option<&mut Vec<(u32, u32)>>,
+    ) -> Result<usize> {
         let mut values_read = 0;
 
         while values_read != len && self.max_remaining_values != 0 {
@@ -78,7 +86,20 @@ impl DictIndexDecoder {
                 .min(self.index_buf_len - self.index_offset)
                 .min(self.max_remaining_values);
 
-            f(&self.index_buf[self.index_offset..self.index_offset + to_read])?;
+            let chunk = &self.index_buf[self.index_offset..self.index_offset + to_read];
+            f(chunk)?;
+
+            // Capture index runs from this chunk
+            if let Some(ref mut runs) = runs {
+                for &idx in chunk {
+                    let idx = idx as u32;
+                    if let Some(last) = runs.last_mut().filter(|r| r.0 == idx) {
+                        last.1 += 1;
+                    } else {
+                        runs.push((idx, 1));
+                    }
+                }
+            }
 
             self.index_offset += to_read;
             values_read += to_read;

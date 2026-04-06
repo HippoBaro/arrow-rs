@@ -51,6 +51,10 @@ pub struct DefinitionLevelBuffer {
     ///
     /// Note: `buffer` and `builder` may contain more elements
     len: usize,
+
+    /// When true, skip building the null bitmap in Full mode.
+    /// Used when skip_padding is active (REE mode) — the bitmap is never read.
+    skip_nulls_bitmap: bool,
 }
 
 impl DefinitionLevelBuffer {
@@ -80,7 +84,11 @@ impl DefinitionLevelBuffer {
             },
         };
 
-        Self { inner, len: 0 }
+        Self {
+            inner,
+            len: 0,
+            skip_nulls_bitmap: false,
+        }
     }
 
     /// Switch from Mask mode to Full mode so that run-level def data
@@ -95,6 +103,12 @@ impl DefinitionLevelBuffer {
             };
             self.len = 0;
         }
+    }
+
+    /// Skip building the null bitmap in Full mode. Call this when the bitmap
+    /// will never be read (e.g. when skip_padding is active in REE mode).
+    pub fn set_skip_nulls_bitmap(&mut self, skip: bool) {
+        self.skip_nulls_bitmap = skip;
     }
 
     /// Returns the built level data as a flat `Vec<i16>`.
@@ -192,31 +206,23 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
 
                 let (values_read, levels_read) = decoder.read_def_levels(levels, num_levels)?;
 
-                // Build the null bitmap directly from the new runs — O(runs)
-                // instead of O(rows). We use the decoder's last batch of new
-                // runs (before they're merged into the buffer) to avoid
-                // tracking merge boundaries.
-                //
-                // The new runs were decoded into a temporary inside
-                // read_def_levels and then appended. We can reconstruct the
-                // bitmap from the total run structure by tracking levels_read:
-                // walk backward from the end for exactly levels_read entries.
-                let runs = levels.runs();
-                let mut remaining = levels_read;
-                // Collect the runs that contribute to the new levels_read,
-                // walking backward from the end
-                let mut new_runs: Vec<(i16, usize)> = Vec::new();
-                for &(value, count) in runs.iter().rev() {
-                    if remaining == 0 {
-                        break;
+                if !writer.skip_nulls_bitmap {
+                    // Build the null bitmap directly from the new runs — O(runs)
+                    // instead of O(rows).
+                    let runs = levels.runs();
+                    let mut remaining = levels_read;
+                    let mut new_runs: Vec<(i16, usize)> = Vec::new();
+                    for &(value, count) in runs.iter().rev() {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = (count as usize).min(remaining);
+                        new_runs.push((value, take));
+                        remaining -= take;
                     }
-                    let take = (count as usize).min(remaining);
-                    new_runs.push((value, take));
-                    remaining -= take;
-                }
-                // Now append in forward order
-                for &(value, count) in new_runs.iter().rev() {
-                    nulls.append_n(count, value == *max_level);
+                    for &(value, count) in new_runs.iter().rev() {
+                        nulls.append_n(count, value == *max_level);
+                    }
                 }
 
                 Ok((values_read, levels_read))

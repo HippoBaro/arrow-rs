@@ -81,6 +81,9 @@ struct ByteArrayReader<I: OffsetSizeTrait> {
     def_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     rep_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     record_reader: GenericRecordReader<OffsetBuffer<I>, ByteArrayColumnValueDecoder<I>>,
+    /// When true, consume_batch produces RunEndEncoded output
+    ree_mode: bool,
+    ree_max_def_level: i16,
 }
 
 impl<I: OffsetSizeTrait> ByteArrayReader<I> {
@@ -95,6 +98,8 @@ impl<I: OffsetSizeTrait> ByteArrayReader<I> {
             def_level_runs: None,
             rep_level_runs: None,
             record_reader,
+            ree_mode: false,
+            ree_max_def_level: 0,
         }
     }
 }
@@ -123,7 +128,6 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
         };
         self.def_level_runs = self.record_reader.consume_def_level_runs();
         self.rep_level_runs = self.record_reader.consume_rep_level_runs();
-        self.record_reader.reset();
 
         let array: ArrayRef = match self.data_type {
             // Apply conversion to all elements regardless of null slots as the conversions
@@ -156,6 +160,23 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
             _ => buffer.into_array(null_buffer, self.data_type.clone()),
         };
 
+        if self.ree_mode {
+            let value_runs = self.record_reader.consume_value_runs();
+            self.record_reader.reset();
+            let def_runs = self
+                .def_level_runs
+                .as_ref()
+                .map(|r| r.runs())
+                .unwrap_or(&[]);
+            return crate::arrow::array_reader::ree_array::build_ree_array(
+                def_runs,
+                array,
+                self.ree_max_def_level,
+                value_runs.as_deref(),
+            );
+        }
+
+        self.record_reader.reset();
         Ok(array)
     }
 
@@ -208,6 +229,18 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
         self.record_reader.reset();
         Ok(n)
     }
+
+    fn set_ree_output(&mut self, max_def_level: i16) -> bool {
+        if max_def_level == 0 {
+            return false;
+        }
+        self.ree_mode = true;
+        self.ree_max_def_level = max_def_level;
+        self.record_reader.require_def_level_runs();
+        self.record_reader.set_skip_padding(true);
+        self.record_reader.enable_value_run_capture();
+        true
+    }
 }
 
 /// A [`ColumnValueDecoder`] for variable length byte arrays
@@ -215,6 +248,8 @@ struct ByteArrayColumnValueDecoder<I: OffsetSizeTrait> {
     dict: Option<OffsetBuffer<I>>,
     decoder: Option<ByteArrayDecoder>,
     validate_utf8: bool,
+    /// Whether value run capture is requested (persists across page boundaries)
+    capture_value_runs: bool,
 }
 
 impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
@@ -226,6 +261,7 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
             dict: None,
             decoder: None,
             validate_utf8,
+            capture_value_runs: false,
         }
     }
 
@@ -281,7 +317,7 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
             .as_mut()
             .ok_or_else(|| general_err!("no decoder set"))?;
 
-        decoder.read(out, num_values, self.dict.as_ref())
+        decoder.read(out, num_values, self.dict.as_ref(), self.capture_value_runs)
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {
@@ -291,6 +327,15 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
             .ok_or_else(|| general_err!("no decoder set"))?;
 
         decoder.skip(num_values, self.dict.as_ref())
+    }
+
+    fn enable_value_run_capture(&mut self) {
+        self.capture_value_runs = true;
+    }
+
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        let decoder = self.decoder.as_mut()?;
+        decoder.take_value_runs()
     }
 }
 
@@ -337,12 +382,15 @@ impl ByteArrayDecoder {
         Ok(decoder)
     }
 
-    /// Read up to `len` values to `out` with the optional dictionary
+    /// Read up to `len` values to `out` with the optional dictionary.
+    /// When `capture_runs` is true and encoding is dictionary, value runs
+    /// are captured internally and can be retrieved via `take_value_runs`.
     pub fn read<I: OffsetSizeTrait>(
         &mut self,
         out: &mut OffsetBuffer<I>,
         len: usize,
         dict: Option<&OffsetBuffer<I>>,
+        capture_runs: bool,
     ) -> Result<usize> {
         match self {
             ByteArrayDecoder::Plain(d) => d.read(out, len),
@@ -350,10 +398,18 @@ impl ByteArrayDecoder {
                 let dict =
                     dict.ok_or_else(|| general_err!("missing dictionary page for column"))?;
 
-                d.read(out, dict, len)
+                d.read(out, dict, len, capture_runs)
             }
             ByteArrayDecoder::DeltaLength(d) => d.read(out, len),
             ByteArrayDecoder::DeltaByteArray(d) => d.read(out, len),
+        }
+    }
+
+    /// Take captured value runs from the dictionary decoder, if any.
+    pub fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        match self {
+            ByteArrayDecoder::Dictionary(d) => d.take_value_runs(),
+            _ => None,
         }
     }
 
@@ -604,12 +660,14 @@ impl ByteArrayDecoderDelta {
 /// Decoder from [`Encoding::RLE_DICTIONARY`] to [`OffsetBuffer`]
 pub struct ByteArrayDecoderDictionary {
     decoder: DictIndexDecoder,
+    value_runs: Option<Vec<(u32, u32)>>,
 }
 
 impl ByteArrayDecoderDictionary {
     fn new(data: Bytes, num_levels: usize, num_values: Option<usize>) -> Result<Self> {
         Ok(Self {
             decoder: DictIndexDecoder::new(data, num_levels, num_values)?,
+            value_runs: None,
         })
     }
 
@@ -618,15 +676,26 @@ impl ByteArrayDecoderDictionary {
         output: &mut OffsetBuffer<I>,
         dict: &OffsetBuffer<I>,
         len: usize,
+        capture_runs: bool,
     ) -> Result<usize> {
         // All data must be NULL
         if dict.is_empty() {
             return Ok(0);
         }
 
+        let runs = if capture_runs {
+            Some(self.value_runs.get_or_insert_with(Vec::new))
+        } else {
+            None
+        };
+
         self.decoder.read(len, |keys| {
             output.extend_from_dictionary(keys, dict.offsets.as_slice(), dict.values.as_slice())
-        })
+        }, runs)
+    }
+
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        self.value_runs.as_mut().map(|v| std::mem::take(v))
     }
 
     fn skip<I: OffsetSizeTrait>(

@@ -68,6 +68,10 @@ pub struct GenericRecordReader<V, CV> {
     /// When true, forces def levels to use Full (run-level) mode instead
     /// of the packed Mask optimization. Set by `require_def_level_runs()`.
     force_full_def_levels: bool,
+    /// Whether value run capture is requested
+    capture_value_runs: bool,
+    /// Accumulated value runs from the inner column reader
+    value_runs: Option<Vec<(u32, u32)>>,
 }
 
 impl<V, CV> GenericRecordReader<V, CV>
@@ -94,6 +98,8 @@ where
             values_written: 0,
             skip_padding: false,
             force_full_def_levels: false,
+            capture_value_runs: false,
+            value_runs: None,
         }
     }
 
@@ -124,13 +130,17 @@ where
         let rep_level_decoder = (descr.max_rep_level() != 0)
             .then(|| RepetitionLevelDecoderImpl::new(descr.max_rep_level()));
 
-        self.column_reader = Some(GenericColumnReader::new_with_decoders(
+        let mut col_reader = GenericColumnReader::new_with_decoders(
             self.column_desc.clone(),
             page_reader,
             values_decoder,
             def_level_decoder,
             rep_level_decoder,
-        ));
+        );
+        if self.capture_value_runs {
+            col_reader.enable_value_run_capture();
+        }
+        self.column_reader = Some(col_reader);
         Ok(())
     }
 
@@ -251,12 +261,22 @@ where
         self.num_values = 0;
         self.num_records = 0;
         self.values_written = 0;
+        if self.capture_value_runs {
+            self.value_runs = Some(Vec::new());
+        }
     }
 
     /// Enable or disable null padding. When disabled, the values buffer contains
     /// only actual (non-null) values and `values_written()` returns their count.
     pub fn set_skip_padding(&mut self, skip: bool) {
         self.skip_padding = skip;
+        // When skip_padding is active and def levels use Full (run-level) mode,
+        // the null bitmap is never read — skip building it entirely.
+        if skip && self.force_full_def_levels {
+            if let Some(buf) = &mut self.def_levels {
+                buf.set_skip_nulls_bitmap(true);
+            }
+        }
     }
 
     /// Returns true if null padding is being skipped.
@@ -317,10 +337,43 @@ where
             );
         }
 
+        // Accumulate value runs from the column reader
+        if self.capture_value_runs && values_read > 0 {
+            let col_reader = self.column_reader.as_mut().unwrap();
+            if let Some(page_runs) = col_reader.take_value_runs() {
+                let accumulated = self.value_runs.get_or_insert_with(Vec::new);
+                for (idx, count) in page_runs {
+                    if let Some(last) = accumulated.last_mut().filter(|r| r.0 == idx) {
+                        last.1 += count;
+                    } else {
+                        accumulated.push((idx, count));
+                    }
+                }
+            } else {
+                // Non-dictionary page encountered; invalidate
+                self.value_runs = None;
+                self.capture_value_runs = false;
+            }
+        }
+
         self.num_records += records_read;
         self.num_values += levels_read;
         self.values_written += values_read;
         Ok(records_read)
+    }
+
+    /// Enable capturing of value runs (dictionary index runs) during reads.
+    pub fn enable_value_run_capture(&mut self) {
+        self.capture_value_runs = true;
+        self.value_runs = Some(Vec::new());
+        if let Some(reader) = self.column_reader.as_mut() {
+            reader.enable_value_run_capture();
+        }
+    }
+
+    /// Take accumulated value runs. Returns `None` if capture was invalidated.
+    pub fn consume_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        self.value_runs.take()
     }
 }
 

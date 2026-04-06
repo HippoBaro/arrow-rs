@@ -135,6 +135,13 @@ pub struct GenericColumnReader<R, D, V> {
 
     /// The decoder for the values
     values_decoder: V,
+
+    /// Accumulated value runs (dict_index, count) across page reads.
+    /// `None` means capture is not enabled or a non-dictionary page was encountered.
+    value_runs: Option<Vec<(u32, u32)>>,
+
+    /// Whether value run capture has been requested
+    capture_value_runs: bool,
 }
 
 impl<V> GenericColumnReader<RepetitionLevelDecoderImpl, DefinitionLevelDecoderImpl, V>
@@ -183,6 +190,8 @@ where
             num_decoded_values: 0,
             values_decoder,
             has_record_delimiter: false,
+            value_runs: None,
+            capture_value_runs: false,
         }
     }
 
@@ -269,6 +278,25 @@ where
                 return Err(general_err!(
                     "insufficient values read from column - expected: {values_to_read}, got: {values_read}",
                 ));
+            }
+
+            // Capture value runs from the decoder if enabled
+            if self.capture_value_runs && values_read > 0 {
+                if let Some(page_runs) = self.values_decoder.take_value_runs() {
+                    let accumulated = self.value_runs.get_or_insert_with(Vec::new);
+                    // Merge with the last existing run if same index
+                    for (idx, count) in page_runs {
+                        if let Some(last) = accumulated.last_mut().filter(|r| r.0 == idx) {
+                            last.1 += count;
+                        } else {
+                            accumulated.push((idx, count));
+                        }
+                    }
+                } else {
+                    // Non-dictionary page encountered; invalidate value runs
+                    self.value_runs = None;
+                    self.capture_value_runs = false;
+                }
             }
 
             self.num_decoded_values += levels_to_read;
@@ -380,6 +408,19 @@ where
             }
         }
         Ok(num_records - remaining_records)
+    }
+
+    /// Enable capturing of value runs (dictionary index runs) during reads.
+    pub fn enable_value_run_capture(&mut self) {
+        self.capture_value_runs = true;
+        self.value_runs = Some(Vec::new());
+        self.values_decoder.enable_value_run_capture();
+    }
+
+    /// Take accumulated value runs. Returns `None` if capture was invalidated
+    /// (e.g. by a non-dictionary page).
+    pub fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        self.value_runs.take()
     }
 
     /// Read the next page as a dictionary page. If the next page is not a dictionary page,

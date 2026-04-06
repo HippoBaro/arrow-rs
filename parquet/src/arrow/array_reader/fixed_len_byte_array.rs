@@ -133,9 +133,11 @@ struct FixedLenByteArrayReader {
     data_type: ArrowType,
     byte_length: usize,
     pages: Box<dyn PageIterator>,
-    def_levels_buffer: Option<Vec<i16>>,
-    rep_levels_buffer: Option<Vec<i16>>,
+    def_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
+    rep_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     record_reader: GenericRecordReader<FixedLenByteArrayBuffer, ValueDecoder>,
+    ree_mode: bool,
+    ree_max_def_level: i16,
 }
 
 impl FixedLenByteArrayReader {
@@ -149,9 +151,11 @@ impl FixedLenByteArrayReader {
             data_type,
             byte_length,
             pages,
-            def_levels_buffer: None,
-            rep_levels_buffer: None,
+            def_level_runs: None,
+            rep_level_runs: None,
             record_reader: GenericRecordReader::new(column_desc),
+            ree_mode: false,
+            ree_max_def_level: 0,
         }
     }
 }
@@ -172,10 +176,16 @@ impl ArrayReader for FixedLenByteArrayReader {
     fn consume_batch(&mut self) -> Result<ArrayRef> {
         let record_data = self.record_reader.consume_record_data();
 
+        let null_buffer = if self.record_reader.skip_padding() {
+            None
+        } else {
+            self.record_reader.consume_bitmap_buffer()
+        };
+
         let array_data = ArrayDataBuilder::new(ArrowType::FixedSizeBinary(self.byte_length as i32))
-            .len(self.record_reader.num_values())
+            .len(self.record_reader.values_written())
             .add_buffer(Buffer::from_vec(record_data.buffer))
-            .null_bit_buffer(self.record_reader.consume_bitmap_buffer());
+            .null_bit_buffer(null_buffer);
 
         let binary = FixedSizeBinaryArray::from(unsafe { array_data.build_unchecked() });
 
@@ -233,10 +243,26 @@ impl ArrayReader for FixedLenByteArrayReader {
             _ => Arc::new(binary) as ArrayRef,
         };
 
-        self.def_levels_buffer = self.record_reader.consume_def_levels();
-        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
-        self.record_reader.reset();
+        self.def_level_runs = self.record_reader.consume_def_level_runs();
+        self.rep_level_runs = self.record_reader.consume_rep_level_runs();
 
+        if self.ree_mode {
+            let value_runs = self.record_reader.consume_value_runs();
+            self.record_reader.reset();
+            let def_runs = self
+                .def_level_runs
+                .as_ref()
+                .map(|r| r.runs())
+                .unwrap_or(&[]);
+            return crate::arrow::array_reader::ree_array::build_ree_array(
+                def_runs,
+                array,
+                self.ree_max_def_level,
+                value_runs.as_deref(),
+            );
+        }
+
+        self.record_reader.reset();
         Ok(array)
     }
 
@@ -245,11 +271,31 @@ impl ArrayReader for FixedLenByteArrayReader {
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
-        self.def_levels_buffer.as_deref()
+        self.def_level_runs.as_ref().map(|r| r.as_slice())
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
-        self.rep_levels_buffer.as_deref()
+        self.rep_level_runs.as_ref().map(|r| r.as_slice())
+    }
+
+    fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.def_level_runs.as_ref().map(|r| r.runs())
+    }
+
+    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.rep_level_runs.as_ref().map(|r| r.runs())
+    }
+
+    fn set_ree_output(&mut self, max_def_level: i16) -> bool {
+        if max_def_level == 0 {
+            return false;
+        }
+        self.ree_mode = true;
+        self.ree_max_def_level = max_def_level;
+        self.record_reader.require_def_level_runs();
+        self.record_reader.set_skip_padding(true);
+        self.record_reader.enable_value_run_capture();
+        true
     }
 }
 
@@ -326,6 +372,8 @@ struct ValueDecoder {
     byte_length: usize,
     dict_page: Option<Bytes>,
     decoder: Option<Decoder>,
+    capture_value_runs: bool,
+    value_runs: Option<Vec<(u32, u32)>>,
 }
 
 impl ColumnValueDecoder for ValueDecoder {
@@ -336,6 +384,8 @@ impl ColumnValueDecoder for ValueDecoder {
             byte_length: col.type_length() as usize,
             dict_page: None,
             decoder: None,
+            capture_value_runs: false,
+            value_runs: None,
         }
     }
 
@@ -423,6 +473,12 @@ impl ColumnValueDecoder for ValueDecoder {
                     return Ok(0);
                 }
 
+                let runs = if self.capture_value_runs {
+                    Some(self.value_runs.get_or_insert_with(Vec::new))
+                } else {
+                    None
+                };
+
                 decoder.read(num_values, |keys| {
                     out.buffer.reserve(keys.len() * self.byte_length);
                     for key in keys {
@@ -431,7 +487,7 @@ impl ColumnValueDecoder for ValueDecoder {
                         out.buffer.extend_from_slice(val);
                     }
                     Ok(())
-                })
+                }, runs)
             }
             Decoder::Delta { decoder } => {
                 let to_read = num_values.min(decoder.remaining());
@@ -481,6 +537,14 @@ impl ColumnValueDecoder for ValueDecoder {
                 Ok(to_read)
             }
         }
+    }
+
+    fn enable_value_run_capture(&mut self) {
+        self.capture_value_runs = true;
+    }
+
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        self.value_runs.as_mut().map(|v| std::mem::take(v))
     }
 }
 

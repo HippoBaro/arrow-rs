@@ -146,7 +146,6 @@ pub trait ArrayReader: Send {
     /// only non-null records (no null entries) and populates record-level
     /// def runs accessible via `get_def_level_runs()`. This is distinct from
     /// `set_skip_padding` which controls value-level padding within records.
-    /// Used by `ReeWrappingReader` to avoid dense intermediate arrays.
     fn set_compact_record_output(&mut self, _compact: bool) -> bool {
         false
     }
@@ -182,6 +181,18 @@ pub trait ArrayReader: Send {
     fn discard_batch(&mut self) -> Result<usize> {
         let array = self.consume_batch()?;
         Ok(array.len())
+    }
+
+    /// Request that this reader produce RunEndEncoded output directly.
+    ///
+    /// When enabled, `consume_batch` returns `RunArray<Int32Type>` instead
+    /// of the reader's normal dense output. Null runs and (for dictionary-
+    /// encoded columns) identical value runs are collapsed.
+    ///
+    /// Returns `true` if the reader supports REE output, `false` otherwise.
+    /// When `false`, the caller should use the dense output as-is.
+    fn set_ree_output(&mut self, _max_def_level: i16) -> bool {
+        false
     }
 }
 

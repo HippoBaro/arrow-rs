@@ -5589,4 +5589,123 @@ mod tests {
 
         nested_ree_roundtrip(batch, expected);
     }
+
+    /// Test that reading a dictionary-encoded nullable column with REE enabled
+    /// collapses runs of identical dictionary values into fewer physical REE entries.
+    #[test]
+    fn test_ree_dict_value_run_collapsing() {
+        // Write a nullable Int32 column with repeated values (dictionary-encoded)
+        // [1, 1, 1, 1, 1, 2, 2, 2, 3] — all non-null but column is nullable
+        let values = Int32Array::from(vec![
+            Some(1), Some(1), Some(1), Some(1), Some(1),
+            Some(2), Some(2), Some(2),
+            Some(3),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(values) as ArrayRef]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .build();
+
+        let mut file = vec![];
+        let mut writer =
+            ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Read back with REE enabled
+        let file = Bytes::from(file);
+        let builder = crate::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .with_run_end_encoding(true);
+
+        let mut reader = builder.build().unwrap();
+        let result = reader.next().unwrap().unwrap();
+        let col = result.column(0);
+
+        // The column should be RunEndEncoded
+        assert!(
+            matches!(col.data_type(), DataType::RunEndEncoded(_, _)),
+            "Expected RunEndEncoded type, got {:?}",
+            col.data_type()
+        );
+
+        let run_array = col
+            .as_any()
+            .downcast_ref::<RunArray<arrow_array::types::Int32Type>>()
+            .expect("Should be RunArray<Int32>");
+
+        // With dictionary value run collapsing, we should get 3 physical runs
+        // (one per unique value run: [1x5, 2x3, 3x1]) instead of 9 (one per value).
+        assert_eq!(
+            run_array.run_ends().values().len(),
+            3,
+            "Expected 3 physical runs from dict value collapsing, got {}. Run ends: {:?}",
+            run_array.run_ends().values().len(),
+            run_array.run_ends().values()
+        );
+
+        // Verify the run ends are correct: [5, 8, 9]
+        assert_eq!(run_array.run_ends().values(), &[5, 8, 9]);
+
+        // Verify logical values via the values array
+        assert_eq!(run_array.len(), 9);
+        let physical_values = run_array.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(physical_values.len(), 3);
+        assert_eq!(physical_values.value(0), 1);
+        assert_eq!(physical_values.value(1), 2);
+        assert_eq!(physical_values.value(2), 3);
+    }
+
+    /// Test that reading a nullable dictionary-encoded column with REE enabled
+    /// collapses both null runs and value runs.
+    #[test]
+    fn test_ree_dict_value_run_collapsing_nullable() {
+        // Write: [1, 1, NULL, NULL, 2, 2, 2, NULL, 3]
+        let values = Int32Array::from(vec![
+            Some(1), Some(1), None, None, Some(2), Some(2), Some(2), None, Some(3),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(values) as ArrayRef]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .build();
+
+        let mut file = vec![];
+        let mut writer =
+            ArrowWriter::try_new(&mut file, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let file = Bytes::from(file);
+        let builder = crate::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .with_run_end_encoding(true);
+
+        let mut reader = builder.build().unwrap();
+        let result = reader.next().unwrap().unwrap();
+        let col = result.column(0);
+
+        let run_array = col
+            .as_any()
+            .downcast_ref::<RunArray<arrow_array::types::Int32Type>>()
+            .expect("Should be RunArray<Int32>");
+
+        // Expected runs: [1x2, NULLx2, 2x3, NULLx1, 3x1] = 5 physical runs
+        assert_eq!(
+            run_array.run_ends().values().len(),
+            5,
+            "Expected 5 physical runs, got {}. Run ends: {:?}",
+            run_array.run_ends().values().len(),
+            run_array.run_ends().values()
+        );
+
+        // Verify run ends: [2, 4, 7, 8, 9]
+        assert_eq!(run_array.run_ends().values(), &[2, 4, 7, 8, 9]);
+        assert_eq!(run_array.len(), 9);
+    }
 }

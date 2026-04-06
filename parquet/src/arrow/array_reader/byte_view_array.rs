@@ -67,9 +67,11 @@ pub fn make_byte_view_array_reader(
 struct ByteViewArrayReader {
     data_type: ArrowType,
     pages: Box<dyn PageIterator>,
-    def_levels_buffer: Option<Vec<i16>>,
-    rep_levels_buffer: Option<Vec<i16>>,
+    def_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
+    rep_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     record_reader: GenericRecordReader<ViewBuffer, ByteViewArrayColumnValueDecoder>,
+    ree_mode: bool,
+    ree_max_def_level: i16,
 }
 
 impl ByteViewArrayReader {
@@ -81,9 +83,11 @@ impl ByteViewArrayReader {
         Self {
             data_type,
             pages,
-            def_levels_buffer: None,
-            rep_levels_buffer: None,
+            def_level_runs: None,
+            rep_level_runs: None,
             record_reader,
+            ree_mode: false,
+            ree_max_def_level: 0,
         }
     }
 }
@@ -103,13 +107,33 @@ impl ArrayReader for ByteViewArrayReader {
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
         let buffer = self.record_reader.consume_record_data();
-        let null_buffer = self.record_reader.consume_bitmap_buffer();
-        self.def_levels_buffer = self.record_reader.consume_def_levels();
-        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
-        self.record_reader.reset();
+        let null_buffer = if self.record_reader.skip_padding() {
+            None
+        } else {
+            self.record_reader.consume_bitmap_buffer()
+        };
+        self.def_level_runs = self.record_reader.consume_def_level_runs();
+        self.rep_level_runs = self.record_reader.consume_rep_level_runs();
 
         let array = buffer.into_array(null_buffer, &self.data_type);
 
+        if self.ree_mode {
+            let value_runs = self.record_reader.consume_value_runs();
+            self.record_reader.reset();
+            let def_runs = self
+                .def_level_runs
+                .as_ref()
+                .map(|r| r.runs())
+                .unwrap_or(&[]);
+            return crate::arrow::array_reader::ree_array::build_ree_array(
+                def_runs,
+                array,
+                self.ree_max_def_level,
+                value_runs.as_deref(),
+            );
+        }
+
+        self.record_reader.reset();
         Ok(array)
     }
 
@@ -118,11 +142,35 @@ impl ArrayReader for ByteViewArrayReader {
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
-        self.def_levels_buffer.as_deref()
+        self.def_level_runs.as_ref().map(|r| r.as_slice())
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
-        self.rep_levels_buffer.as_deref()
+        self.rep_level_runs.as_ref().map(|r| r.as_slice())
+    }
+
+    fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.def_level_runs.as_ref().map(|r| r.runs())
+    }
+
+    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.rep_level_runs.as_ref().map(|r| r.runs())
+    }
+
+    fn peek_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.record_reader.def_level_runs()
+    }
+
+    fn set_ree_output(&mut self, max_def_level: i16) -> bool {
+        if max_def_level == 0 {
+            return false;
+        }
+        self.ree_mode = true;
+        self.ree_max_def_level = max_def_level;
+        self.record_reader.require_def_level_runs();
+        self.record_reader.set_skip_padding(true);
+        self.record_reader.enable_value_run_capture();
+        true
     }
 }
 
@@ -131,6 +179,7 @@ struct ByteViewArrayColumnValueDecoder {
     dict: Option<ViewBuffer>,
     decoder: Option<ByteViewArrayDecoder>,
     validate_utf8: bool,
+    capture_value_runs: bool,
 }
 
 impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
@@ -142,6 +191,7 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
             dict: None,
             decoder: None,
             validate_utf8,
+            capture_value_runs: false,
         }
     }
 
@@ -197,7 +247,7 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
             .as_mut()
             .ok_or_else(|| general_err!("no decoder set"))?;
 
-        decoder.read(out, num_values, self.dict.as_ref())
+        decoder.read(out, num_values, self.dict.as_ref(), self.capture_value_runs)
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {
@@ -207,6 +257,15 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
             .ok_or_else(|| general_err!("no decoder set"))?;
 
         decoder.skip(num_values, self.dict.as_ref())
+    }
+
+    fn enable_value_run_capture(&mut self) {
+        self.capture_value_runs = true;
+    }
+
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        let decoder = self.decoder.as_mut()?;
+        decoder.take_value_runs()
     }
 }
 
@@ -261,16 +320,24 @@ impl ByteViewArrayDecoder {
         out: &mut ViewBuffer,
         len: usize,
         dict: Option<&ViewBuffer>,
+        capture_runs: bool,
     ) -> Result<usize> {
         match self {
             ByteViewArrayDecoder::Plain(d) => d.read(out, len),
             ByteViewArrayDecoder::Dictionary(d) => {
                 let dict = dict
                     .ok_or_else(|| general_err!("dictionary required for dictionary encoding"))?;
-                d.read(out, dict, len)
+                d.read(out, dict, len, capture_runs)
             }
             ByteViewArrayDecoder::DeltaLength(d) => d.read(out, len),
             ByteViewArrayDecoder::DeltaByteArray(d) => d.read(out, len),
+        }
+    }
+
+    pub fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        match self {
+            ByteViewArrayDecoder::Dictionary(d) => d.take_value_runs(),
+            _ => None,
         }
     }
 
@@ -423,23 +490,24 @@ impl ByteViewArrayDecoderPlain {
 
 pub struct ByteViewArrayDecoderDictionary {
     decoder: DictIndexDecoder,
+    value_runs: Option<Vec<(u32, u32)>>,
 }
 
 impl ByteViewArrayDecoderDictionary {
     fn new(data: Bytes, num_levels: usize, num_values: Option<usize>) -> Result<Self> {
         Ok(Self {
             decoder: DictIndexDecoder::new(data, num_levels, num_values)?,
+            value_runs: None,
         })
     }
 
-    /// Reads the next indexes from self.decoder
-    /// the indexes are assumed to be indexes into `dict`
-    /// the output values are written to output
-    ///
-    /// Assumptions / Optimization
-    /// This function checks if dict.buffers() are the last buffers in `output`, and if so
-    /// reuses the dictionary page buffers directly without copying data
-    fn read(&mut self, output: &mut ViewBuffer, dict: &ViewBuffer, len: usize) -> Result<usize> {
+    fn read(
+        &mut self,
+        output: &mut ViewBuffer,
+        dict: &ViewBuffer,
+        len: usize,
+        capture_runs: bool,
+    ) -> Result<usize> {
         if dict.is_empty() || len == 0 {
             return Ok(0);
         }
@@ -469,6 +537,12 @@ impl ByteViewArrayDecoderDictionary {
         // then the base_buffer_idx is 5 - 2 = 3
         let base_buffer_idx = output.buffers.len() as u32 - dict.buffers.len() as u32;
 
+        let runs = if capture_runs {
+            Some(self.value_runs.get_or_insert_with(Vec::new))
+        } else {
+            None
+        };
+
         self.decoder.read(len, |keys| {
             for k in keys {
                 let view = dict
@@ -494,7 +568,11 @@ impl ByteViewArrayDecoderDictionary {
                 }
             }
             Ok(())
-        })
+        }, runs)
+    }
+
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        self.value_runs.as_mut().map(|v| std::mem::take(v))
     }
 
     fn skip(&mut self, dict: &ViewBuffer, to_skip: usize) -> Result<usize> {

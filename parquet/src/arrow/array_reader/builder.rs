@@ -26,7 +26,6 @@ use crate::arrow::array_reader::cached_array_reader::CachedArrayReader;
 use crate::arrow::array_reader::empty_array::make_empty_array_reader;
 use crate::arrow::array_reader::fixed_len_byte_array::make_fixed_len_byte_array_reader;
 use crate::arrow::array_reader::row_group_cache::RowGroupCache;
-use crate::arrow::array_reader::ree_array;
 use crate::arrow::array_reader::row_number::RowNumberReader;
 use crate::arrow::array_reader::{
     ArrayReader, FixedSizeListArrayReader, ListArrayReader, MapArrayReader, NullArrayReader,
@@ -144,15 +143,19 @@ impl<'a> ArrayReaderBuilder<'a> {
         field: &ParquetField,
         mask: &ProjectionMask,
     ) -> Result<Option<Box<dyn ArrayReader>>> {
-        // If the field is REE-wrapped, unwrap it, build the inner reader
-        // for the original type, then wrap in ReeWrappingReader.
+        // If the field is REE-wrapped, unwrap to the inner type, build the
+        // reader normally, then ask it to produce REE output directly.
+        // Readers that support REE (primitives, byte arrays, etc.) will
+        // return true from set_ree_output and produce RunEndEncoded arrays.
+        // Readers that don't support it return false and produce dense arrays.
         if let DataType::RunEndEncoded(_, ref values_field) = field.arrow_type {
             let mut inner_field = field.clone();
             inner_field.arrow_type = values_field.data_type().clone();
             let def_level = field.def_level;
             let inner_reader = self.build_reader(&inner_field, mask)?;
-            return Ok(inner_reader.map(|r| {
-                Box::new(ree_array::ReeWrappingReader::new(r, def_level)) as Box<dyn ArrayReader>
+            return Ok(inner_reader.map(|mut r| {
+                r.set_ree_output(def_level);
+                r
             }));
         }
 
@@ -379,52 +382,6 @@ impl<'a> ArrayReaderBuilder<'a> {
         ));
 
         let page_iterator = self.row_groups.column_chunks(col_idx)?;
-
-        // Check if the schema requests RunEndEncoded output for this column.
-        // The arrow_type is set to RunEndEncoded by with_run_end_encoding()
-        // for eligible columns.
-        if let DataType::RunEndEncoded(_, ref values_field) = field.arrow_type {
-            let inner_type = values_field.data_type().clone();
-            let reader: Box<dyn ArrayReader> = match physical_type {
-                PhysicalType::BOOLEAN => Box::new(
-                    ree_array::ReeArrayReader::<BoolType>::new(
-                        page_iterator, column_desc, inner_type,
-                    )?,
-                ),
-                PhysicalType::INT32 => Box::new(
-                    ree_array::ReeArrayReader::<Int32Type>::new(
-                        page_iterator, column_desc, inner_type,
-                    )?,
-                ),
-                PhysicalType::INT64 => Box::new(
-                    ree_array::ReeArrayReader::<Int64Type>::new(
-                        page_iterator, column_desc, inner_type,
-                    )?,
-                ),
-                PhysicalType::INT96 => Box::new(
-                    ree_array::ReeArrayReader::<Int96Type>::new(
-                        page_iterator, column_desc, inner_type,
-                    )?,
-                ),
-                PhysicalType::FLOAT => Box::new(
-                    ree_array::ReeArrayReader::<FloatType>::new(
-                        page_iterator, column_desc, inner_type,
-                    )?,
-                ),
-                PhysicalType::DOUBLE => Box::new(
-                    ree_array::ReeArrayReader::<DoubleType>::new(
-                        page_iterator, column_desc, inner_type,
-                    )?,
-                ),
-                _ => {
-                    return Err(general_err!(
-                        "RunEndEncoded not supported for physical type {:?}",
-                        physical_type
-                    ));
-                }
-            };
-            return Ok(Some(reader));
-        }
 
         let arrow_type = Some(field.arrow_type.clone());
         let reader = match physical_type {

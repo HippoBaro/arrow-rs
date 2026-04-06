@@ -570,6 +570,88 @@ impl RleDecoder {
         Ok(values_read)
     }
 
+    /// Like [`get_batch_with_dict`](Self::get_batch_with_dict) but also captures
+    /// `(dict_index, count)` runs in `runs`. For RLE runs a single entry is
+    /// appended; for bit-packed runs each value is merged with the previous
+    /// entry when the dictionary index matches.
+    #[inline(never)]
+    pub fn get_batch_with_dict_as_runs<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        max_values: usize,
+        runs: &mut Vec<(u32, u32)>,
+    ) -> Result<usize>
+    where
+        T: Default + Clone,
+    {
+        assert!(buffer.len() >= max_values);
+
+        let mut values_read = 0;
+        while values_read < max_values {
+            let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+
+            if self.rle_left > 0 {
+                let num_values = cmp::min(max_values - values_read, self.rle_left as usize);
+                let dict_idx = self.current_value.unwrap() as u32;
+                let dict_value = dict[dict_idx as usize].clone();
+
+                buffer[values_read..values_read + num_values].fill(dict_value);
+
+                // Merge with last run if same index
+                if let Some(last) = runs.last_mut().filter(|r| r.0 == dict_idx) {
+                    last.1 += num_values as u32;
+                } else {
+                    runs.push((dict_idx, num_values as u32));
+                }
+
+                self.rle_left -= num_values as u32;
+                values_read += num_values;
+            } else if self.bit_packed_left > 0 {
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+
+                loop {
+                    let to_read = index_buf
+                        .len()
+                        .min(max_values - values_read)
+                        .min(self.bit_packed_left as usize);
+
+                    if to_read == 0 {
+                        break;
+                    }
+
+                    let num_values = bit_reader
+                        .get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                    if num_values == 0 {
+                        self.bit_packed_left = 0;
+                        break;
+                    }
+                    for i in 0..num_values {
+                        let idx = index_buf[i] as u32;
+                        buffer[values_read + i].clone_from(&dict[idx as usize]);
+                        if let Some(last) = runs.last_mut().filter(|r| r.0 == idx) {
+                            last.1 += 1;
+                        } else {
+                            runs.push((idx, 1));
+                        }
+                    }
+                    self.bit_packed_left -= num_values as u32;
+                    values_read += num_values;
+                    if num_values < to_read {
+                        break;
+                    }
+                }
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok(values_read)
+    }
+
     /// Returns the next RLE or bit-packed run as `(value, count)` pairs
     /// appended to `out`. For RLE runs this is a single `(value, count)` entry.
     /// For bit-packed runs, each distinct value-group is appended separately.
@@ -612,6 +694,54 @@ impl RleDecoder {
                             general_err!("not enough data for bit-packed RLE run")
                         })?;
                     // Merge with the last run if same value
+                    if let Some(last) = out.last_mut().filter(|r| r.0 == value) {
+                        last.1 += 1;
+                    } else {
+                        out.push((value, 1));
+                    }
+                }
+                self.bit_packed_left -= count as u32;
+                values_read += count;
+            } else if !self.reload()? {
+                break;
+            }
+        }
+        Ok(values_read)
+    }
+
+    /// Like [`get_batch_as_runs`](Self::get_batch_as_runs) but with `u32` value type,
+    /// suitable for dictionary indices which may exceed `i16` range.
+    #[inline(never)]
+    pub fn get_batch_as_runs_u32(
+        &mut self,
+        out: &mut Vec<(u32, u32)>,
+        max_values: usize,
+    ) -> Result<usize> {
+        let mut values_read = 0;
+        while values_read < max_values {
+            if self.rle_left > 0 {
+                let count = (max_values - values_read).min(self.rle_left as usize);
+                let value = self.current_value.unwrap() as u32;
+                if let Some(last) = out.last_mut().filter(|r| r.0 == value) {
+                    last.1 += count as u32;
+                } else {
+                    out.push((value, count as u32));
+                }
+                self.rle_left -= count as u32;
+                values_read += count;
+            } else if self.bit_packed_left > 0 {
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+
+                let count = (max_values - values_read).min(self.bit_packed_left as usize);
+                for _ in 0..count {
+                    let value = bit_reader
+                        .get_value::<u32>(self.bit_width as usize)
+                        .ok_or_else(|| {
+                            general_err!("not enough data for bit-packed RLE run")
+                        })?;
                     if let Some(last) = out.last_mut().filter(|r| r.0 == value) {
                         last.1 += 1;
                     } else {

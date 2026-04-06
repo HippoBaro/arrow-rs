@@ -122,9 +122,11 @@ pub fn make_byte_array_dictionary_reader(
 struct ByteArrayDictionaryReader<K: ArrowNativeType, V: OffsetSizeTrait> {
     data_type: ArrowType,
     pages: Box<dyn PageIterator>,
-    def_levels_buffer: Option<Vec<i16>>,
-    rep_levels_buffer: Option<Vec<i16>>,
+    def_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
+    rep_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     record_reader: GenericRecordReader<DictionaryBuffer<K, V>, DictionaryDecoder<K, V>>,
+    ree_mode: bool,
+    ree_max_def_level: i16,
 }
 
 impl<K, V> ByteArrayDictionaryReader<K, V>
@@ -140,9 +142,11 @@ where
         Self {
             data_type,
             pages,
-            def_levels_buffer: None,
-            rep_levels_buffer: None,
+            def_level_runs: None,
+            rep_level_runs: None,
             record_reader,
+            ree_mode: false,
+            ree_max_def_level: 0,
         }
     }
 }
@@ -165,22 +169,39 @@ where
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
-        // advance the def & rep level buffers
-        self.def_levels_buffer = self.record_reader.consume_def_levels();
-        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
+        self.def_level_runs = self.record_reader.consume_def_level_runs();
+        self.rep_level_runs = self.record_reader.consume_rep_level_runs();
 
         if self.record_reader.num_values() == 0 {
-            // once the record_reader has been consumed, we've replaced its values with the default
-            // variant of DictionaryBuffer (Offset). If `consume_batch` then gets called again, we
-            // avoid using the wrong variant of the buffer by returning empty array.
+            self.record_reader.reset();
             return Ok(new_empty_array(&self.data_type));
         }
 
         let buffer = self.record_reader.consume_record_data();
-        let null_buffer = self.record_reader.consume_bitmap_buffer();
+        let null_buffer = if self.record_reader.skip_padding() {
+            None
+        } else {
+            self.record_reader.consume_bitmap_buffer()
+        };
         let array = buffer.into_array(null_buffer, &self.data_type)?;
-        self.record_reader.reset();
 
+        if self.ree_mode {
+            let value_runs = self.record_reader.consume_value_runs();
+            self.record_reader.reset();
+            let def_runs = self
+                .def_level_runs
+                .as_ref()
+                .map(|r| r.runs())
+                .unwrap_or(&[]);
+            return crate::arrow::array_reader::ree_array::build_ree_array(
+                def_runs,
+                array,
+                self.ree_max_def_level,
+                value_runs.as_deref(),
+            );
+        }
+
+        self.record_reader.reset();
         Ok(array)
     }
 
@@ -189,11 +210,31 @@ where
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
-        self.def_levels_buffer.as_deref()
+        self.def_level_runs.as_ref().map(|r| r.as_slice())
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
-        self.rep_levels_buffer.as_deref()
+        self.rep_level_runs.as_ref().map(|r| r.as_slice())
+    }
+
+    fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.def_level_runs.as_ref().map(|r| r.runs())
+    }
+
+    fn get_rep_level_runs(&self) -> Option<&[(i16, u32)]> {
+        self.rep_level_runs.as_ref().map(|r| r.runs())
+    }
+
+    fn set_ree_output(&mut self, max_def_level: i16) -> bool {
+        if max_def_level == 0 {
+            return false;
+        }
+        self.ree_mode = true;
+        self.ree_max_def_level = max_def_level;
+        self.record_reader.require_def_level_runs();
+        self.record_reader.set_skip_padding(true);
+        self.record_reader.enable_value_run_capture();
+        true
     }
 }
 
@@ -222,6 +263,9 @@ struct DictionaryDecoder<K, V> {
 
     value_type: ArrowType,
 
+    capture_value_runs: bool,
+    value_runs: Option<Vec<(u32, u32)>>,
+
     phantom: PhantomData<(K, V)>,
 }
 
@@ -247,6 +291,8 @@ where
             decoder: None,
             validate_utf8,
             value_type,
+            capture_value_runs: false,
+            value_runs: None,
             phantom: Default::default(),
         }
     }
@@ -315,7 +361,7 @@ where
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
         match self.decoder.as_mut().expect("decoder set") {
             MaybeDictionaryDecoder::Fallback(decoder) => {
-                decoder.read(out.spill_values()?, num_values, None)
+                decoder.read(out.spill_values()?, num_values, None, false)
             }
             MaybeDictionaryDecoder::Dict {
                 decoder,
@@ -339,12 +385,25 @@ where
                         // Happy path - can just copy keys
                         // Keys will be validated on conversion to arrow
 
-                        // TODO: Push vec into decoder (#5177)
                         let start = keys.len();
                         keys.resize(start + len, K::default());
                         let len = decoder.get_batch(&mut keys[start..])?;
                         keys.truncate(start + len);
                         *max_remaining_values -= len;
+
+                        // Capture value runs from the keys we just decoded
+                        if self.capture_value_runs {
+                            let runs = self.value_runs.get_or_insert_with(Vec::new);
+                            for &k in &keys[start..start + len] {
+                                let idx = k.as_usize() as u32;
+                                if let Some(last) = runs.last_mut().filter(|r| r.0 == idx) {
+                                    last.1 += 1;
+                                } else {
+                                    runs.push((idx, 1));
+                                }
+                            }
+                        }
+
                         Ok(len)
                     }
                     None => {
@@ -384,6 +443,14 @@ where
                 decoder.skip(num_values)
             }
         }
+    }
+
+    fn enable_value_run_capture(&mut self) {
+        self.capture_value_runs = true;
+    }
+
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        self.value_runs.as_mut().map(|v| std::mem::take(v))
     }
 }
 

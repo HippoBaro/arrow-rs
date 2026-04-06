@@ -236,6 +236,16 @@ pub trait Decoder<T: DataType>: Send {
 
     /// Skip the specified number of values in this decoder stream.
     fn skip(&mut self, num_values: usize) -> Result<usize>;
+
+    /// Enable capturing of value runs (dictionary index runs) during decoding.
+    /// Only meaningful for dictionary decoders; other decoders ignore this.
+    fn enable_value_run_capture(&mut self) {}
+
+    /// Take the captured value runs, if any. Each entry is `(dict_index, count)`.
+    /// Returns `None` if capture is not enabled or the decoder does not support it.
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        None
+    }
 }
 
 /// Gets a decoder for the column descriptor `descr` and encoding type `encoding`.
@@ -349,6 +359,9 @@ pub struct DictDecoder<T: DataType> {
 
     // Number of values left in the data stream
     num_values: usize,
+
+    // When Some, captures (dict_index, count) runs during get()
+    value_runs: Option<Vec<(u32, u32)>>,
 }
 
 impl<T: DataType> Default for DictDecoder<T> {
@@ -365,6 +378,7 @@ impl<T: DataType> DictDecoder<T> {
             has_dictionary: false,
             rle_decoder: None,
             num_values: 0,
+            value_runs: None,
         }
     }
 
@@ -405,7 +419,11 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
 
         let rle = self.rle_decoder.as_mut().unwrap();
         let num_values = cmp::min(buffer.len(), self.num_values);
-        rle.get_batch_with_dict(&self.dictionary[..], buffer, num_values)
+        if let Some(ref mut runs) = self.value_runs {
+            rle.get_batch_with_dict_as_runs(&self.dictionary[..], buffer, num_values, runs)
+        } else {
+            rle.get_batch_with_dict(&self.dictionary[..], buffer, num_values)
+        }
     }
 
     /// Number of values left in this decoder stream
@@ -424,6 +442,16 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
         let rle = self.rle_decoder.as_mut().unwrap();
         let num_values = cmp::min(num_values, self.num_values);
         rle.skip(num_values)
+    }
+
+    fn enable_value_run_capture(&mut self) {
+        if self.value_runs.is_none() {
+            self.value_runs = Some(Vec::new());
+        }
+    }
+
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        self.value_runs.as_mut().map(|v| std::mem::take(v))
     }
 }
 

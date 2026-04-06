@@ -112,6 +112,10 @@ where
     /// Repetition levels stored as runs — no flat Vec<i16> materialization.
     rep_level_runs: Option<crate::column::reader::run_level_buffer::RunLevelBuffer>,
     record_reader: RecordReader<T>,
+    /// When true, consume_batch produces RunEndEncoded output
+    ree_mode: bool,
+    /// The max definition level for REE null detection
+    ree_max_def_level: i16,
 }
 
 impl<T> PrimitiveArrayReader<T>
@@ -142,6 +146,8 @@ where
             def_level_runs: None,
             rep_level_runs: None,
             record_reader,
+            ree_mode: false,
+            ree_max_def_level: 0,
         })
     }
 }
@@ -498,6 +504,23 @@ where
         // Take definition level runs directly — no flat Vec<i16> materialization.
         self.def_level_runs = self.record_reader.consume_def_level_runs();
         self.rep_level_runs = self.record_reader.consume_rep_level_runs();
+
+        if self.ree_mode {
+            let value_runs = self.record_reader.consume_value_runs();
+            self.record_reader.reset();
+            let def_runs = self
+                .def_level_runs
+                .as_ref()
+                .map(|r| r.runs())
+                .unwrap_or(&[]);
+            return crate::arrow::array_reader::ree_array::build_ree_array(
+                def_runs,
+                array,
+                self.ree_max_def_level,
+                value_runs.as_deref(),
+            );
+        }
+
         self.record_reader.reset();
         Ok(array)
     }
@@ -552,6 +575,18 @@ where
         self.record_reader.consume_bitmap_buffer();
         self.record_reader.reset();
         Ok(n)
+    }
+
+    fn set_ree_output(&mut self, max_def_level: i16) -> bool {
+        if max_def_level == 0 {
+            return false; // required (non-nullable) column — REE has no benefit
+        }
+        self.ree_mode = true;
+        self.ree_max_def_level = max_def_level;
+        self.record_reader.require_def_level_runs();
+        self.record_reader.set_skip_padding(true);
+        self.record_reader.enable_value_run_capture();
+        true
     }
 }
 

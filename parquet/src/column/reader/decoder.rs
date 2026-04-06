@@ -133,6 +133,16 @@ pub trait ColumnValueDecoder {
     ///
     /// Returns the number of values skipped
     fn skip_values(&mut self, num_values: usize) -> Result<usize>;
+
+    /// Enable capturing of value runs (dictionary index runs) during reads.
+    /// Only meaningful for dictionary-encoded columns; others ignore this.
+    fn enable_value_run_capture(&mut self) {}
+
+    /// Take captured value runs. Each entry is `(dict_index, count)`.
+    /// Returns `None` if capture is not enabled or the encoding does not support it.
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        None
+    }
 }
 
 /// Bucket-based storage for decoder instances keyed by `Encoding`.
@@ -151,6 +161,9 @@ pub struct ColumnValueDecoderImpl<T: DataType> {
     /// Uses `EncodingMask` and dense storage keyed by encoding discriminant.
     decoder_mask: EncodingMask,
     decoders: [Option<Box<dyn Decoder<T>>>; ENCODING_SLOTS],
+
+    /// Whether value run capture is requested (persists across page boundaries)
+    capture_value_runs: bool,
 }
 
 impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
@@ -162,6 +175,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             current_encoding: None,
             decoder_mask: EncodingMask::default(),
             decoders: std::array::from_fn(|_| None),
+            capture_value_runs: false,
         }
     }
 
@@ -225,6 +239,9 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         };
 
         decoder.set_data(data, num_values.unwrap_or(num_levels))?;
+        if self.capture_value_runs && encoding == Encoding::RLE_DICTIONARY {
+            decoder.enable_value_run_capture();
+        }
         self.current_encoding = Some(encoding);
         Ok(())
     }
@@ -256,6 +273,24 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             .unwrap_or_else(|| panic!("decoder for encoding {encoding} should be set"));
 
         current_decoder.skip(num_values)
+    }
+
+    fn enable_value_run_capture(&mut self) {
+        self.capture_value_runs = true;
+        // Enable on the current dict decoder if already set
+        if let Some(decoder) = self.decoders[Encoding::RLE_DICTIONARY as usize].as_mut() {
+            decoder.enable_value_run_capture();
+        }
+    }
+
+    fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
+        let encoding = self.current_encoding?;
+        if encoding != Encoding::RLE_DICTIONARY {
+            return None;
+        }
+        self.decoders[encoding as usize]
+            .as_mut()
+            .and_then(|d| d.take_value_runs())
     }
 }
 
