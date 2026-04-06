@@ -174,6 +174,16 @@ where
     D: DefinitionLevelDecoder,
     V: ColumnValueDecoder,
 {
+    /// Returns a reference to the inner value decoder.
+    pub(crate) fn values_decoder(&self) -> &V {
+        &self.values_decoder
+    }
+
+    /// Returns a mutable reference to the inner value decoder.
+    pub(crate) fn values_decoder_mut(&mut self) -> &mut V {
+        &mut self.values_decoder
+    }
+
     pub(crate) fn new_with_decoders(
         descr: ColumnDescPtr,
         page_reader: Box<dyn PageReader>,

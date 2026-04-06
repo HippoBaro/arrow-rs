@@ -139,6 +139,23 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
             return Err(general_err!("first repetition level of batch must be 0"));
         }
 
+        // When skip_padding is active, we don't need to build a ListArray with
+        // dense offsets. Instead, compute record_def_runs from the rep/def runs
+        // (the compact list-level structure) and return the child array directly.
+        // The parent reader will use record_def_runs to reconstruct the list
+        // structure, just as it does for leaf columns via build_ree_array.
+        if self.skip_padding {
+            for (d, r, count) in AlignedRunIter::new(def_runs, rep_runs) {
+                if r < self.rep_level {
+                    // Record boundary — emit a def run at the list level.
+                    self.record_def_runs.push((d, count as u32));
+                }
+                // r >= self.rep_level means continuation within a list — the child
+                // reader already handled these, nothing to do at this level.
+            }
+            return Ok(child_array);
+        }
+
         // Max definition level from runs — O(runs) not O(rows).
         let max_def_level = def_runs
             .iter()
@@ -157,13 +174,8 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
             .sum();
 
         let mut list_offsets: Vec<OffsetSize> = Vec::with_capacity(est_lists + 1);
-        // In compact mode, all output entries are non-null so no validity bitmap.
-        let mut validity = if self.skip_padding {
-            None
-        } else {
-            self.nullable
-                .then(|| BooleanBufferBuilder::new(est_lists))
-        };
+        let mut validity = self.nullable
+            .then(|| BooleanBufferBuilder::new(est_lists));
 
         let child_data;
 
@@ -182,9 +194,6 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                     let count = count as usize;
                     if r < self.rep_level {
                         if d >= self.def_level {
-                            if self.skip_padding {
-                                self.record_def_runs.push((self.def_level, count as u32));
-                            }
                             for _ in 0..count {
                                 list_offsets.push(
                                     OffsetSize::from_usize(cur_offset)
@@ -195,8 +204,6 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                             if let Some(v) = validity.as_mut() {
                                 v.append_n(count, true);
                             }
-                        } else if self.skip_padding {
-                            self.record_def_runs.push((d, count as u32));
                         } else {
                             let offset = OffsetSize::from_usize(cur_offset)
                                 .ok_or_else(|| general_err!("offset overflow"))?;
@@ -234,9 +241,6 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                     } else {
                         // Record boundaries
                         if d >= self.def_level {
-                            if self.skip_padding {
-                                self.record_def_runs.push((self.def_level, count as u32));
-                            }
                             filter_start.get_or_insert(cur_offset + skipped);
                             for _ in 0..count {
                                 list_offsets.push(
@@ -247,13 +251,6 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                             if let Some(v) = validity.as_mut() {
                                 v.append_n(count, true);
                             }
-                        } else if self.skip_padding {
-                            if let Some(start) = filter_start.take() {
-                                child_data_builder
-                                    .extend(0, start, cur_offset + skipped);
-                            }
-                            skipped += count;
-                            self.record_def_runs.push((d, count as u32));
                         } else {
                             if let Some(start) = filter_start.take() {
                                 child_data_builder
@@ -315,9 +312,6 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                             OffsetSize::from_usize(cur_offset)
                                 .ok_or_else(|| general_err!("offset overflow"))?,
                         );
-                        if self.skip_padding {
-                            self.record_def_runs.push((self.def_level, 1));
-                        }
                         if let Some(v) = validity.as_mut() {
                             v.append(true);
                         }
@@ -329,8 +323,6 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                             child_builder.extend_nulls(1);
                             cur_offset += 1;
                         }
-                    } else if self.skip_padding {
-                        self.record_def_runs.push((d, 1));
                     } else {
                         if let Some(start) = run_start.take() {
                             child_builder.extend(0, start, compact_idx);
@@ -401,19 +393,9 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                         list_offsets.push(OffsetSize::from_usize(cur_offset).unwrap());
                         filter_start.get_or_insert(cur_offset + skipped);
                         cur_offset += 1;
-                        if self.skip_padding {
-                            self.record_def_runs.push((self.def_level, 1));
-                        }
                         if let Some(v) = validity.as_mut() {
                             v.append(true);
                         }
-                    } else if self.skip_padding {
-                        if let Some(start) = filter_start.take() {
-                            child_data_builder
-                                .extend(0, start, cur_offset + skipped);
-                        }
-                        skipped += 1;
-                        self.record_def_runs.push((d, 1));
                     } else {
                         list_offsets.push(OffsetSize::from_usize(cur_offset).unwrap());
                         if let Some(start) = filter_start.take() {

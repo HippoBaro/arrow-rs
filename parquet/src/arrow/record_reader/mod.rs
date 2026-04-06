@@ -375,6 +375,11 @@ where
     pub fn consume_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
         self.value_runs.take()
     }
+
+    /// Return the dictionary as an Arrow array from the inner value decoder.
+    pub fn dict_as_array(&self) -> Option<arrow_array::ArrayRef> {
+        self.column_reader.as_ref()?.values_decoder().dict_as_array()
+    }
 }
 
 /// Returns true if we do not need to unpack the nullability for this column, this is

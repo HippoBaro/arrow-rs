@@ -31,7 +31,7 @@ use crate::schema::types::ColumnDescPtr;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, Decimal128Array, Decimal256Array, OffsetSizeTrait,
 };
-use arrow_buffer::i256;
+use arrow_buffer::{Buffer, i256};
 use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
 use std::any::Any;
@@ -118,6 +118,50 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
+        self.def_level_runs = self.record_reader.consume_def_level_runs();
+        self.rep_level_runs = self.record_reader.consume_rep_level_runs();
+
+        // REE fast path: when all pages were dictionary-encoded and expansion
+        // was skipped, build the REE array directly from the dictionary.
+        if self.ree_mode {
+            let value_runs = self.record_reader.consume_value_runs();
+            let def_runs = self
+                .def_level_runs
+                .as_ref()
+                .map(|r| r.runs())
+                .unwrap_or(&[]);
+
+            if let Some(ref vr) = value_runs {
+                if let Some(dict_array) = self.record_reader.dict_as_array() {
+                    // Discard the empty buffer and reset.
+                    let _ = self.record_reader.consume_record_data();
+                    self.record_reader.reset();
+                    return crate::arrow::array_reader::ree_array::build_ree_array_from_dict(
+                        def_runs,
+                        dict_array,
+                        self.ree_max_def_level,
+                        vr,
+                    );
+                }
+            }
+
+            // Fallback: non-dictionary pages or dict unavailable — use expanded buffer.
+            let buffer = self.record_reader.consume_record_data();
+            let null_buffer = if self.record_reader.skip_padding() {
+                None
+            } else {
+                self.record_reader.consume_bitmap_buffer()
+            };
+            let array = buffer.into_array(null_buffer, self.data_type.clone());
+            self.record_reader.reset();
+            return crate::arrow::array_reader::ree_array::build_ree_array(
+                def_runs,
+                array,
+                self.ree_max_def_level,
+                value_runs.as_deref(),
+            );
+        }
+
         let buffer = self.record_reader.consume_record_data();
         // When skip_padding is active, suppress the null bitmap — the parent
         // list reader handles nullness via def/rep levels.
@@ -126,18 +170,11 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
         } else {
             self.record_reader.consume_bitmap_buffer()
         };
-        self.def_level_runs = self.record_reader.consume_def_level_runs();
-        self.rep_level_runs = self.record_reader.consume_rep_level_runs();
 
         let array: ArrayRef = match self.data_type {
-            // Apply conversion to all elements regardless of null slots as the conversions
-            // are infallible. This improves performance by avoiding a branch in the inner
-            // loop (see docs for `PrimitiveArray::from_unary`).
             ArrowType::Decimal128(p, s) => {
                 let array = buffer.into_array(null_buffer, ArrowType::Binary);
                 let binary = array.as_any().downcast_ref::<BinaryArray>().unwrap();
-                // Null slots will have 0 length, so we need to check for that in the lambda
-                // or sign_extend_be will panic.
                 let decimal = Decimal128Array::from_unary(binary, |x| match x.len() {
                     0 => i128::default(),
                     _ => i128::from_be_bytes(sign_extend_be(x)),
@@ -148,8 +185,6 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
             ArrowType::Decimal256(p, s) => {
                 let array = buffer.into_array(null_buffer, ArrowType::Binary);
                 let binary = array.as_any().downcast_ref::<BinaryArray>().unwrap();
-                // Null slots will have 0 length, so we need to check for that in the lambda
-                // or sign_extend_be will panic.
                 let decimal = Decimal256Array::from_unary(binary, |x| match x.len() {
                     0 => i256::default(),
                     _ => i256::from_be_bytes(sign_extend_be(x)),
@@ -159,22 +194,6 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
             }
             _ => buffer.into_array(null_buffer, self.data_type.clone()),
         };
-
-        if self.ree_mode {
-            let value_runs = self.record_reader.consume_value_runs();
-            self.record_reader.reset();
-            let def_runs = self
-                .def_level_runs
-                .as_ref()
-                .map(|r| r.runs())
-                .unwrap_or(&[]);
-            return crate::arrow::array_reader::ree_array::build_ree_array(
-                def_runs,
-                array,
-                self.ree_max_def_level,
-                value_runs.as_deref(),
-            );
-        }
 
         self.record_reader.reset();
         Ok(array)
@@ -336,6 +355,30 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
     fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
         let decoder = self.decoder.as_mut()?;
         decoder.take_value_runs()
+    }
+
+    fn dict_as_array(&self) -> Option<ArrayRef> {
+        let dict = self.dict.as_ref()?;
+        if dict.is_empty() {
+            return None;
+        }
+        // Build an Arrow array from the dictionary's offsets + values.
+        // This copies only the N unique dictionary entries, not N_rows.
+        let offsets = Buffer::from_vec(dict.offsets.clone());
+        let values = Buffer::from_vec(dict.values.clone());
+        let data_type = if self.validate_utf8 {
+            ArrowType::Utf8
+        } else {
+            ArrowType::Binary
+        };
+        let array_data = unsafe {
+            arrow_data::ArrayDataBuilder::new(data_type)
+                .len(dict.len())
+                .add_buffer(offsets)
+                .add_buffer(values)
+                .build_unchecked()
+        };
+        Some(arrow_array::make_array(array_data))
     }
 }
 

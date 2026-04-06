@@ -120,6 +120,77 @@ pub(crate) fn build_ree_array(
     Ok(Arc::new(run_array))
 }
 
+/// Build a `RunArray<Int32Type>` directly from dictionary values and value runs,
+/// without requiring an expanded flat values array.
+///
+/// `dict_values` is the Arrow array of unique dictionary entries (N unique strings).
+/// `value_runs` contains `(dict_index, count)` pairs referencing positions in `dict_values`.
+/// `def_runs` describes null/non-null regions at the record level.
+pub(crate) fn build_ree_array_from_dict(
+    def_runs: &[(i16, u32)],
+    dict_values: ArrayRef,
+    max_def_level: i16,
+    value_runs: &[(u32, u32)],
+) -> Result<ArrayRef> {
+    if def_runs.is_empty() {
+        let run_ends = Int32Array::from(Vec::<i32>::new());
+        let values = arrow_array::new_empty_array(dict_values.data_type());
+        let run_array = RunArray::<ArrowInt32Type>::try_new(&run_ends, &values)?;
+        return Ok(Arc::new(run_array));
+    }
+
+    // Merge adjacent def runs with the same null/non-null classification.
+    let mut merged_runs: Vec<(bool, u32)> = Vec::new();
+    for &(def_val, count) in def_runs {
+        let is_value = def_val >= max_def_level;
+        if let Some(last) = merged_runs.last_mut().filter(|r| r.0 == is_value) {
+            last.1 += count;
+        } else {
+            merged_runs.push((is_value, count));
+        }
+    }
+
+    let mut run_ends: Vec<i32> = Vec::new();
+    let mut cumulative: i32 = 0;
+
+    let dict_data = dict_values.to_data();
+    let mut values_builder = arrow_data::transform::MutableArrayData::new(
+        vec![&dict_data],
+        true,
+        merged_runs.len(),
+    );
+
+    let mut vr_iter = ValueRunIterator::new(value_runs);
+
+    for &(is_value, count) in &merged_runs {
+        if is_value {
+            // Each value run produces one REE entry, indexing into the
+            // dictionary by dict_index instead of into a flat expanded array.
+            let mut remaining = count;
+            while remaining > 0 {
+                let (dict_index, run_count) = vr_iter.consume(remaining);
+                cumulative += run_count as i32;
+                run_ends.push(cumulative);
+                let idx = dict_index as usize;
+                values_builder.extend(0, idx, idx + 1);
+                remaining -= run_count;
+            }
+        } else {
+            // Entire null run collapses to one REE entry.
+            cumulative += count as i32;
+            run_ends.push(cumulative);
+            values_builder.extend_nulls(1);
+        }
+    }
+
+    let values_data = values_builder.freeze();
+    let values_array = arrow_array::make_array(values_data);
+    let run_ends_array = Int32Array::from(run_ends);
+
+    let run_array = RunArray::<ArrowInt32Type>::try_new(&run_ends_array, &values_array)?;
+    Ok(Arc::new(run_array))
+}
+
 /// Iterator that consumes value runs `(dict_index, count)` and supports
 /// partial consumption of individual entries.
 struct ValueRunIterator<'a> {

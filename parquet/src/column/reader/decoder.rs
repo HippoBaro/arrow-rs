@@ -143,6 +143,12 @@ pub trait ColumnValueDecoder {
     fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
         None
     }
+
+    /// Return the stored dictionary as an Arrow array, if available.
+    /// Only meaningful for byte array decoders with a dictionary page.
+    fn dict_as_array(&self) -> Option<arrow_array::ArrayRef> {
+        None
+    }
 }
 
 /// Bucket-based storage for decoder instances keyed by `Encoding`.
