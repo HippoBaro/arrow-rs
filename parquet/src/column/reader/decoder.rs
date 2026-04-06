@@ -144,6 +144,12 @@ pub trait ColumnValueDecoder {
         None
     }
 
+    /// When true, dictionary-encoded decoders skip copying string bytes
+    /// into the output buffer during `read()`, only capturing value runs.
+    /// If a non-dictionary page appears later, the skipped values are
+    /// retroactively expanded before reading that page.
+    fn set_ree_skip_expansion(&mut self, _skip: bool) {}
+
     /// Return the stored dictionary as an Arrow array, if available.
     /// Only meaningful for byte array decoders with a dictionary page.
     fn dict_as_array(&self) -> Option<arrow_array::ArrayRef> {

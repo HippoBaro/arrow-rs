@@ -47,6 +47,9 @@ pub struct ListArrayReader<OffsetSize: OffsetSizeTrait> {
     /// When true, produce compact output: only non-null list entries,
     /// no validity bitmap, and populate record_def_runs as side output.
     skip_padding: bool,
+    /// When true, produce REE output: build a compact ListArray with only
+    /// non-null entries, then wrap it in a RunArray via build_ree_array.
+    ree_mode: bool,
     /// Record-level def runs populated during compact consume_batch.
     /// Each entry is (def_value, count) at the list level — non-null
     /// lists have def >= def_level, null lists have def < def_level.
@@ -76,6 +79,7 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
             nullable,
             compact_child,
             skip_padding: false,
+            ree_mode: false,
             record_def_runs: Vec::new(),
             _marker: PhantomData,
         }
@@ -100,7 +104,7 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
     fn consume_batch(&mut self) -> Result<ArrayRef> {
         // Clear record_def_runs early, BEFORE any early-return paths,
         // to prevent stale data from a previous batch leaking through.
-        if self.skip_padding {
+        if self.skip_padding || self.ree_mode {
             self.record_def_runs.clear();
         }
 
@@ -139,21 +143,70 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
             return Err(general_err!("first repetition level of batch must be 0"));
         }
 
-        // When skip_padding is active, we don't need to build a ListArray with
-        // dense offsets. Instead, compute record_def_runs from the rep/def runs
-        // (the compact list-level structure) and return the child array directly.
-        // The parent reader will use record_def_runs to reconstruct the list
-        // structure, just as it does for leaf columns via build_ree_array.
-        if self.skip_padding {
+        // When skip_padding is active (parent list compact mode), compute
+        // record_def_runs and return the child array directly.
+        if self.skip_padding && !self.ree_mode {
             for (d, r, count) in AlignedRunIter::new(def_runs, rep_runs) {
                 if r < self.rep_level {
-                    // Record boundary — emit a def run at the list level.
                     self.record_def_runs.push((d, count as u32));
                 }
-                // r >= self.rep_level means continuation within a list — the child
-                // reader already handled these, nothing to do at this level.
             }
             return Ok(child_array);
+        }
+
+        // REE mode: build a compact ListArray containing only non-null list
+        // entries, then wrap it in a RunArray via build_ree_array.
+        // This avoids materializing a dense offset buffer for every record
+        // (which would be 262 KB avg x 13K columns = 3.48 GB at peak).
+        if self.ree_mode {
+            let mut cur_offset: usize = 0;
+            // Only non-null lists get offsets — much smaller than one per record.
+            let mut compact_offsets: Vec<OffsetSize> = Vec::new();
+
+            for (d, r, count) in AlignedRunIter::new(def_runs, rep_runs) {
+                if r < self.rep_level {
+                    // Record boundary
+                    self.record_def_runs.push((d, count as u32));
+                    if d >= self.def_level {
+                        // Non-null list entries — each gets an offset
+                        for _ in 0..count {
+                            compact_offsets.push(
+                                OffsetSize::from_usize(cur_offset)
+                                    .ok_or_else(|| general_err!("offset overflow"))?,
+                            );
+                            cur_offset += 1;
+                        }
+                    }
+                } else if d >= self.def_level {
+                    // Continuation within a list
+                    cur_offset += count as usize;
+                }
+            }
+            compact_offsets.push(
+                OffsetSize::from_usize(cur_offset)
+                    .ok_or_else(|| general_err!("offset overflow"))?,
+            );
+
+            // Build a compact ListArray with only non-null entries.
+            let value_offsets = Buffer::from(compact_offsets.to_byte_slice());
+            let child_data = child_array.to_data();
+            let compact_list_data = unsafe {
+                ArrayData::builder(self.data_type.clone())
+                    .len(compact_offsets.len() - 1)
+                    .add_buffer(value_offsets)
+                    .add_child_data(child_data)
+                    .build_unchecked()
+            };
+            let compact_list: ArrayRef =
+                Arc::new(GenericListArray::<OffsetSize>::from(compact_list_data));
+
+            // Wrap in REE using the record-level def runs.
+            return crate::arrow::array_reader::ree_array::build_ree_array(
+                &self.record_def_runs,
+                compact_list,
+                self.def_level,
+                None,
+            );
         }
 
         // Max definition level from runs — O(runs) not O(rows).
@@ -452,6 +505,14 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
 
     fn set_compact_record_output(&mut self, compact: bool) -> bool {
         self.skip_padding = compact;
+        true
+    }
+
+    fn set_ree_output(&mut self, _max_def_level: i16) -> bool {
+        // Activate REE mode: build a compact ListArray with only non-null
+        // entries, then wrap it in a RunArray. This avoids materializing
+        // dense offsets for every record.
+        self.ree_mode = true;
         true
     }
 

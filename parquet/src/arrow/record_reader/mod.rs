@@ -72,6 +72,8 @@ pub struct GenericRecordReader<V, CV> {
     capture_value_runs: bool,
     /// Accumulated value runs from the inner column reader
     value_runs: Option<Vec<(u32, u32)>>,
+    /// When true, dictionary-encoded reads skip byte expansion (REE fast path).
+    ree_skip_expansion: bool,
 }
 
 impl<V, CV> GenericRecordReader<V, CV>
@@ -100,6 +102,7 @@ where
             force_full_def_levels: false,
             capture_value_runs: false,
             value_runs: None,
+            ree_skip_expansion: false,
         }
     }
 
@@ -139,6 +142,9 @@ where
         );
         if self.capture_value_runs {
             col_reader.enable_value_run_capture();
+        }
+        if self.ree_skip_expansion {
+            col_reader.values_decoder_mut().set_ree_skip_expansion(true);
         }
         self.column_reader = Some(col_reader);
         Ok(())
@@ -374,6 +380,17 @@ where
     /// Take accumulated value runs. Returns `None` if capture was invalidated.
     pub fn consume_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
         self.value_runs.take()
+    }
+
+    /// Enable REE skip-expansion mode on the value decoder.
+    /// When active, dictionary-encoded reads skip copying string bytes,
+    /// only capturing value runs. If a non-dict page appears, the skipped
+    /// values are retroactively expanded.
+    pub fn set_ree_skip_expansion(&mut self, skip: bool) {
+        self.ree_skip_expansion = skip;
+        if let Some(reader) = self.column_reader.as_mut() {
+            reader.values_decoder_mut().set_ree_skip_expansion(skip);
+        }
     }
 
     /// Return the dictionary as an Arrow array from the inner value decoder.

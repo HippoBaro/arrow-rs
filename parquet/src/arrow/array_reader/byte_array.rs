@@ -258,6 +258,7 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
         self.record_reader.require_def_level_runs();
         self.record_reader.set_skip_padding(true);
         self.record_reader.enable_value_run_capture();
+        self.record_reader.set_ree_skip_expansion(true);
         true
     }
 }
@@ -269,6 +270,13 @@ struct ByteArrayColumnValueDecoder<I: OffsetSizeTrait> {
     validate_utf8: bool,
     /// Whether value run capture is requested (persists across page boundaries)
     capture_value_runs: bool,
+    /// When true, dictionary-encoded reads skip copying string bytes into the
+    /// output buffer. If a non-dict page appears, the skipped values are
+    /// retroactively expanded before reading that page.
+    ree_skip_expansion: bool,
+    /// Accumulated (dict_index, count) runs from dictionary pages whose
+    /// expansion was skipped. Used for retroactive expansion if needed.
+    skipped_dict_runs: Option<Vec<(u32, u32)>>,
 }
 
 impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
@@ -281,6 +289,8 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
             decoder: None,
             validate_utf8,
             capture_value_runs: false,
+            ree_skip_expansion: false,
+            skipped_dict_runs: None,
         }
     }
 
@@ -331,12 +341,44 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
     }
 
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
+        // Retroactive expansion: if we have skipped dict runs and the current
+        // decoder is NOT dictionary-encoded, expand the skipped values now
+        // before reading the non-dict page. This handles the case where dict
+        // pages were skipped but a non-dict page appeared later.
+        let needs_expansion = self.skipped_dict_runs.is_some()
+            && self
+                .decoder
+                .as_ref()
+                .map_or(false, |d| !matches!(d, ByteArrayDecoder::Dictionary(_)));
+
+        if needs_expansion {
+            let runs = self.skipped_dict_runs.take().unwrap();
+            if let Some(dict) = self.dict.as_ref() {
+                for &(dict_idx, count) in &runs {
+                    let idx = dict_idx as usize;
+                    let start = dict.offsets[idx].as_usize();
+                    let end = dict.offsets[idx + 1].as_usize();
+                    let value = &dict.values[start..end];
+                    for _ in 0..count {
+                        out.try_push(value, false)?;
+                    }
+                }
+            }
+            self.ree_skip_expansion = false;
+        }
+
         let decoder = self
             .decoder
             .as_mut()
             .ok_or_else(|| general_err!("no decoder set"))?;
 
-        decoder.read(out, num_values, self.dict.as_ref(), self.capture_value_runs)
+        decoder.read(
+            out,
+            num_values,
+            self.dict.as_ref(),
+            self.capture_value_runs,
+            self.ree_skip_expansion,
+        )
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {
@@ -354,7 +396,17 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
 
     fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {
         let decoder = self.decoder.as_mut()?;
-        decoder.take_value_runs()
+        let runs = decoder.take_value_runs()?;
+        // When skip_expansion is active, keep a copy for retroactive expansion
+        if self.ree_skip_expansion {
+            let accumulated = self.skipped_dict_runs.get_or_insert_with(Vec::new);
+            accumulated.extend_from_slice(&runs);
+        }
+        Some(runs)
+    }
+
+    fn set_ree_skip_expansion(&mut self, skip: bool) {
+        self.ree_skip_expansion = skip;
     }
 
     fn dict_as_array(&self) -> Option<ArrayRef> {
@@ -428,20 +480,22 @@ impl ByteArrayDecoder {
     /// Read up to `len` values to `out` with the optional dictionary.
     /// When `capture_runs` is true and encoding is dictionary, value runs
     /// are captured internally and can be retrieved via `take_value_runs`.
+    /// When `skip_expansion` is true, dictionary-encoded reads skip copying
+    /// string bytes, only capturing value runs.
     pub fn read<I: OffsetSizeTrait>(
         &mut self,
         out: &mut OffsetBuffer<I>,
         len: usize,
         dict: Option<&OffsetBuffer<I>>,
         capture_runs: bool,
+        skip_expansion: bool,
     ) -> Result<usize> {
         match self {
             ByteArrayDecoder::Plain(d) => d.read(out, len),
             ByteArrayDecoder::Dictionary(d) => {
                 let dict =
                     dict.ok_or_else(|| general_err!("missing dictionary page for column"))?;
-
-                d.read(out, dict, len, capture_runs)
+                d.read(out, dict, len, capture_runs, skip_expansion)
             }
             ByteArrayDecoder::DeltaLength(d) => d.read(out, len),
             ByteArrayDecoder::DeltaByteArray(d) => d.read(out, len),
@@ -720,6 +774,7 @@ impl ByteArrayDecoderDictionary {
         dict: &OffsetBuffer<I>,
         len: usize,
         capture_runs: bool,
+        skip_expansion: bool,
     ) -> Result<usize> {
         // All data must be NULL
         if dict.is_empty() {
@@ -732,9 +787,16 @@ impl ByteArrayDecoderDictionary {
             None
         };
 
-        self.decoder.read(len, |keys| {
-            output.extend_from_dictionary(keys, dict.offsets.as_slice(), dict.values.as_slice())
-        }, runs)
+        if skip_expansion && runs.is_some() {
+            // REE fast path: decode indices for run capture only, skip byte copies.
+            // If a non-dict page appears later, ByteArrayColumnValueDecoder::read()
+            // will retroactively expand these values using the accumulated runs.
+            self.decoder.read(len, |_keys| Ok(()), runs)
+        } else {
+            self.decoder.read(len, |keys| {
+                output.extend_from_dictionary(keys, dict.offsets.as_slice(), dict.values.as_slice())
+            }, runs)
+        }
     }
 
     fn take_value_runs(&mut self) -> Option<Vec<(u32, u32)>> {

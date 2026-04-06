@@ -21,6 +21,7 @@
 use crate::errors::Result;
 use arrow_array::types::Int32Type as ArrowInt32Type;
 use arrow_array::{ArrayRef, Int32Array, RunArray};
+use arrow_buffer::Buffer;
 use arrow_schema::DataType as ArrowType;
 use std::sync::Arc;
 
@@ -63,57 +64,177 @@ pub(crate) fn build_ree_array(
         }
     }
 
-    // Build run_ends and values array in a single pass, avoiding an
-    // intermediate index vector. Values are built directly using
-    // MutableArrayData with batched extend calls.
     let mut run_ends: Vec<i32> = Vec::new();
     let mut cumulative: i32 = 0;
     let mut value_offset: usize = 0;
 
     let compact_data = compact_values.to_data();
-    let mut values_builder = arrow_data::transform::MutableArrayData::new(
-        vec![&compact_data],
-        true,
-        merged_runs.len(), // lower-bound estimate
-    );
 
-    let mut vr_iter = value_runs.map(ValueRunIterator::new);
+    // For byte array types with value_runs, build output buffers directly
+    // to avoid MutableArrayData overhead. Fall back to MutableArrayData
+    // for non-byte types or when there are no value_runs.
+    let use_direct_buffers = value_runs.is_some()
+        && matches!(
+            compact_values.data_type(),
+            ArrowType::Utf8 | ArrowType::Binary | ArrowType::LargeUtf8 | ArrowType::LargeBinary
+        );
 
-    for &(is_value, count) in &merged_runs {
-        if is_value {
-            if let Some(ref mut vr) = vr_iter {
-                // With value runs: collapse identical consecutive values.
-                // Each value run produces one REE entry (one extend call).
-                let mut remaining = count;
-                while remaining > 0 {
-                    let (_, run_count) = vr.consume(remaining);
-                    cumulative += run_count as i32;
+    let values_array: ArrayRef = if use_direct_buffers {
+        let vr = value_runs.unwrap();
+        let is_large = matches!(
+            compact_values.data_type(),
+            ArrowType::LargeUtf8 | ArrowType::LargeBinary
+        );
+
+        if is_large {
+            let src_offsets: &[i64] = unsafe {
+                std::slice::from_raw_parts(
+                    compact_data.buffers()[0].as_ptr() as *const i64,
+                    compact_data.len() + 1,
+                )
+            };
+            let src_values: &[u8] = &compact_data.buffers()[1];
+
+            let mut out_offsets: Vec<i64> = Vec::with_capacity(merged_runs.len() + 1);
+            let mut out_values: Vec<u8> = Vec::new();
+            let mut null_count: usize = 0;
+            let mut null_bits =
+                arrow_buffer::BooleanBufferBuilder::new(merged_runs.len());
+            out_offsets.push(0);
+
+            let mut vr_iter = ValueRunIterator::new(vr);
+            for &(is_value, count) in &merged_runs {
+                if is_value {
+                    let mut remaining = count;
+                    while remaining > 0 {
+                        let (_, run_count) = vr_iter.consume(remaining);
+                        cumulative += run_count as i32;
+                        run_ends.push(cumulative);
+                        let start = src_offsets[value_offset] as usize;
+                        let end = src_offsets[value_offset + 1] as usize;
+                        out_values.extend_from_slice(&src_values[start..end]);
+                        out_offsets.push(out_values.len() as i64);
+                        null_bits.append(true);
+                        value_offset += run_count as usize;
+                        remaining -= run_count;
+                    }
+                } else {
+                    cumulative += count as i32;
                     run_ends.push(cumulative);
-                    values_builder.extend(0, value_offset, value_offset + 1);
-                    value_offset += run_count as usize;
-                    remaining -= run_count;
+                    out_offsets.push(out_values.len() as i64);
+                    null_bits.append(false);
+                    null_count += 1;
+                }
+            }
+
+            let num_entries = out_offsets.len() - 1;
+            let mut builder =
+                arrow_data::ArrayDataBuilder::new(compact_values.data_type().clone())
+                    .len(num_entries)
+                    .add_buffer(Buffer::from_vec(out_offsets))
+                    .add_buffer(Buffer::from_vec(out_values));
+            if null_count > 0 {
+                builder = builder
+                    .null_count(null_count)
+                    .null_bit_buffer(Some(null_bits.finish().into_inner()));
+            }
+            arrow_array::make_array(unsafe { builder.build_unchecked() })
+        } else {
+            let src_offsets: &[i32] = unsafe {
+                std::slice::from_raw_parts(
+                    compact_data.buffers()[0].as_ptr() as *const i32,
+                    compact_data.len() + 1,
+                )
+            };
+            let src_values: &[u8] = &compact_data.buffers()[1];
+
+            let mut out_offsets: Vec<i32> = Vec::with_capacity(merged_runs.len() + 1);
+            let mut out_values: Vec<u8> = Vec::new();
+            let mut null_count: usize = 0;
+            let mut null_bits =
+                arrow_buffer::BooleanBufferBuilder::new(merged_runs.len());
+            out_offsets.push(0);
+
+            let mut vr_iter = ValueRunIterator::new(vr);
+            for &(is_value, count) in &merged_runs {
+                if is_value {
+                    let mut remaining = count;
+                    while remaining > 0 {
+                        let (_, run_count) = vr_iter.consume(remaining);
+                        cumulative += run_count as i32;
+                        run_ends.push(cumulative);
+                        let start = src_offsets[value_offset] as usize;
+                        let end = src_offsets[value_offset + 1] as usize;
+                        out_values.extend_from_slice(&src_values[start..end]);
+                        out_offsets.push(out_values.len() as i32);
+                        null_bits.append(true);
+                        value_offset += run_count as usize;
+                        remaining -= run_count;
+                    }
+                } else {
+                    cumulative += count as i32;
+                    run_ends.push(cumulative);
+                    out_offsets.push(out_values.len() as i32);
+                    null_bits.append(false);
+                    null_count += 1;
+                }
+            }
+
+            let num_entries = out_offsets.len() - 1;
+            let mut builder =
+                arrow_data::ArrayDataBuilder::new(compact_values.data_type().clone())
+                    .len(num_entries)
+                    .add_buffer(Buffer::from_vec(out_offsets))
+                    .add_buffer(Buffer::from_vec(out_values));
+            if null_count > 0 {
+                builder = builder
+                    .null_count(null_count)
+                    .null_bit_buffer(Some(null_bits.finish().into_inner()));
+            }
+            arrow_array::make_array(unsafe { builder.build_unchecked() })
+        }
+    } else {
+        // Fallback: use MutableArrayData for non-byte types or no value_runs.
+        let mut values_builder = arrow_data::transform::MutableArrayData::new(
+            vec![&compact_data],
+            true,
+            merged_runs.len(),
+        );
+
+        let mut vr_iter = value_runs.map(ValueRunIterator::new);
+
+        for &(is_value, count) in &merged_runs {
+            if is_value {
+                if let Some(ref mut vr) = vr_iter {
+                    let mut remaining = count;
+                    while remaining > 0 {
+                        let (_, run_count) = vr.consume(remaining);
+                        cumulative += run_count as i32;
+                        run_ends.push(cumulative);
+                        values_builder.extend(0, value_offset, value_offset + 1);
+                        value_offset += run_count as usize;
+                        remaining -= run_count;
+                    }
+                } else {
+                    let n = count as usize;
+                    for _i in 0..n {
+                        cumulative += 1;
+                        run_ends.push(cumulative);
+                    }
+                    values_builder.extend(0, value_offset, value_offset + n);
+                    value_offset += n;
                 }
             } else {
-                // No value runs: each value gets its own REE entry.
-                // Batch the entire consecutive range in ONE extend call.
-                let n = count as usize;
-                for i in 0..n {
-                    cumulative += 1;
-                    run_ends.push(cumulative);
-                }
-                values_builder.extend(0, value_offset, value_offset + n);
-                value_offset += n;
+                cumulative += count as i32;
+                run_ends.push(cumulative);
+                values_builder.extend_nulls(1);
             }
-        } else {
-            // Entire null run collapses to one REE entry
-            cumulative += count as i32;
-            run_ends.push(cumulative);
-            values_builder.extend_nulls(1);
         }
-    }
 
-    let values_data = values_builder.freeze();
-    let values_array = arrow_array::make_array(values_data);
+        let values_data = values_builder.freeze();
+        arrow_array::make_array(values_data)
+    };
+
     let run_ends_array = Int32Array::from(run_ends);
 
     let run_array = RunArray::<ArrowInt32Type>::try_new(&run_ends_array, &values_array)?;
@@ -126,6 +247,9 @@ pub(crate) fn build_ree_array(
 /// `dict_values` is the Arrow array of unique dictionary entries (N unique strings).
 /// `value_runs` contains `(dict_index, count)` pairs referencing positions in `dict_values`.
 /// `def_runs` describes null/non-null regions at the record level.
+///
+/// This function builds the output byte array directly from buffers instead of
+/// using `MutableArrayData`, avoiding per-instance overhead across many columns.
 pub(crate) fn build_ree_array_from_dict(
     def_runs: &[(i16, u32)],
     dict_values: ArrayRef,
@@ -150,41 +274,65 @@ pub(crate) fn build_ree_array_from_dict(
         }
     }
 
+    // Access source dictionary buffers directly (Utf8/Binary with i32 offsets).
+    let dict_data = dict_values.to_data();
+    let src_offsets: &[i32] = // Safety: buffer 0 is the i32 offsets array
+        unsafe {
+            std::slice::from_raw_parts(
+                dict_data.buffers()[0].as_ptr() as *const i32,
+                dict_data.len() + 1,
+            )
+        };
+    let src_values: &[u8] = &dict_data.buffers()[1];
+
     let mut run_ends: Vec<i32> = Vec::new();
     let mut cumulative: i32 = 0;
 
-    let dict_data = dict_values.to_data();
-    let mut values_builder = arrow_data::transform::MutableArrayData::new(
-        vec![&dict_data],
-        true,
-        merged_runs.len(),
-    );
+    // Build output byte array buffers directly, avoiding MutableArrayData.
+    let mut out_offsets: Vec<i32> = Vec::with_capacity(merged_runs.len() + 1);
+    let mut out_values: Vec<u8> = Vec::new();
+    let mut null_count: usize = 0;
+    let mut null_bits = arrow_buffer::BooleanBufferBuilder::new(merged_runs.len());
+    out_offsets.push(0);
 
     let mut vr_iter = ValueRunIterator::new(value_runs);
 
     for &(is_value, count) in &merged_runs {
         if is_value {
-            // Each value run produces one REE entry, indexing into the
-            // dictionary by dict_index instead of into a flat expanded array.
             let mut remaining = count;
             while remaining > 0 {
                 let (dict_index, run_count) = vr_iter.consume(remaining);
                 cumulative += run_count as i32;
                 run_ends.push(cumulative);
                 let idx = dict_index as usize;
-                values_builder.extend(0, idx, idx + 1);
+                let start = src_offsets[idx] as usize;
+                let end = src_offsets[idx + 1] as usize;
+                out_values.extend_from_slice(&src_values[start..end]);
+                out_offsets.push(out_values.len() as i32);
+                null_bits.append(true);
                 remaining -= run_count;
             }
         } else {
-            // Entire null run collapses to one REE entry.
             cumulative += count as i32;
             run_ends.push(cumulative);
-            values_builder.extend_nulls(1);
+            out_offsets.push(out_values.len() as i32);
+            null_bits.append(false);
+            null_count += 1;
         }
     }
 
-    let values_data = values_builder.freeze();
-    let values_array = arrow_array::make_array(values_data);
+    let num_entries = out_offsets.len() - 1;
+    let mut builder = arrow_data::ArrayDataBuilder::new(dict_values.data_type().clone())
+        .len(num_entries)
+        .add_buffer(Buffer::from_vec(out_offsets))
+        .add_buffer(Buffer::from_vec(out_values));
+    if null_count > 0 {
+        builder = builder
+            .null_count(null_count)
+            .null_bit_buffer(Some(null_bits.finish().into_inner()));
+    }
+    // Safety: offsets are monotonically increasing and within bounds of values buffer.
+    let values_array = arrow_array::make_array(unsafe { builder.build_unchecked() });
     let run_ends_array = Int32Array::from(run_ends);
 
     let run_array = RunArray::<ArrowInt32Type>::try_new(&run_ends_array, &values_array)?;

@@ -361,7 +361,7 @@ where
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
         match self.decoder.as_mut().expect("decoder set") {
             MaybeDictionaryDecoder::Fallback(decoder) => {
-                decoder.read(out.spill_values()?, num_values, None, false)
+                decoder.read(out.spill_values()?, num_values, None, false, false)
             }
             MaybeDictionaryDecoder::Dict {
                 decoder,
