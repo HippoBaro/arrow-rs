@@ -154,21 +154,32 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
             return Ok(child_array);
         }
 
-        // REE mode: build a compact ListArray containing only non-null list
-        // entries, then wrap it in a RunArray via build_ree_array.
-        // This avoids materializing a dense offset buffer for every record
-        // (which would be 262 KB avg x 13K columns = 3.48 GB at peak).
+        // REE mode: build a RunArray<Int32Type> directly from record_def_runs
+        // and the compact child array, without materializing dense offsets or
+        // going through MutableArrayData.
+        //
+        // The compact child array contains only values for non-null lists.
+        // We build a compact ListArray (offsets for non-null entries only),
+        // then construct the RunArray by hand: run_ends from record_def_runs,
+        // values = compact ListArray + interleaved nulls for null runs.
         if self.ree_mode {
+            use arrow_array::types::Int32Type as ArrowInt32Type;
+            use arrow_array::{Int32Array, RunArray};
+
             let mut cur_offset: usize = 0;
-            // Only non-null lists get offsets — much smaller than one per record.
+            // Compact offsets — one per non-null list entry, much smaller
+            // than one per record for sparse columns.
             let mut compact_offsets: Vec<OffsetSize> = Vec::new();
+
+            // Merge adjacent record_def_runs with same null/non-null status
+            // and simultaneously compute compact offsets.
+            let mut merged_runs: Vec<(bool, u32)> = Vec::new();
 
             for (d, r, count) in AlignedRunIter::new(def_runs, rep_runs) {
                 if r < self.rep_level {
                     // Record boundary
-                    self.record_def_runs.push((d, count as u32));
-                    if d >= self.def_level {
-                        // Non-null list entries — each gets an offset
+                    let is_value = d >= self.def_level;
+                    if is_value {
                         for _ in 0..count {
                             compact_offsets.push(
                                 OffsetSize::from_usize(cur_offset)
@@ -176,6 +187,11 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                             );
                             cur_offset += 1;
                         }
+                    }
+                    if let Some(last) = merged_runs.last_mut().filter(|r| r.0 == is_value) {
+                        last.1 += count as u32;
+                    } else {
+                        merged_runs.push((is_value, count as u32));
                     }
                 } else if d >= self.def_level {
                     // Continuation within a list
@@ -187,26 +203,67 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
                     .ok_or_else(|| general_err!("offset overflow"))?,
             );
 
-            // Build a compact ListArray with only non-null entries.
-            let value_offsets = Buffer::from(compact_offsets.to_byte_slice());
             let child_data = child_array.to_data();
-            let compact_list_data = unsafe {
-                ArrayData::builder(self.data_type.clone())
-                    .len(compact_offsets.len() - 1)
-                    .add_buffer(value_offsets)
-                    .add_child_data(child_data)
-                    .build_unchecked()
-            };
-            let compact_list: ArrayRef =
-                Arc::new(GenericListArray::<OffsetSize>::from(compact_list_data));
 
-            // Wrap in REE using the record-level def runs.
-            return crate::arrow::array_reader::ree_array::build_ree_array(
-                &self.record_def_runs,
-                compact_list,
-                self.def_level,
-                None,
-            );
+            // Build run_ends and the REE values ListArray directly from
+            // merged_runs + compact_offsets, without MutableArrayData.
+            // The REE values array is a ListArray with the same child data
+            // as the compact child — offsets index into it directly.
+            let mut run_ends: Vec<i32> = Vec::with_capacity(merged_runs.len());
+            let mut cumulative: i32 = 0;
+            let mut value_offset: usize = 0;
+
+            let mut out_offsets: Vec<OffsetSize> = Vec::with_capacity(merged_runs.len() + 1);
+            let mut null_count: usize = 0;
+            let mut null_bits =
+                arrow_array::builder::BooleanBufferBuilder::new(merged_runs.len());
+            let compact_offsets_slice = &compact_offsets;
+            out_offsets.push(OffsetSize::zero());
+
+            for &(is_value, count) in &merged_runs {
+                if is_value {
+                    // Batch: n consecutive non-null lists → n REE entries.
+                    let n = count as usize;
+                    for i in 0..n {
+                        cumulative += 1;
+                        run_ends.push(cumulative);
+                        // Each REE value entry spans one list element from the
+                        // compact array. Its offset range is
+                        // [compact_offsets[value_offset+i], compact_offsets[value_offset+i+1]).
+                        // In the REE values ListArray, we use relative offsets.
+                        out_offsets.push(compact_offsets_slice[value_offset + i + 1]);
+                        null_bits.append(true);
+                    }
+                    value_offset += n;
+                } else {
+                    // Null run → one REE entry with null value.
+                    cumulative += count as i32;
+                    run_ends.push(cumulative);
+                    // Null list entry: repeat the same offset (empty range).
+                    out_offsets.push(*out_offsets.last().unwrap());
+                    null_bits.append(false);
+                    null_count += 1;
+                }
+            }
+
+            let num_ree_values = out_offsets.len() - 1;
+            let ree_values_offsets = Buffer::from(out_offsets.to_byte_slice());
+            let mut ree_values_builder = ArrayData::builder(self.data_type.clone())
+                .len(num_ree_values)
+                .add_buffer(ree_values_offsets)
+                .add_child_data(child_data);
+            if null_count > 0 {
+                ree_values_builder = ree_values_builder
+                    .null_count(null_count)
+                    .null_bit_buffer(Some(null_bits.finish().into_inner()));
+            }
+            let ree_values: ArrayRef = Arc::new(GenericListArray::<OffsetSize>::from(
+                unsafe { ree_values_builder.build_unchecked() },
+            ));
+
+            let run_ends_array = Int32Array::from(run_ends);
+            let run_array = RunArray::<ArrowInt32Type>::try_new(&run_ends_array, &ree_values)?;
+            return Ok(Arc::new(run_array));
         }
 
         // Max definition level from runs — O(runs) not O(rows).
