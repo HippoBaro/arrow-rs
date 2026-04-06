@@ -521,6 +521,17 @@ where
         true
     }
 
+    fn set_compact_record_output(&mut self, compact: bool) -> bool {
+        if !self.record_reader.has_def_levels() {
+            return false; // required column — no nulls
+        }
+        if compact {
+            self.record_reader.require_def_level_runs();
+        }
+        self.record_reader.set_skip_padding(compact);
+        true
+    }
+
     fn get_def_level_runs(&self) -> Option<&[(i16, u32)]> {
         self.def_level_runs.as_ref().map(|r| r.runs())
     }

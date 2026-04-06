@@ -220,6 +220,58 @@ impl FallbackEncoder {
         }
     }
 
+    /// Encode the value at `index` repeated `count` times.
+    fn encode_repeated<T>(&mut self, values: T, index: usize, count: usize)
+    where
+        T: ArrayAccessor + Copy,
+        T::Item: AsRef<[u8]>,
+    {
+        self.num_values += count;
+        let value = values.value(index);
+        let value = value.as_ref();
+        let value_len = value.len();
+        self.variable_length_bytes += value_len as i64 * count as i64;
+        match &mut self.encoder {
+            FallbackEncoderImpl::Plain { buffer } => {
+                let len_bytes = (value_len as u32).as_bytes().to_owned();
+                buffer.reserve((4 + value_len) * count);
+                for _ in 0..count {
+                    buffer.extend_from_slice(&len_bytes);
+                    buffer.extend_from_slice(value);
+                }
+            }
+            FallbackEncoderImpl::DeltaLength { buffer, lengths } => {
+                buffer.reserve(value_len * count);
+                for _ in 0..count {
+                    lengths.put(&[value_len as i32]).unwrap();
+                    buffer.extend_from_slice(value);
+                }
+            }
+            FallbackEncoderImpl::Delta {
+                buffer,
+                last_value,
+                prefix_lengths,
+                suffix_lengths,
+            } => {
+                for _ in 0..count {
+                    let mut prefix_length = 0;
+                    while prefix_length < last_value.len()
+                        && prefix_length < value_len
+                        && last_value[prefix_length] == value[prefix_length]
+                    {
+                        prefix_length += 1;
+                    }
+                    let suffix_length = value_len - prefix_length;
+                    last_value.clear();
+                    last_value.extend_from_slice(value);
+                    buffer.extend_from_slice(&value[prefix_length..]);
+                    prefix_lengths.put(&[prefix_length as i32]).unwrap();
+                    suffix_lengths.put(&[suffix_length as i32]).unwrap();
+                }
+            }
+        }
+    }
+
     /// Returns an estimate of the data page size in bytes
     ///
     /// This includes:
@@ -356,6 +408,21 @@ impl DictEncoder {
         }
     }
 
+    /// Encode the value at `index` repeated `count` times.
+    /// Interns the value once, then pushes the interned index `count` times.
+    fn encode_repeated<T>(&mut self, values: T, index: usize, count: usize)
+    where
+        T: ArrayAccessor + Copy,
+        T::Item: AsRef<[u8]>,
+    {
+        let value = values.value(index);
+        let value = value.as_ref();
+        let interned = self.interner.intern(value);
+        self.indices.reserve(count);
+        self.indices.extend(std::iter::repeat_n(interned, count));
+        self.variable_length_bytes += value.len() as i64 * count as i64;
+    }
+
     fn bit_width(&self) -> u8 {
         let length = self.interner.storage().values.len();
         num_required_bits(length.saturating_sub(1) as u64)
@@ -472,6 +539,16 @@ impl ColumnValueEncoder for ByteArrayEncoder {
         Ok(())
     }
 
+    fn write_repeated(
+        &mut self,
+        values: &Self::Values,
+        index: usize,
+        count: usize,
+    ) -> Result<()> {
+        downcast_op!(values.data_type(), values, encode_repeated, index, count, self);
+        Ok(())
+    }
+
     fn num_values(&self) -> usize {
         match &self.dict_encoder {
             Some(encoder) => encoder.indices.len(),
@@ -581,6 +658,37 @@ where
     match &mut encoder.dict_encoder {
         Some(dict_encoder) => dict_encoder.encode(values, indices),
         None => encoder.fallback.encode(values, indices),
+    }
+}
+
+/// Encodes the value at `index` repeated `count` times.
+///
+/// Statistics are computed once, bloom filter is inserted once,
+/// and dictionary interning happens once. This avoids O(count)
+/// redundant work for REE value runs.
+fn encode_repeated<T>(values: T, index: usize, count: usize, encoder: &mut ByteArrayEncoder)
+where
+    T: ArrayAccessor + Copy,
+    T::Item: Copy + Ord + AsRef<[u8]>,
+{
+    if encoder.statistics_enabled != EnabledStatistics::None {
+        let val = values.value(index);
+        let byte_val: ByteArray = val.as_ref().to_vec().into();
+        if encoder.min_value.as_ref().is_none_or(|m| m > &byte_val) {
+            encoder.min_value = Some(byte_val.clone());
+        }
+        if encoder.max_value.as_ref().is_none_or(|m| m < &byte_val) {
+            encoder.max_value = Some(byte_val);
+        }
+    }
+
+    if let Some(bloom_filter) = &mut encoder.bloom_filter {
+        bloom_filter.insert(values.value(index).as_ref());
+    }
+
+    match &mut encoder.dict_encoder {
+        Some(dict_encoder) => dict_encoder.encode_repeated(values, index, count),
+        None => encoder.fallback.encode_repeated(values, index, count),
     }
 }
 

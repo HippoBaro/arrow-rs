@@ -147,9 +147,7 @@ impl ArrayReader for StructArrayReader {
                 (Some(def_runs), Some(rep_levels)) => {
                     // Use run cursor for def levels, flat for rep levels
                     let mut def_cursor =
-                        crate::column::reader::run_level_buffer::RunCursor::new(
-                            def_runs,
-                        );
+                        crate::column::reader::run_level_buffer::RunCursor::new(def_runs);
                     for rep_level in rep_levels {
                         let def_level = def_cursor.next();
                         if *rep_level > self.struct_rep_level {
@@ -161,8 +159,7 @@ impl ArrayReader for StructArrayReader {
                 (Some(def_runs), None) => {
                     // No rep levels — build bitmap directly from def runs
                     for &(value, count) in def_runs {
-                        bitmap_builder
-                            .append_n(count as usize, value >= self.struct_def_level);
+                        bitmap_builder.append_n(count as usize, value >= self.struct_def_level);
                     }
                 }
                 (None, rep_levels_opt) => {

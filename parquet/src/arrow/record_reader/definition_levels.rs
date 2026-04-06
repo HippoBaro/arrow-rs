@@ -83,6 +83,20 @@ impl DefinitionLevelBuffer {
         Self { inner, len: 0 }
     }
 
+    /// Switch from Mask mode to Full mode so that run-level def data
+    /// is preserved. No-op if already in Full mode.
+    /// `max_level` is the column's max definition level.
+    pub fn upgrade_to_full(&mut self, max_level: i16) {
+        if matches!(self.inner, BufferInner::Mask { .. }) {
+            self.inner = BufferInner::Full {
+                levels: RunLevelBuffer::new(),
+                nulls: BooleanBufferBuilder::new(0),
+                max_level,
+            };
+            self.len = 0;
+        }
+    }
+
     /// Returns the built level data as a flat `Vec<i16>`.
     /// Materializes from the run-length representation if needed.
     pub fn consume_levels(&mut self) -> Option<Vec<i16>> {

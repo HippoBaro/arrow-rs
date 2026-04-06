@@ -20,7 +20,7 @@
 //! without dense materialization.
 
 use crate::arrow::array_reader::primitive_array::IntoBuffer;
-use crate::arrow::array_reader::{read_records, ArrayReader};
+use crate::arrow::array_reader::{ArrayReader, read_records};
 use crate::arrow::record_reader::RecordReader;
 use crate::column::page::PageIterator;
 use crate::column::reader::run_level_buffer::RunLevelBuffer;
@@ -29,10 +29,9 @@ use crate::errors::Result;
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::types::Int32Type as ArrowInt32Type;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Decimal32Array, Decimal64Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, RunArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Decimal32Array, Decimal64Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, RunArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_data::ArrayDataBuilder;
@@ -104,13 +103,11 @@ pub(crate) fn build_ree_array(
     // Count total physical entries (null runs = 1 each, value runs = count each)
     let total_entries: usize = merged_runs
         .iter()
-        .map(|(is_value, count)| {
-            if *is_value {
-                *count as usize
-            } else {
-                1
-            }
-        })
+        .map(
+            |(is_value, count)| {
+                if *is_value { *count as usize } else { 1 }
+            },
+        )
         .sum();
 
     let mut run_ends = Vec::with_capacity(total_entries);
@@ -485,8 +482,7 @@ impl ArrayReader for ReeWrappingReader {
                 _ => unreachable!(),
             };
             let null_value = arrow_array::new_null_array(inner_type, 1);
-            let run_array =
-                RunArray::<ArrowInt32Type>::try_new(&run_ends, &null_value)?;
+            let run_array = RunArray::<ArrowInt32Type>::try_new(&run_ends, &null_value)?;
             return Ok(Arc::new(run_array));
         }
 

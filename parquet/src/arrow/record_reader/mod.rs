@@ -65,6 +65,9 @@ pub struct GenericRecordReader<V, CV> {
     /// actual (non-null) values. Used by ListArrayReader to avoid the
     /// pad-then-filter round-trip.
     skip_padding: bool,
+    /// When true, forces def levels to use Full (run-level) mode instead
+    /// of the packed Mask optimization. Set by `require_def_level_runs()`.
+    force_full_def_levels: bool,
 }
 
 impl<V, CV> GenericRecordReader<V, CV>
@@ -90,6 +93,21 @@ where
             num_records: 0,
             values_written: 0,
             skip_padding: false,
+            force_full_def_levels: false,
+        }
+    }
+
+    /// Force the definition level buffer to use Full (run-level) mode
+    /// instead of the packed Mask optimization. This is needed for REE
+    /// compact output which requires def level runs.
+    /// Must be called before any pages are read.
+    pub fn require_def_level_runs(&mut self) {
+        if self.force_full_def_levels {
+            return;
+        }
+        self.force_full_def_levels = true;
+        if let Some(buf) = &mut self.def_levels {
+            buf.upgrade_to_full(self.column_desc.max_def_level());
         }
     }
 
@@ -98,8 +116,9 @@ where
         let descr = &self.column_desc;
         let values_decoder = CV::new(descr);
 
+        let use_packed = packed_null_mask(descr) && !self.force_full_def_levels;
         let def_level_decoder = (descr.max_def_level() != 0).then(|| {
-            DefinitionLevelBufferDecoder::new(descr.max_def_level(), packed_null_mask(descr))
+            DefinitionLevelBufferDecoder::new(descr.max_def_level(), use_packed)
         });
 
         let rep_level_decoder = (descr.max_rep_level() != 0)
@@ -168,6 +187,22 @@ where
     /// as record values, e.g. those from `self.num_values` to `self.values_written`.
     pub fn consume_def_levels(&mut self) -> Option<Vec<i16>> {
         self.def_levels.as_mut().and_then(|x| x.consume_levels())
+    }
+
+    /// Returns true if this record reader tracks definition levels
+    /// (i.e. the column is nullable with max_def_level > 0).
+    pub fn has_def_levels(&self) -> bool {
+        self.def_levels.is_some()
+    }
+
+    /// Returns true if this record reader stores definition levels as
+    /// run-length encoded runs (Full mode). Returns false if definition
+    /// levels are stored as a packed null bitmask (Mask mode, used for
+    /// simple nullable leaf columns with max_def_level=1, rep_level=0).
+    pub fn has_def_level_runs(&self) -> bool {
+        self.def_levels
+            .as_ref()
+            .is_some_and(|x| x.runs().is_some())
     }
 
     /// Returns definition level runs as `&[(i16, u32)]` without materializing.

@@ -140,7 +140,6 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) metrics: ArrowReaderMetrics,
 
     pub(crate) max_predicate_cache_size: usize,
-
 }
 
 impl<T: Debug> Debug for ArrowReaderBuilder<T> {
@@ -176,8 +175,7 @@ fn transform_fields_for_ree(field: &ParquetField) -> ParquetField {
     // Check if this field should be REE-wrapped: nullable, not the Null type.
     // List/Map columns (rep_level > 0) are also eligible — the ReeWrappingReader
     // handles them via compact ListArrayReader output.
-    let eligible = field.def_level > 0
-        && !matches!(field.arrow_type, ArrowType::Null);
+    let eligible = field.def_level > 0 && !matches!(field.arrow_type, ArrowType::Null);
 
     if eligible {
         let mut transformed = field.clone();
@@ -1176,7 +1174,6 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
                 let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_parquet_metadata(&reader.metadata)
-
                     .build_array_reader(fields.as_deref(), predicate.projection())?;
 
                 plan_builder = plan_builder.with_predicate(array_reader, predicate.as_mut())?;

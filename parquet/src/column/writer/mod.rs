@@ -326,6 +326,7 @@ pub struct GenericColumnWriter<'a, E: ColumnValueEncoder> {
     descr: ColumnDescPtr,
     props: WriterPropertiesPtr,
     statistics_enabled: EnabledStatistics,
+    dictionary_page_size_limit: usize,
 
     page_writer: Box<dyn PageWriter + 'a>,
     codec: Compression,
@@ -369,6 +370,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         let encoder = E::try_new(&descr, props.as_ref()).unwrap();
 
         let statistics_enabled = props.statistics_enabled(descr.path());
+        let dictionary_page_size_limit = props.column_dictionary_page_size_limit(descr.path());
 
         let mut encodings = BTreeSet::new();
         // Used for level information
@@ -405,6 +407,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             descr,
             props,
             statistics_enabled,
+            dictionary_page_size_limit,
             page_writer,
             codec,
             compressor,
@@ -879,11 +882,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     #[inline]
     fn should_dict_fallback(&self) -> bool {
         match self.encoder.estimated_dict_page_size() {
-            Some(size) => {
-                size >= self
-                    .props
-                    .column_dictionary_page_size_limit(self.descr.path())
-            }
+            Some(size) => size >= self.dictionary_page_size_limit,
             None => false,
         }
     }
