@@ -279,17 +279,6 @@ impl WriterProperties {
     ///
     /// For more details see [`WriterPropertiesBuilder::set_offset_index_disabled`]
     pub fn offset_index_disabled(&self) -> bool {
-        // If page statistics are to be collected, then do not disable the offset indexes.
-        let default_page_stats_enabled =
-            self.default_column_properties.statistics_enabled() == Some(EnabledStatistics::Page);
-        let column_page_stats_enabled = self
-            .column_properties
-            .iter()
-            .any(|path_props| path_props.1.statistics_enabled() == Some(EnabledStatistics::Page));
-        if default_page_stats_enabled || column_page_stats_enabled {
-            return false;
-        }
-
         self.offset_index_disabled
     }
 
@@ -489,6 +478,24 @@ impl Default for WriterPropertiesBuilder {
 impl WriterPropertiesBuilder {
     /// Finalizes the configuration and returns immutable writer properties struct.
     pub fn build(self) -> WriterProperties {
+        // Pre-compute offset_index_disabled so it doesn't need to scan
+        // column_properties on every call (O(n) per column → O(n²) for wide schemas).
+        let offset_index_disabled = if self.offset_index_disabled {
+            let default_page_stats_enabled = self
+                .default_column_properties
+                .statistics_enabled()
+                == Some(EnabledStatistics::Page);
+            let column_page_stats_enabled = self
+                .column_properties
+                .iter()
+                .any(|path_props| {
+                    path_props.1.statistics_enabled() == Some(EnabledStatistics::Page)
+                });
+            !(default_page_stats_enabled || column_page_stats_enabled)
+        } else {
+            false
+        };
+
         WriterProperties {
             data_page_size_limit: self.data_page_size_limit,
             data_page_row_count_limit: self.data_page_row_count_limit,
@@ -497,7 +504,7 @@ impl WriterPropertiesBuilder {
             bloom_filter_position: self.bloom_filter_position,
             writer_version: self.writer_version,
             created_by: self.created_by,
-            offset_index_disabled: self.offset_index_disabled,
+            offset_index_disabled,
             key_value_metadata: self.key_value_metadata,
             default_column_properties: self.default_column_properties,
             column_properties: self.column_properties,
