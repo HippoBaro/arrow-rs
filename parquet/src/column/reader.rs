@@ -433,6 +433,11 @@ where
         self.value_runs.take()
     }
 
+    /// Clear per-batch state in the value decoder (e.g. skipped_dict_runs).
+    pub fn reset_batch_state(&mut self) {
+        self.values_decoder.reset_batch_state();
+    }
+
     /// Read the next page as a dictionary page. If the next page is not a dictionary page,
     /// this will return an error.
     fn read_dictionary_page(&mut self) -> Result<()> {

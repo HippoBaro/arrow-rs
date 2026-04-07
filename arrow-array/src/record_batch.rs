@@ -343,7 +343,20 @@ impl RecordBatch {
         // function for comparing column type and field type
         // return true if 2 types are not matched
         let type_not_match = if options.match_field_names {
-            |(_, (col_type, field_type)): &(usize, (&DataType, &DataType))| col_type != field_type
+            |(_, (col_type, field_type)): &(usize, (&DataType, &DataType))| {
+                // RunEndEncoded is a physical encoding — unwrap to the logical
+                // values type before comparing so that REE columns are accepted
+                // when the schema carries the logical type.
+                let col_logical = match col_type {
+                    DataType::RunEndEncoded(_, values) => values.data_type(),
+                    other => other,
+                };
+                let field_logical = match field_type {
+                    DataType::RunEndEncoded(_, values) => values.data_type(),
+                    other => other,
+                };
+                col_logical != field_logical
+            }
         } else {
             |(_, (col_type, field_type)): &(usize, (&DataType, &DataType))| {
                 !col_type.equals_datatype(field_type)

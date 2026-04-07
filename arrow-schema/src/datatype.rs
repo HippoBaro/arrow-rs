@@ -689,6 +689,13 @@ impl DataType {
                     && a_values.is_nullable() == b_values.is_nullable()
                     && a_values.data_type().equals_datatype(b_values.data_type())
             }
+            // REE is a physical encoding — logically equivalent to the values type.
+            (DataType::RunEndEncoded(_, values), other) => {
+                values.data_type().equals_datatype(other)
+            }
+            (other, DataType::RunEndEncoded(_, values)) => {
+                other.equals_datatype(values.data_type())
+            }
             (
                 DataType::Union(a_union_fields, a_union_mode),
                 DataType::Union(b_union_fields, b_union_mode),

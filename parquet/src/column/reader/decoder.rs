@@ -150,6 +150,10 @@ pub trait ColumnValueDecoder {
     /// retroactively expanded before reading that page.
     fn set_ree_skip_expansion(&mut self, _skip: bool) {}
 
+    /// Clear per-batch state that must not leak across batch boundaries.
+    /// Called from the record reader's `reset()` after each batch is consumed.
+    fn reset_batch_state(&mut self) {}
+
     /// Return the stored dictionary as an Arrow array, if available.
     /// Only meaningful for byte array decoders with a dictionary page.
     fn dict_as_array(&self) -> Option<arrow_array::ArrayRef> {

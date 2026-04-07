@@ -270,6 +270,9 @@ where
         if self.capture_value_runs {
             self.value_runs = Some(Vec::new());
         }
+        if let Some(reader) = self.column_reader.as_mut() {
+            reader.reset_batch_state();
+        }
     }
 
     /// Enable or disable null padding. When disabled, the values buffer contains

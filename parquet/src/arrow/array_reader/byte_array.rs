@@ -409,6 +409,10 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
         self.ree_skip_expansion = skip;
     }
 
+    fn reset_batch_state(&mut self) {
+        self.skipped_dict_runs = None;
+    }
+
     fn dict_as_array(&self) -> Option<ArrayRef> {
         let dict = self.dict.as_ref()?;
         if dict.is_empty() {
