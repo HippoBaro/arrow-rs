@@ -786,6 +786,30 @@ impl From<Vec<u8>> for BitReader {
     }
 }
 
+/// Portable parallel bit extract: for each set bit in `mask`, extract
+/// the corresponding bit from `value` and pack them contiguously into
+/// the low bits of the return value.
+///
+/// Equivalent to the x86 BMI2 `PEXT` instruction.
+///
+/// Replace with `value.compress(mask)` when `uint_gather_scatter_bits`
+/// is stabilised: <https://github.com/rust-lang/rust/issues/149069>
+#[inline]
+#[cfg(feature = "arrow")]
+pub(crate) fn compress(value: u64, mut mask: u64) -> u64 {
+    let mut result: u64 = 0;
+    let mut dest_bit: u64 = 1;
+    while mask != 0 {
+        let lowest = mask & mask.wrapping_neg();
+        if value & lowest != 0 {
+            result |= dest_bit;
+        }
+        dest_bit <<= 1;
+        mask ^= lowest;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
