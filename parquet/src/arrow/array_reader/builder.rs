@@ -140,7 +140,7 @@ impl<'a> ArrayReaderBuilder<'a> {
         mask: &ProjectionMask,
     ) -> Result<Box<dyn ArrayReader>> {
         let reader = field
-            .and_then(|field| self.build_reader(field, mask).transpose())
+            .and_then(|field| self.build_reader(field, mask, None).transpose())
             .transpose()?
             .unwrap_or_else(|| make_empty_array_reader(self.num_rows()));
 
@@ -156,10 +156,12 @@ impl<'a> ArrayReaderBuilder<'a> {
         &self,
         field: &ParquetField,
         mask: &ProjectionMask,
+        padding_threshold: Option<i16>,
     ) -> Result<Option<Box<dyn ArrayReader>>> {
         match field.field_type {
             ParquetFieldType::Primitive { col_idx, .. } => {
-                let Some(reader) = self.build_primitive_reader(field, mask)? else {
+                let Some(reader) = self.build_primitive_reader(field, mask, padding_threshold)?
+                else {
                     return Ok(None);
                 };
                 let Some(cache_options) = self.cache_options.as_ref() else {
@@ -189,13 +191,17 @@ impl<'a> ArrayReaderBuilder<'a> {
                 }
             }
             ParquetFieldType::Group { .. } => match &field.arrow_type {
-                DataType::Map(_, _) => self.build_map_reader(field, mask),
-                DataType::Struct(_) => self.build_struct_reader(field, mask),
+                DataType::Map(_, _) => self.build_map_reader(field, mask, padding_threshold),
+                DataType::Struct(_) => self.build_struct_reader(field, mask, padding_threshold),
                 DataType::List(_)
                 | DataType::LargeList(_)
                 | DataType::ListView(_)
-                | DataType::LargeListView(_) => self.build_list_reader(field, mask),
-                DataType::FixedSizeList(_, _) => self.build_fixed_size_list_reader(field, mask),
+                | DataType::LargeListView(_) => {
+                    self.build_list_reader(field, mask, padding_threshold)
+                }
+                DataType::FixedSizeList(_, _) => {
+                    self.build_fixed_size_list_reader(field, mask, padding_threshold)
+                }
                 d => unimplemented!("reading group type {} not implemented", d),
             },
         }
@@ -230,12 +236,17 @@ impl<'a> ArrayReaderBuilder<'a> {
         &self,
         field: &ParquetField,
         mask: &ProjectionMask,
+        padding_threshold: Option<i16>,
     ) -> Result<Option<Box<dyn ArrayReader>>> {
         let children = field.children().unwrap();
         assert_eq!(children.len(), 2);
 
-        let key_reader = self.build_reader(&children[0], mask)?;
-        let value_reader = self.build_reader(&children[1], mask)?;
+        // The map is internally List(Struct(key, value)). The key/value
+        // readers are children of the struct inside the list, so their
+        // padding threshold is the map's (= list's) def_level.
+        let child_threshold = Some(field.def_level);
+        let key_reader = self.build_reader(&children[0], mask, child_threshold)?;
+        let value_reader = self.build_reader(&children[1], mask, child_threshold)?;
 
         match (key_reader, value_reader) {
             (Some(key_reader), Some(value_reader)) => {
@@ -267,6 +278,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                     field.def_level,
                     field.rep_level,
                     field.nullable,
+                    padding_threshold,
                 ))))
             }
             (None, None) => Ok(None),
@@ -281,11 +293,14 @@ impl<'a> ArrayReaderBuilder<'a> {
         &self,
         field: &ParquetField,
         mask: &ProjectionMask,
+        padding_threshold: Option<i16>,
     ) -> Result<Option<Box<dyn ArrayReader>>> {
         let children = field.children().unwrap();
         assert_eq!(children.len(), 1);
 
-        let reader = match self.build_reader(&children[0], mask)? {
+        // Build the child with this list's def_level as its padding threshold.
+        // Pass the received padding_threshold as this list's parent_threshold.
+        let reader = match self.build_reader(&children[0], mask, Some(field.def_level))? {
             Some(item_reader) => {
                 // Need to retrieve underlying data type to handle projection
                 let item_type = item_reader.get_data_type().clone();
@@ -299,6 +314,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                             field.def_level,
                             field.rep_level,
                             field.nullable,
+                            padding_threshold,
                         ))
                     }
                     DataType::LargeList(f) => {
@@ -311,6 +327,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                             field.def_level,
                             field.rep_level,
                             field.nullable,
+                            padding_threshold,
                         ))
                     }
                     DataType::ListView(f) => {
@@ -323,6 +340,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                             field.def_level,
                             field.rep_level,
                             field.nullable,
+                            padding_threshold,
                         ))
                     }
                     DataType::LargeListView(f) => {
@@ -335,6 +353,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                             field.def_level,
                             field.rep_level,
                             field.nullable,
+                            padding_threshold,
                         ))
                     }
                     _ => unreachable!(),
@@ -351,11 +370,12 @@ impl<'a> ArrayReaderBuilder<'a> {
         &self,
         field: &ParquetField,
         mask: &ProjectionMask,
+        padding_threshold: Option<i16>,
     ) -> Result<Option<Box<dyn ArrayReader>>> {
         let children = field.children().unwrap();
         assert_eq!(children.len(), 1);
 
-        let reader = match self.build_reader(&children[0], mask)? {
+        let reader = match self.build_reader(&children[0], mask, Some(field.def_level))? {
             Some(item_reader) => {
                 let item_type = item_reader.get_data_type().clone();
                 let reader = match &field.arrow_type {
@@ -372,6 +392,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                             field.def_level,
                             field.rep_level,
                             field.nullable,
+                            padding_threshold,
                         )) as _
                     }
                     _ => unimplemented!(),
@@ -388,6 +409,7 @@ impl<'a> ArrayReaderBuilder<'a> {
         &self,
         field: &ParquetField,
         mask: &ProjectionMask,
+        padding_threshold: Option<i16>,
     ) -> Result<Option<Box<dyn ArrayReader>>> {
         let (col_idx, primitive_type) = match &field.field_type {
             ParquetFieldType::Primitive {
@@ -428,6 +450,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                 column_desc,
                 arrow_type,
                 self.batch_size,
+                padding_threshold,
             )?) as _,
             PhysicalType::INT32 => {
                 if let Some(DataType::Null) = arrow_type {
@@ -435,6 +458,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                         page_iterator,
                         column_desc,
                         self.batch_size,
+                        padding_threshold,
                     )?) as _
                 } else {
                     Box::new(PrimitiveArrayReader::<Int32Type>::new(
@@ -442,6 +466,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                         column_desc,
                         arrow_type,
                         self.batch_size,
+                        padding_threshold,
                     )?) as _
                 }
             }
@@ -450,24 +475,28 @@ impl<'a> ArrayReaderBuilder<'a> {
                 column_desc,
                 arrow_type,
                 self.batch_size,
+                padding_threshold,
             )?) as _,
             PhysicalType::INT96 => Box::new(PrimitiveArrayReader::<Int96Type>::new(
                 page_iterator,
                 column_desc,
                 arrow_type,
                 self.batch_size,
+                padding_threshold,
             )?) as _,
             PhysicalType::FLOAT => Box::new(PrimitiveArrayReader::<FloatType>::new(
                 page_iterator,
                 column_desc,
                 arrow_type,
                 self.batch_size,
+                padding_threshold,
             )?) as _,
             PhysicalType::DOUBLE => Box::new(PrimitiveArrayReader::<DoubleType>::new(
                 page_iterator,
                 column_desc,
                 arrow_type,
                 self.batch_size,
+                padding_threshold,
             )?) as _,
             PhysicalType::BYTE_ARRAY => match arrow_type {
                 Some(DataType::Dictionary(_, _)) => make_byte_array_dictionary_reader(
@@ -475,16 +504,22 @@ impl<'a> ArrayReaderBuilder<'a> {
                     column_desc,
                     arrow_type,
                     self.batch_size,
+                    padding_threshold,
                 )?,
                 Some(DataType::Utf8View | DataType::BinaryView) => make_byte_view_array_reader(
                     page_iterator,
                     column_desc,
                     arrow_type,
                     self.batch_size,
+                    padding_threshold,
                 )?,
-                _ => {
-                    make_byte_array_reader(page_iterator, column_desc, arrow_type, self.batch_size)?
-                }
+                _ => make_byte_array_reader(
+                    page_iterator,
+                    column_desc,
+                    arrow_type,
+                    self.batch_size,
+                    padding_threshold,
+                )?,
             },
             PhysicalType::FIXED_LEN_BYTE_ARRAY => match arrow_type {
                 Some(DataType::Dictionary(_, _)) => make_byte_array_dictionary_reader(
@@ -492,12 +527,14 @@ impl<'a> ArrayReaderBuilder<'a> {
                     column_desc,
                     arrow_type,
                     self.batch_size,
+                    padding_threshold,
                 )?,
                 _ => make_fixed_len_byte_array_reader(
                     page_iterator,
                     column_desc,
                     arrow_type,
                     self.batch_size,
+                    padding_threshold,
                 )?,
             },
         };
@@ -508,6 +545,7 @@ impl<'a> ArrayReaderBuilder<'a> {
         &self,
         field: &ParquetField,
         mask: &ProjectionMask,
+        padding_threshold: Option<i16>,
     ) -> Result<Option<Box<dyn ArrayReader>>> {
         let arrow_fields = match &field.arrow_type {
             DataType::Struct(children) => children,
@@ -520,7 +558,7 @@ impl<'a> ArrayReaderBuilder<'a> {
         let mut builder = SchemaBuilder::with_capacity(children.len());
 
         for (arrow, parquet) in arrow_fields.iter().zip(children) {
-            if let Some(reader) = self.build_reader(parquet, mask)? {
+            if let Some(reader) = self.build_reader(parquet, mask, padding_threshold)? {
                 // Need to retrieve underlying data type to handle projection
                 let child_type = reader.get_data_type().clone();
                 builder.push(arrow.as_ref().clone().with_data_type(child_type));
@@ -538,6 +576,7 @@ impl<'a> ArrayReaderBuilder<'a> {
             field.def_level,
             field.rep_level,
             field.nullable,
+            padding_threshold,
         ))))
     }
 }
