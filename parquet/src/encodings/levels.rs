@@ -52,7 +52,7 @@ impl LevelEncoder {
         LevelEncoder::RleV2(RleEncoder::new_from_buf(bit_width, Vec::new()))
     }
 
-    /// Put/encode levels vector into this level encoder and calls
+    /// Put/encode levels vector into this level encoder and call
     /// `observer(value, count)` for each run of identical values encountered
     /// during encoding.
     ///
