@@ -97,7 +97,7 @@ pub struct ArrayReaderBuilder<'a> {
     parquet_metadata: Option<&'a ParquetMetaData>,
     /// metrics
     metrics: &'a ArrowReaderMetrics,
-    /// Batch size for pre-allocating internal buffers
+    /// Batch size hint
     batch_size: usize,
 }
 
@@ -113,9 +113,7 @@ impl<'a> ArrayReaderBuilder<'a> {
         }
     }
 
-    /// Set the batch size used to pre-allocate internal buffers.
-    ///
-    /// This avoids reallocations when reading the first batch of data.
+    /// Set the batch size hint.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
         self
