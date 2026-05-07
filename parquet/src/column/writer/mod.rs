@@ -4571,69 +4571,151 @@ mod tests {
         );
     }
 
-    /// Write-then-read roundtrip using `write_batch_internal` with the given
-    /// [`LevelDataRef`] variants, and assert the read-back matches `expected_*`.
-    #[allow(clippy::too_many_arguments)]
-    fn column_roundtrip_uniform<T: DataType>(
+    struct ColumnRoundTripUniform<'a, T: DataType> {
         props: WriterProperties,
-        values: &[T::T],
-        def_levels: LevelDataRef<'_>,
-        rep_levels: LevelDataRef<'_>,
+        values: &'a [T::T],
+        def_levels: LevelDataRef<'a>,
+        rep_levels: LevelDataRef<'a>,
         max_def_level: i16,
         max_rep_level: i16,
-        expected_values: &[T::T],
-        expected_def_levels: Option<&[i16]>,
-        expected_rep_levels: Option<&[i16]>,
-    ) where
+        expected_values: &'a [T::T],
+        expected_def_levels: Option<&'a [i16]>,
+        expected_rep_levels: Option<&'a [i16]>,
+    }
+
+    impl<'a, T: DataType> ColumnRoundTripUniform<'a, T>
+    where
         T::T: PartialEq + std::fmt::Debug,
     {
-        let mut file = tempfile::tempfile().unwrap();
-        let mut write = TrackedWrite::new(&mut file);
-        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
-        let mut writer =
-            get_test_column_writer::<T>(page_writer, max_def_level, max_rep_level, Arc::new(props));
-
-        writer
-            .write_batch_internal(values, None, def_levels, rep_levels, None, None, None)
-            .unwrap();
-        let result = writer.close().unwrap();
-        drop(write);
-
-        let props = ReaderProperties::builder()
-            .set_backward_compatible_lz4(false)
-            .build();
-        let page_reader = Box::new(
-            SerializedPageReader::new_with_properties(
-                Arc::new(file),
-                &result.metadata,
-                result.rows_written as usize,
-                None,
-                Arc::new(props),
-            )
-            .unwrap(),
-        );
-        let mut reader = get_test_column_reader::<T>(page_reader, max_def_level, max_rep_level);
-
-        let batch_size = expected_def_levels.map_or(expected_values.len(), |l| l.len());
-        let mut actual_values = Vec::with_capacity(batch_size);
-        let mut actual_def = expected_def_levels.map(|_| Vec::with_capacity(batch_size));
-        let mut actual_rep = expected_rep_levels.map(|_| Vec::with_capacity(batch_size));
-
-        let (_, values_read, levels_read) = reader
-            .read_records(
-                batch_size,
-                actual_def.as_mut(),
-                actual_rep.as_mut(),
-                &mut actual_values,
-            )
-            .unwrap();
-
-        assert_eq!(&actual_values[..values_read], expected_values);
-        if let Some(ref v) = actual_def {
-            assert_eq!(&v[..levels_read], expected_def_levels.unwrap());
+        fn new() -> Self {
+            Self {
+                props: Default::default(),
+                values: &[],
+                def_levels: LevelDataRef::Absent,
+                rep_levels: LevelDataRef::Absent,
+                max_def_level: 0,
+                max_rep_level: 0,
+                expected_values: &[],
+                expected_def_levels: None,
+                expected_rep_levels: None,
+            }
         }
-        if let Some(ref v) = actual_rep {
-            assert_eq!(&v[..levels_read], expected_rep_levels.unwrap());
+
+        fn with_props(mut self, props: WriterProperties) -> Self {
+            self.props = props;
+            self
+        }
+
+        fn with_values(mut self, values: &'a [T::T]) -> Self {
+            self.values = values;
+            self
+        }
+
+        fn with_def_levels(mut self, def_levels: LevelDataRef<'a>) -> Self {
+            self.def_levels = def_levels;
+            self
+        }
+
+        fn with_rep_levels(mut self, rep_levels: LevelDataRef<'a>) -> Self {
+            self.rep_levels = rep_levels;
+            self
+        }
+
+        fn with_max_def_level(mut self, max_def_level: i16) -> Self {
+            self.max_def_level = max_def_level;
+            self
+        }
+
+        fn with_max_rep_level(mut self, max_rep_level: i16) -> Self {
+            self.max_rep_level = max_rep_level;
+            self
+        }
+
+        fn with_expected_values(mut self, expected_values: &'a [T::T]) -> Self {
+            self.expected_values = expected_values;
+            self
+        }
+
+        fn with_expected_def_levels(mut self, expected_def_levels: &'a [i16]) -> Self {
+            self.expected_def_levels = Some(expected_def_levels);
+            self
+        }
+
+        fn with_expected_rep_levels(mut self, expected_rep_levels: &'a [i16]) -> Self {
+            self.expected_rep_levels = Some(expected_rep_levels);
+            self
+        }
+
+        /// Write-then-read roundtrip using `write_batch_internal` with the given
+        /// [`LevelDataRef`] variants, and assert the read-back matches `expected_*`.
+        fn run(self) {
+            let mut file = tempfile::tempfile().unwrap();
+            let mut write = TrackedWrite::new(&mut file);
+            let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+            let mut writer = get_test_column_writer::<T>(
+                page_writer,
+                self.max_def_level,
+                self.max_rep_level,
+                Arc::new(self.props),
+            );
+
+            writer
+                .write_batch_internal(
+                    self.values,
+                    None,
+                    self.def_levels,
+                    self.rep_levels,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let result = writer.close().unwrap();
+            drop(write);
+
+            let props = ReaderProperties::builder()
+                .set_backward_compatible_lz4(false)
+                .build();
+            let page_reader = Box::new(
+                SerializedPageReader::new_with_properties(
+                    Arc::new(file),
+                    &result.metadata,
+                    result.rows_written as usize,
+                    None,
+                    Arc::new(props),
+                )
+                .unwrap(),
+            );
+            let mut reader =
+                get_test_column_reader::<T>(page_reader, self.max_def_level, self.max_rep_level);
+
+            let batch_size = self
+                .expected_def_levels
+                .map_or(self.expected_values.len(), |l| l.len());
+            let mut actual_values = Vec::with_capacity(batch_size);
+            let mut actual_def = self
+                .expected_def_levels
+                .map(|_| Vec::with_capacity(batch_size));
+            let mut actual_rep = self
+                .expected_rep_levels
+                .map(|_| Vec::with_capacity(batch_size));
+
+            let (_, values_read, levels_read) = reader
+                .read_records(
+                    batch_size,
+                    actual_def.as_mut(),
+                    actual_rep.as_mut(),
+                    &mut actual_values,
+                )
+                .unwrap();
+
+            assert_eq!(&actual_values[..values_read], self.expected_values);
+            if let Some(ref v) = actual_def {
+                assert_eq!(&v[..levels_read], self.expected_def_levels.unwrap());
+            }
+            if let Some(ref v) = actual_rep {
+                assert_eq!(&v[..levels_read], self.expected_rep_levels.unwrap());
+            }
         }
     }
 
@@ -4642,17 +4724,12 @@ mod tests {
         // All-null column: def_level=0 (null) for every slot, no values written.
         let max_def_level = 1;
         let count = 100;
-        column_roundtrip_uniform::<Int32Type>(
-            Default::default(),
-            &[],
-            LevelDataRef::Uniform { value: 0, count },
-            LevelDataRef::Absent,
-            max_def_level,
-            0,
-            &[],
-            Some(&vec![0i16; count]),
-            None,
-        );
+        let expected_def_levels = vec![0i16; count];
+        ColumnRoundTripUniform::<Int32Type>::new()
+            .with_def_levels(LevelDataRef::Uniform { value: 0, count })
+            .with_max_def_level(max_def_level)
+            .with_expected_def_levels(&expected_def_levels)
+            .run();
     }
 
     #[test]
@@ -4660,20 +4737,17 @@ mod tests {
         // All-valid column: def_level=max for every slot, all values written.
         let max_def_level = 1;
         let values: Vec<i32> = (0..50).collect();
-        column_roundtrip_uniform::<Int32Type>(
-            Default::default(),
-            &values,
-            LevelDataRef::Uniform {
+        let expected_def_levels = vec![max_def_level; values.len()];
+        ColumnRoundTripUniform::<Int32Type>::new()
+            .with_values(&values)
+            .with_def_levels(LevelDataRef::Uniform {
                 value: max_def_level,
                 count: values.len(),
-            },
-            LevelDataRef::Absent,
-            max_def_level,
-            0,
-            &values,
-            Some(&vec![max_def_level; values.len()]),
-            None,
-        );
+            })
+            .with_max_def_level(max_def_level)
+            .with_expected_values(&values)
+            .with_expected_def_levels(&expected_def_levels)
+            .run();
     }
 
     #[test]
@@ -4683,17 +4757,16 @@ mod tests {
         let max_def_level = 2;
         let max_rep_level = 1;
         let count = 200;
-        column_roundtrip_uniform::<Int32Type>(
-            Default::default(),
-            &[],
-            LevelDataRef::Uniform { value: 0, count },
-            LevelDataRef::Uniform { value: 0, count },
-            max_def_level,
-            max_rep_level,
-            &[],
-            Some(&vec![0i16; count]),
-            Some(&vec![0i16; count]),
-        );
+        let expected_def_levels = vec![0i16; count];
+        let expected_rep_levels = vec![0i16; count];
+        ColumnRoundTripUniform::<Int32Type>::new()
+            .with_def_levels(LevelDataRef::Uniform { value: 0, count })
+            .with_rep_levels(LevelDataRef::Uniform { value: 0, count })
+            .with_max_def_level(max_def_level)
+            .with_max_rep_level(max_rep_level)
+            .with_expected_def_levels(&expected_def_levels)
+            .with_expected_rep_levels(&expected_rep_levels)
+            .run();
     }
 
     #[test]
@@ -4705,17 +4778,13 @@ mod tests {
                 .build();
             let max_def = 1;
             let count = 100;
-            column_roundtrip_uniform::<Int32Type>(
-                props,
-                &[],
-                LevelDataRef::Uniform { value: 0, count },
-                LevelDataRef::Absent,
-                max_def,
-                0,
-                &[],
-                Some(&vec![0i16; count]),
-                None,
-            );
+            let expected_def_levels = vec![0i16; count];
+            ColumnRoundTripUniform::<Int32Type>::new()
+                .with_props(props)
+                .with_def_levels(LevelDataRef::Uniform { value: 0, count })
+                .with_max_def_level(max_def)
+                .with_expected_def_levels(&expected_def_levels)
+                .run();
         }
     }
 }
