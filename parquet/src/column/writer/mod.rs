@@ -360,7 +360,7 @@ impl<T: Default> ColumnMetrics<T> {
 ///
 /// The variants are different physical representations of the same logical
 /// sequence of levels.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LevelDataRef<'a> {
     Absent,
     Materialized(&'a [i16]),
@@ -491,6 +491,17 @@ impl<'a> ValueSelection<'a> {
                 len,
             },
             Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[inline(always)]
+    pub(crate) fn index_at(self, idx: usize) -> usize {
+        debug_assert!(idx < self.len());
+        match self {
+            Self::Empty => unreachable!("empty value selection has no values"),
+            Self::Dense { offset, .. } => offset + idx,
+            Self::Sparse(indices) => indices[idx],
         }
     }
 }
@@ -663,7 +674,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn write_source_batch_internal<S>(
+    pub(crate) fn write_batch_internal<S>(
         &mut self,
         source: S,
         def_levels: LevelDataRef<'_>,
@@ -777,34 +788,6 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         Ok(values_offset)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn write_batch_internal(
-        &mut self,
-        values: &E::Values,
-        value_indices: Option<&[usize]>,
-        def_levels: LevelDataRef<'_>,
-        rep_levels: LevelDataRef<'_>,
-        min: Option<&E::T>,
-        max: Option<&E::T>,
-        distinct_count: Option<u64>,
-    ) -> Result<usize> {
-        let value_selection = match value_indices {
-            Some(indices) => ValueSelection::Sparse(indices),
-            None => ValueSelection::Dense {
-                offset: 0,
-                len: values.len(),
-            },
-        };
-        self.write_source_batch_internal(
-            SliceColumnValueSource::new(values, value_selection),
-            def_levels,
-            rep_levels,
-            min,
-            max,
-            distinct_count,
-        )
-    }
-
     /// Writes batch of values, definition levels and repetition levels.
     /// Returns number of values processed (written).
     ///
@@ -827,7 +810,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             offset: 0,
             len: values.len(),
         };
-        self.write_source_batch_internal(
+        self.write_batch_internal(
             SliceColumnValueSource::new(values, value_selection),
             LevelDataRef::from(def_levels),
             LevelDataRef::from(rep_levels),
@@ -857,7 +840,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             offset: 0,
             len: values.len(),
         };
-        self.write_source_batch_internal(
+        self.write_batch_internal(
             SliceColumnValueSource::new(values, value_selection),
             LevelDataRef::from(def_levels),
             LevelDataRef::from(rep_levels),
@@ -2138,7 +2121,7 @@ mod tests {
         let props = Default::default();
         let mut writer = get_test_column_writer::<Int32Type>(page_writer, 1, 0, props);
         let values = [1, 2, 3, 4];
-        let res = writer.write_source_batch_internal(
+        let res = writer.write_batch_internal(
             SliceColumnValueSource::new(
                 values.as_slice(),
                 ValueSelection::Dense { offset: 0, len: 2 },
@@ -5397,7 +5380,7 @@ mod tests {
             };
 
             writer
-                .write_source_batch_internal(
+                .write_batch_internal(
                     SliceColumnValueSource::new(self.values, value_selection),
                     self.def_levels,
                     self.rep_levels,
@@ -5581,7 +5564,7 @@ mod tests {
         );
 
         writer
-            .write_source_batch_internal(
+            .write_batch_internal(
                 SliceColumnValueSource::new(
                     all_values.as_slice(),
                     ValueSelection::Sparse(non_null_indices),

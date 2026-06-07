@@ -41,7 +41,8 @@ use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
 use crate::column::writer::encoder::ColumnValueEncoder;
 use crate::column::writer::{
-    ColumnCloseResult, ColumnWriter, GenericColumnWriter, get_column_writer,
+    ColumnCloseResult, ColumnWriter, GenericColumnWriter, Selected, ValueSelection,
+    get_column_writer,
 };
 use crate::data_type::{ByteArray, FixedLenByteArray};
 #[cfg(feature = "encryption")]
@@ -52,7 +53,7 @@ use crate::file::properties::{WriterProperties, WriterPropertiesPtr};
 use crate::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use crate::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use crate::schema::types::{ColumnDescPtr, SchemaDescPtr, SchemaDescriptor};
-use levels::{ArrayLevels, calculate_array_levels};
+use levels::{ArrayLevels, ArrayLevelsView, calculate_array_levels};
 
 mod byte_array;
 mod levels;
@@ -1098,7 +1099,10 @@ enum ArrowColumnWriterImpl {
 impl ArrowColumnWriter {
     /// Write an [`ArrowLeafColumn`]
     pub fn write(&mut self, col: &ArrowLeafColumn) -> Result<()> {
-        self.write_internal(&col.0)
+        let view = col.0.view();
+        let materialized = self.maybe_materialize_dictionary(view.array())?;
+        let column = materialized.as_deref().unwrap_or_else(|| view.array());
+        self.write_internal(view, column)
     }
 
     /// Write with content-defined chunking, inserting page flushes at chunk boundaries.
@@ -1108,16 +1112,24 @@ impl ArrowColumnWriter {
         chunker: &mut ContentDefinedChunker,
     ) -> Result<()> {
         let levels = &col.0;
+        // Materialize a dictionary leaf once per column rather than once per
+        // chunk: `chunk_view` keeps the full array plus a selection, so taking
+        // per chunk would re-expand the whole dictionary for every chunk.
+        let materialized = self.maybe_materialize_dictionary(levels.array().as_ref())?;
         let chunks = chunker.get_arrow_chunks(
             levels.def_level_data().as_ref(),
             levels.rep_level_data().as_ref(),
-            levels.array(),
+            levels.value_selection().as_ref(),
+            levels.array().as_ref(),
         )?;
 
         let num_chunks = chunks.len();
         for (i, chunk) in chunks.iter().enumerate() {
-            let chunk_levels = levels.slice_for_chunk(chunk);
-            self.write_internal(&chunk_levels)?;
+            let chunk_levels = levels.chunk_view(chunk);
+            let column = materialized
+                .as_deref()
+                .unwrap_or_else(|| chunk_levels.array());
+            self.write_internal(chunk_levels, column)?;
 
             // Add a page break after each chunk except the last
             if i + 1 < num_chunks {
@@ -1130,21 +1142,58 @@ impl ArrowColumnWriter {
         Ok(())
     }
 
-    fn write_internal(&mut self, levels: &ArrayLevels) -> Result<()> {
+    /// Materializes a dictionary leaf into its values for the generic column
+    /// writer (primitive/bool/FLBA), which still consumes materialized values.
+    /// Returns `None` for non-dictionary arrays, and for the byte-array writer
+    /// which consumes dictionaries natively from the original array.
+    fn maybe_materialize_dictionary(
+        &self,
+        array: &dyn arrow_array::Array,
+    ) -> Result<Option<ArrayRef>> {
+        if matches!(self.writer, ArrowColumnWriterImpl::ByteArray(_)) {
+            return Ok(None);
+        }
+        match array.as_any_dictionary_opt() {
+            Some(dictionary) => Ok(Some(arrow_select::take::take(
+                dictionary.values(),
+                dictionary.keys(),
+                None,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    fn write_internal(
+        &mut self,
+        levels: ArrayLevelsView<'_>,
+        column: &dyn arrow_array::Array,
+    ) -> Result<()> {
         match &mut self.writer {
             ArrowColumnWriterImpl::Column(c) => {
-                let leaf = levels.array();
-                match leaf.as_any_dictionary_opt() {
-                    Some(dictionary) => {
-                        let materialized =
-                            arrow_select::take::take(dictionary.values(), dictionary.keys(), None)?;
-                        write_leaf(c, &materialized, levels)?
-                    }
-                    None => write_leaf(c, leaf, levels)?,
-                };
+                write_leaf(c, column, levels)?;
             }
             ArrowColumnWriterImpl::ByteArray(c) => {
-                write_primitive(c, levels.array().as_ref(), levels)?;
+                // The byte-array encoder only implements the gather path. A
+                // sparse selection is already an explicit index slice, so it is
+                // used as-is (no copy); only a dense selection is expanded. This
+                // matches the pre-native behaviour exactly.
+                let dense_indices: Vec<usize>;
+                let selection = match levels.value_selection() {
+                    ValueSelection::Sparse(idx) => ValueSelection::Sparse(idx),
+                    ValueSelection::Empty => ValueSelection::Sparse(&[]),
+                    ValueSelection::Dense { offset, len } => {
+                        dense_indices = (offset..offset + len).collect();
+                        ValueSelection::Sparse(&dense_indices)
+                    }
+                };
+                c.write_batch_internal(
+                    Selected::new(levels.array(), selection),
+                    levels.def_level_data(),
+                    levels.rep_level_data(),
+                    None,
+                    None,
+                    None,
+                )?;
             }
         }
         Ok(())
@@ -1519,10 +1568,8 @@ impl ArrowColumnWriterFactory {
 fn write_leaf(
     writer: &mut ColumnWriter<'_>,
     column: &dyn arrow_array::Array,
-    levels: &ArrayLevels,
+    levels: ArrayLevelsView<'_>,
 ) -> Result<usize> {
-    let indices = levels.non_null_indices();
-
     match writer {
         // Note: this should match the contents of arrow_to_parquet_type
         ColumnWriter::Int32ColumnWriter(typed) => {
@@ -1608,12 +1655,19 @@ fn write_leaf(
         }
         ColumnWriter::BoolColumnWriter(typed) => {
             let array = column.as_boolean();
-            let values = get_bool_array_slice(array, indices.iter().copied());
+            let values = match levels.value_selection() {
+                ValueSelection::Dense { offset, len } => {
+                    get_bool_array_slice(array, offset..offset + len)
+                }
+                ValueSelection::Sparse(idx) => get_bool_array_slice(array, idx.iter().copied()),
+                #[cfg(feature = "arrow")]
+                ValueSelection::Empty => Vec::new(),
+            };
+            let len = values.len();
             typed.write_batch_internal(
-                values.as_slice(),
-                None,
-                levels.def_level_data().as_ref(),
-                levels.rep_level_data().as_ref(),
+                Selected::new(values.as_slice(), ValueSelection::Dense { offset: 0, len }),
+                levels.def_level_data(),
+                levels.rep_level_data(),
                 None,
                 None,
                 None,
@@ -1721,6 +1775,7 @@ fn write_leaf(
             unreachable!("should use ByteArrayWriter")
         }
         ColumnWriter::FixedLenByteArrayColumnWriter(typed) => {
+            let indices = selection_indices(levels.value_selection());
             let bytes = match column.data_type() {
                 ArrowDataType::Interval(interval_unit) => match interval_unit {
                     IntervalUnit::YearMonth => {
@@ -1767,11 +1822,11 @@ fn write_leaf(
                     ));
                 }
             };
+            let len = bytes.len();
             typed.write_batch_internal(
-                bytes.as_slice(),
-                None,
-                levels.def_level_data().as_ref(),
-                levels.rep_level_data().as_ref(),
+                Selected::new(bytes.as_slice(), ValueSelection::Dense { offset: 0, len }),
+                levels.def_level_data(),
+                levels.rep_level_data(),
                 None,
                 None,
                 None,
@@ -1783,17 +1838,27 @@ fn write_leaf(
 fn write_primitive<E: ColumnValueEncoder>(
     writer: &mut GenericColumnWriter<E>,
     values: &E::Values,
-    levels: &ArrayLevels,
+    levels: ArrayLevelsView<'_>,
 ) -> Result<usize> {
     writer.write_batch_internal(
-        values,
-        Some(levels.non_null_indices()),
-        levels.def_level_data().as_ref(),
-        levels.rep_level_data().as_ref(),
+        Selected::new(values, levels.value_selection()),
+        levels.def_level_data(),
+        levels.rep_level_data(),
         None,
         None,
         None,
     )
+}
+
+/// Materializes the selected leaf indices for writers that still consume an
+/// explicit index list (the fixed-length byte-array coercions).
+fn selection_indices(selection: ValueSelection<'_>) -> Vec<usize> {
+    match selection {
+        ValueSelection::Dense { offset, len } => (offset..offset + len).collect(),
+        ValueSelection::Sparse(indices) => indices.to_vec(),
+        #[cfg(feature = "arrow")]
+        ValueSelection::Empty => Vec::new(),
+    }
 }
 
 fn get_bool_array_slice(
