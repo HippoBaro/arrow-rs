@@ -31,6 +31,7 @@ use crate::basic::{
     PageType, Type,
 };
 use crate::column::page::{CompressedPage, Page, PageWriteSpec, PageWriter};
+pub use crate::column::writer::encoder::ColumnEncoderType;
 use crate::column::writer::encoder::{ColumnValueEncoder, ColumnValueEncoderImpl, ColumnValues};
 use crate::compression::{Codec, CodecOptionsBuilder, create_codec};
 use crate::data_type::private::ParquetValueType;
@@ -51,8 +52,6 @@ use crate::schema::types::{ColumnDescPtr, ColumnDescriptor};
 
 mod byte_budget_chunker;
 pub(crate) mod encoder;
-
-pub use crate::column::writer::encoder::ColumnEncoderType;
 
 use byte_budget_chunker::ByteBudgetChunker;
 
@@ -491,6 +490,16 @@ impl<'a> ValueSelectionRef<'a> {
             Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
         }
     }
+
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    pub(crate) fn index_at(self, idx: usize) -> Option<usize> {
+        match self {
+            #[cfg(feature = "arrow")]
+            Self::Empty => None,
+            Self::Dense { offset, len } => (idx < len).then_some(offset + idx),
+            Self::Sparse(indices) => indices.get(idx).copied(),
+        }
+    }
 }
 
 /// A physical value storage shape paired with the selected logical values to write.
@@ -661,7 +670,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn write_source_batch_internal<S>(
+    pub(crate) fn write_batch_internal<S>(
         &mut self,
         source: S,
         def_levels: LevelDataRef<'_>,
@@ -775,34 +784,6 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         Ok(values_offset)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn write_batch_internal(
-        &mut self,
-        values: &E::Values,
-        value_indices: Option<&[usize]>,
-        def_levels: LevelDataRef<'_>,
-        rep_levels: LevelDataRef<'_>,
-        min: Option<&E::T>,
-        max: Option<&E::T>,
-        distinct_count: Option<u64>,
-    ) -> Result<usize> {
-        let value_selection = match value_indices {
-            Some(indices) => ValueSelectionRef::Sparse(indices),
-            None => ValueSelectionRef::Dense {
-                offset: 0,
-                len: values.len(),
-            },
-        };
-        self.write_source_batch_internal(
-            SliceColumnValueSource::new(values, value_selection),
-            def_levels,
-            rep_levels,
-            min,
-            max,
-            distinct_count,
-        )
-    }
-
     /// Writes batch of values, definition levels and repetition levels.
     /// Returns number of values processed (written).
     ///
@@ -825,7 +806,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             offset: 0,
             len: values.len(),
         };
-        self.write_source_batch_internal(
+        self.write_batch_internal(
             SliceColumnValueSource::new(values, value_selection),
             LevelDataRef::from(def_levels),
             LevelDataRef::from(rep_levels),
@@ -855,7 +836,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             offset: 0,
             len: values.len(),
         };
-        self.write_source_batch_internal(
+        self.write_batch_internal(
             SliceColumnValueSource::new(values, value_selection),
             LevelDataRef::from(def_levels),
             LevelDataRef::from(rep_levels),
@@ -5359,7 +5340,7 @@ mod tests {
             };
 
             writer
-                .write_source_batch_internal(
+                .write_batch_internal(
                     SliceColumnValueSource::new(self.values, value_selection),
                     self.def_levels,
                     self.rep_levels,
@@ -5543,7 +5524,7 @@ mod tests {
         );
 
         writer
-            .write_source_batch_internal(
+            .write_batch_internal(
                 SliceColumnValueSource::new(
                     all_values.as_slice(),
                     ValueSelectionRef::Sparse(non_null_indices),
