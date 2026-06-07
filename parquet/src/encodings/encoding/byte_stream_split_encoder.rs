@@ -16,14 +16,16 @@
 // under the License.
 
 use crate::basic::{Encoding, Type};
-use crate::data_type::{AsBytes, BoolType, DataType, Int32Type, Int64Type, SliceAsBytes};
+use crate::data_type::{
+    AsBytes, BoolType, DataType, FixedLenByteArrayType, Int32Type, Int64Type, SliceAsBytes,
+};
 
 use crate::errors::{ParquetError, Result};
 
 use super::Encoder;
-use super::{BoolEncoder, Int32Encoder, Int64Encoder};
+use super::{BoolEncoder, FixedLenByteArrayEncoder, Int32Encoder, Int64Encoder};
 #[cfg(feature = "arrow")]
-use super::{Int32Values, Int64Values};
+use super::{FixedLenByteArrayValues, Int32Values, Int64Values};
 
 use bytes::{BufMut, Bytes};
 use std::{cmp, marker::PhantomData};
@@ -248,5 +250,26 @@ impl<T: DataType> Encoder<T> for VariableWidthByteStreamSplitEncoder<T> {
     /// return the estimated memory size of this encoder.
     fn estimated_memory_size(&self) -> usize {
         self.buffer.capacity() * std::mem::size_of::<u8>()
+    }
+}
+
+impl FixedLenByteArrayEncoder for VariableWidthByteStreamSplitEncoder<FixedLenByteArrayType> {
+    #[cfg(feature = "arrow")]
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        if values.type_length() != self.type_width {
+            return Err(general_err!(
+                "Mismatched FixedLenByteArray sizes: {} != {}",
+                values.type_length(),
+                self.type_width
+            ));
+        }
+
+        match values.dense_bytes() {
+            Some(bytes) => self.buffer.extend_from_slice(bytes),
+            None => values
+                .iter()
+                .for_each(|value| self.buffer.extend_from_slice(value)),
+        }
+        Ok(())
     }
 }

@@ -398,6 +398,128 @@ impl<'a> PackedBoolValues<'a> {
     }
 }
 
+/// Borrowed fixed-length byte-array values.
+#[derive(Debug, Clone, Copy)]
+#[cfg(feature = "arrow")]
+pub(crate) struct FixedLenByteArrayValues<'a> {
+    bytes: &'a [u8],
+    type_length: usize,
+    indices: ValueIndices<'a>,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> FixedLenByteArrayValues<'a> {
+    pub(crate) fn new(bytes: &'a [u8], type_length: usize, len: usize) -> Self {
+        assert_eq!(
+            bytes.len(),
+            type_length
+                .checked_mul(len)
+                .expect("fixed-length byte-array values length overflow")
+        );
+        Self {
+            bytes,
+            type_length,
+            indices: ValueIndices::Dense { offset: 0, len },
+        }
+    }
+
+    pub(crate) fn new_selected(
+        bytes: &'a [u8],
+        type_length: usize,
+        indices: ValueIndices<'a>,
+    ) -> Self {
+        if type_length == 0 {
+            assert!(
+                bytes.is_empty(),
+                "zero-width fixed-length byte-array values must not have data bytes"
+            );
+        } else {
+            assert_eq!(
+                bytes.len() % type_length,
+                0,
+                "fixed-length byte-array values length must be a multiple of type length"
+            );
+        }
+
+        Self {
+            bytes,
+            type_length,
+            indices,
+        }
+    }
+
+    pub(crate) fn dense_bytes(self) -> Option<&'a [u8]> {
+        match self.indices {
+            ValueIndices::Dense { offset, len } => {
+                let start = offset * self.type_length;
+                let end = start + len * self.type_length;
+                Some(&self.bytes[start..end])
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn type_length(self) -> usize {
+        self.type_length
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn iter(self) -> FixedLenByteArrayValueIter<'a> {
+        FixedLenByteArrayValueIter {
+            bytes: self.bytes,
+            type_length: self.type_length,
+            indices: self.indices,
+            offset: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[cfg(feature = "arrow")]
+pub(crate) struct FixedLenByteArrayValueIter<'a> {
+    bytes: &'a [u8],
+    type_length: usize,
+    indices: ValueIndices<'a>,
+    offset: usize,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> Iterator for FixedLenByteArrayValueIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.indices.len() {
+            return None;
+        }
+
+        let idx = self.indices.index_at(self.offset);
+        self.offset += 1;
+
+        if self.type_length == 0 {
+            return Some(&self.bytes[..0]);
+        }
+
+        let start = idx * self.type_length;
+        let end = start + self.type_length;
+        Some(&self.bytes[start..end])
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.indices.len() - self.offset;
+        (remaining, Some(remaining))
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl ExactSizeIterator for FixedLenByteArrayValueIter<'_> {}
+
 #[cfg(feature = "arrow")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ValueIndices<'a> {
@@ -687,6 +809,19 @@ pub(crate) trait BoolEncoder: Encoder<BoolType> {
     }
 }
 
+/// Encodes raw fixed-length byte-array values.
+///
+/// This is a storage-shape fast path for Arrow fixed-width buffers.
+#[doc(hidden)]
+pub(crate) trait FixedLenByteArrayEncoder: Encoder<FixedLenByteArrayType> {
+    #[cfg(feature = "arrow")]
+    fn put_fixed_len_byte_array(&mut self, _values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        Err(general_err!(
+            "Raw fixed-length byte-array values are not supported by this encoder"
+        ))
+    }
+}
+
 /// Encodes selected values as physical INT32 values.
 #[doc(hidden)]
 pub(crate) trait Int32Encoder: Encoder<Int32Type> {
@@ -760,6 +895,9 @@ impl<T: DataType> EncoderFactory<T> for dyn Encoder<T> {
 pub struct BoolEncoderObject(Box<dyn BoolEncoder>);
 
 #[doc(hidden)]
+pub struct FixedLenByteArrayEncoderObject(Box<dyn FixedLenByteArrayEncoder>);
+
+#[doc(hidden)]
 pub struct Int32EncoderObject(Box<dyn Int32Encoder>);
 
 #[doc(hidden)]
@@ -792,6 +930,7 @@ macro_rules! delegate_encoder {
 }
 
 delegate_encoder!(BoolEncoderObject, BoolType);
+delegate_encoder!(FixedLenByteArrayEncoderObject, FixedLenByteArrayType);
 delegate_encoder!(Int32EncoderObject, Int32Type);
 delegate_encoder!(Int64EncoderObject, Int64Type);
 
@@ -799,6 +938,13 @@ impl BoolEncoder for BoolEncoderObject {
     #[cfg(feature = "arrow")]
     fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
         self.0.put_packed_bool(values)
+    }
+}
+
+impl FixedLenByteArrayEncoder for FixedLenByteArrayEncoderObject {
+    #[cfg(feature = "arrow")]
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        self.0.put_fixed_len_byte_array(values)
     }
 }
 
@@ -830,6 +976,28 @@ impl EncoderFactory<BoolType> for BoolEncoderObject {
             Encoding::DELTA_LENGTH_BYTE_ARRAY => Box::new(DeltaLengthByteArrayEncoder::new()),
             Encoding::DELTA_BYTE_ARRAY => Box::new(DeltaByteArrayEncoder::new()),
             Encoding::BYTE_STREAM_SPLIT => Box::new(ByteStreamSplitEncoder::new()),
+            e => return Err(nyi_err!("Encoding {} is not supported", e)),
+        };
+        Ok(Box::new(Self(encoder)))
+    }
+}
+
+impl EncoderFactory<FixedLenByteArrayType> for FixedLenByteArrayEncoderObject {
+    fn get_encoder(encoding: Encoding, descr: &ColumnDescPtr) -> Result<Box<Self>> {
+        let encoder: Box<dyn FixedLenByteArrayEncoder> = match encoding {
+            Encoding::PLAIN => Box::new(PlainEncoder::new()),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                return Err(general_err!(
+                    "Cannot initialize this encoding through this function"
+                ));
+            }
+            Encoding::RLE => Box::new(RleValueEncoder::new()),
+            Encoding::DELTA_BINARY_PACKED => Box::new(DeltaBitPackEncoder::new()),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => Box::new(DeltaLengthByteArrayEncoder::new()),
+            Encoding::DELTA_BYTE_ARRAY => Box::new(DeltaByteArrayEncoder::new()),
+            Encoding::BYTE_STREAM_SPLIT => Box::new(VariableWidthByteStreamSplitEncoder::new(
+                descr.type_length(),
+            )),
             e => return Err(nyi_err!("Encoding {} is not supported", e)),
         };
         Ok(Box::new(Self(encoder)))
@@ -954,6 +1122,20 @@ impl BoolEncoder for PlainEncoder<BoolType> {
             self.bit_writer.put_bits(bytes, bit_offset, len);
         } else {
             values.put_indexed_packed(&mut self.bit_writer);
+        }
+        Ok(())
+    }
+}
+
+impl FixedLenByteArrayEncoder for PlainEncoder<FixedLenByteArrayType> {
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        match values.dense_bytes() {
+            Some(bytes) => self.buffer.extend_from_slice(bytes),
+            None => values
+                .iter()
+                .for_each(|value| self.buffer.extend_from_slice(value)),
         }
         Ok(())
     }
@@ -1087,6 +1269,7 @@ impl BoolEncoder for RleValueEncoder<BoolType> {
 
 impl Int32Encoder for RleValueEncoder<Int32Type> {}
 impl Int64Encoder for RleValueEncoder<Int64Type> {}
+impl FixedLenByteArrayEncoder for RleValueEncoder<FixedLenByteArrayType> {}
 
 // ----------------------------------------------------------------------
 // DELTA_BINARY_PACKED encoding
@@ -1369,6 +1552,7 @@ impl Int64Encoder for DeltaBitPackEncoder<Int64Type> {
 }
 
 impl BoolEncoder for DeltaBitPackEncoder<BoolType> {}
+impl FixedLenByteArrayEncoder for DeltaBitPackEncoder<FixedLenByteArrayType> {}
 
 /// Helper trait to define specific conversions and subtractions when computing deltas
 trait DeltaBitPackEncoderConversion<T: DataType> {
@@ -1504,6 +1688,7 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
 }
 
 impl BoolEncoder for DeltaLengthByteArrayEncoder<BoolType> {}
+impl FixedLenByteArrayEncoder for DeltaLengthByteArrayEncoder<FixedLenByteArrayType> {}
 impl Int32Encoder for DeltaLengthByteArrayEncoder<Int32Type> {}
 impl Int64Encoder for DeltaLengthByteArrayEncoder<Int64Type> {}
 
@@ -1618,6 +1803,7 @@ impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
 }
 
 impl BoolEncoder for DeltaByteArrayEncoder<BoolType> {}
+impl FixedLenByteArrayEncoder for DeltaByteArrayEncoder<FixedLenByteArrayType> {}
 impl Int32Encoder for DeltaByteArrayEncoder<Int32Type> {}
 impl Int64Encoder for DeltaByteArrayEncoder<Int64Type> {}
 

@@ -51,11 +51,12 @@ use crate::column::writer::{
     ValueSelectionRef, get_column_writer,
 };
 use crate::data_type::{
-    BoolType, ByteArray, DoubleType as ParquetDoubleType, FixedLenByteArray,
+    BoolType, ByteArray, DoubleType as ParquetDoubleType, FixedLenByteArray, FixedLenByteArrayType,
     FloatType as ParquetFloatType, Int32Type as ParquetInt32Type, Int64Type as ParquetInt64Type,
 };
 use crate::encodings::encoding::{
-    DictionaryValueIndices, Int32Values, Int64Values, PackedBoolValues, RowSelection, ValueIndices,
+    DictionaryValueIndices, FixedLenByteArrayValues, Int32Values, Int64Values, PackedBoolValues,
+    RowSelection, ValueIndices,
 };
 #[cfg(feature = "encryption")]
 use crate::encryption::encrypt::FileEncryptor;
@@ -1904,6 +1905,154 @@ fn write_bool_column(
     )
 }
 
+type FixedLenByteArraySource<'a> = Selected<'a, FixedLenByteArrayStorage<'a>>;
+
+#[derive(Clone, Copy)]
+struct FixedLenByteArrayStorage<'a> {
+    column: &'a dyn arrow_array::Array,
+}
+
+impl<'a> FixedLenByteArrayStorage<'a> {
+    fn from_column(column: &'a dyn arrow_array::Array) -> Self {
+        Self { column }
+    }
+}
+
+impl<'a> ColumnValueSource<ColumnValueEncoderImpl<FixedLenByteArrayType>>
+    for Selected<'a, FixedLenByteArrayStorage<'a>>
+{
+    fn len(self) -> usize {
+        Selected::len(self)
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Selected::slice(self, offset, len)
+    }
+
+    fn write_to(self, encoder: &mut ColumnValueEncoderImpl<FixedLenByteArrayType>) -> Result<()> {
+        write_fixed_len_byte_array_column(encoder, self.storage().column, self.selection())
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        let len = Selected::len(self);
+        if len == 0 {
+            return Some(0);
+        }
+        // Fixed-len values encode to a constant width with no length prefix, so
+        // the boundary value that crosses the budget is included — matching the
+        // per-value walk in `ColumnValueEncoderImpl::count_values_within_byte_budget`.
+        // FixedSizeBinary exposes that width directly; the other fixed-len arrow
+        // types (decimals, float16, intervals) are narrow enough that
+        // `ByteBudgetChunker::static_always_fits` short-circuits before this is
+        // consulted, so `None` (no estimate) is a safe fallback for them.
+        match self.storage().column.data_type() {
+            ArrowDataType::FixedSizeBinary(width) => {
+                let per = (*width).max(1) as usize;
+                Some(((budget / per) + 1).min(len))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn write_fixed_len_byte_array_column(
+    encoder: &mut ColumnValueEncoderImpl<FixedLenByteArrayType>,
+    column: &dyn arrow_array::Array,
+    selection: ValueSelectionRef<'_>,
+) -> Result<()> {
+    if let Some(()) = with_dictionary_values_and_indices(column, selection, |values, indices| {
+        write_fixed_len_byte_array_column_indices(encoder, values, indices)
+    })? {
+        return Ok(());
+    }
+
+    write_fixed_len_byte_array_column_indices(encoder, column, value_indices(selection))
+}
+
+fn write_fixed_len_byte_array_column_indices(
+    encoder: &mut ColumnValueEncoderImpl<FixedLenByteArrayType>,
+    column: &dyn arrow_array::Array,
+    indices: ValueIndices<'_>,
+) -> Result<()> {
+    if encoder.supports_raw_fixed_len_byte_array() {
+        match column.data_type() {
+            ArrowDataType::FixedSizeBinary(_) => {
+                let array = column.as_fixed_size_binary();
+                return encoder.write_raw_fixed_len_byte_array(
+                    FixedLenByteArrayValues::new_selected(
+                        array.value_data(),
+                        array.value_size(),
+                        indices,
+                    ),
+                );
+            }
+            _ => {
+                if let ValueIndices::Dense { offset, len } = indices {
+                    match column.data_type() {
+                        ArrowDataType::Interval(IntervalUnit::YearMonth) => {
+                            let array = column.as_primitive::<IntervalYearMonthType>();
+                            let bytes = get_interval_ym_array_dense_bytes(array, offset, len);
+                            return encoder.write_raw_fixed_len_byte_array(
+                                FixedLenByteArrayValues::new(&bytes, 12, len),
+                            );
+                        }
+                        ArrowDataType::Interval(IntervalUnit::DayTime) => {
+                            let array = column.as_primitive::<IntervalDayTimeType>();
+                            let bytes = get_interval_dt_array_dense_bytes(array, offset, len);
+                            return encoder.write_raw_fixed_len_byte_array(
+                                FixedLenByteArrayValues::new(&bytes, 12, len),
+                            );
+                        }
+                        ArrowDataType::Decimal32(_, _) => {
+                            let array = column.as_primitive::<Decimal32Type>();
+                            let size = decimal_length_from_precision(array.precision());
+                            let bytes = get_decimal_32_array_dense_bytes(array, offset, len, size);
+                            return encoder.write_raw_fixed_len_byte_array(
+                                FixedLenByteArrayValues::new(&bytes, size, len),
+                            );
+                        }
+                        ArrowDataType::Decimal64(_, _) => {
+                            let array = column.as_primitive::<Decimal64Type>();
+                            let size = decimal_length_from_precision(array.precision());
+                            let bytes = get_decimal_64_array_dense_bytes(array, offset, len, size);
+                            return encoder.write_raw_fixed_len_byte_array(
+                                FixedLenByteArrayValues::new(&bytes, size, len),
+                            );
+                        }
+                        ArrowDataType::Decimal128(_, _) => {
+                            let array = column.as_primitive::<Decimal128Type>();
+                            let size = decimal_length_from_precision(array.precision());
+                            let bytes = get_decimal_128_array_dense_bytes(array, offset, len, size);
+                            return encoder.write_raw_fixed_len_byte_array(
+                                FixedLenByteArrayValues::new(&bytes, size, len),
+                            );
+                        }
+                        ArrowDataType::Decimal256(_, _) => {
+                            let array = column.as_primitive::<Decimal256Type>();
+                            let size = decimal_length_from_precision(array.precision());
+                            let bytes = get_decimal_256_array_dense_bytes(array, offset, len, size);
+                            return encoder.write_raw_fixed_len_byte_array(
+                                FixedLenByteArrayValues::new(&bytes, size, len),
+                            );
+                        }
+                        ArrowDataType::Float16 => {
+                            let array = column.as_primitive::<Float16Type>();
+                            let bytes = get_float_16_array_dense_bytes(array, offset, len);
+                            return encoder.write_raw_fixed_len_byte_array(
+                                FixedLenByteArrayValues::new(&bytes, 2, len),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let values = get_fixed_len_byte_array_values(column, indices)?;
+    encoder.write(values.as_slice(), 0, values.len())
+}
+
 type Int32Source<'a> = Selected<'a, Int32Storage<'a>>;
 
 #[derive(Clone, Copy)]
@@ -2355,78 +2504,14 @@ fn write_leaf(
         ColumnWriter::ByteArrayColumnWriter(_) => {
             unreachable!("should use ByteArrayWriter")
         }
-        ColumnWriter::FixedLenByteArrayColumnWriter(typed) => {
-            let indices = selection_indices(levels.value_selection());
-            let bytes = match column.data_type() {
-                ArrowDataType::Interval(interval_unit) => match interval_unit {
-                    IntervalUnit::YearMonth => {
-                        let array = column.as_primitive::<IntervalYearMonthType>();
-                        get_interval_ym_array_slice(array, indices.iter().copied())
-                    }
-                    IntervalUnit::DayTime => {
-                        let array = column.as_primitive::<IntervalDayTimeType>();
-                        get_interval_dt_array_slice(array, indices.iter().copied())
-                    }
-                    _ => {
-                        return Err(ParquetError::NYI(format!(
-                            "Attempting to write an Arrow interval type {interval_unit:?} to parquet that is not yet implemented"
-                        )));
-                    }
-                },
-                ArrowDataType::FixedSizeBinary(_) => {
-                    let array = column.as_fixed_size_binary();
-                    get_fsb_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Decimal32(_, _) => {
-                    let array = column.as_primitive::<Decimal32Type>();
-                    get_decimal_32_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Decimal64(_, _) => {
-                    let array = column.as_primitive::<Decimal64Type>();
-                    get_decimal_64_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Decimal128(_, _) => {
-                    let array = column.as_primitive::<Decimal128Type>();
-                    get_decimal_128_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Decimal256(_, _) => {
-                    let array = column.as_primitive::<Decimal256Type>();
-                    get_decimal_256_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Float16 => {
-                    let array = column.as_primitive::<Float16Type>();
-                    get_float_16_array_slice(array, indices.iter().copied())
-                }
-                _ => {
-                    return Err(ParquetError::NYI(
-                        "Attempting to write an Arrow type that is not yet implemented".to_string(),
-                    ));
-                }
-            };
-            let len = bytes.len();
-            typed.write_batch_internal(
-                Selected::new(
-                    bytes.as_slice(),
-                    ValueSelectionRef::Dense { offset: 0, len },
-                ),
-                levels.def_level_data(),
-                levels.rep_level_data(),
-                None,
-                None,
-                None,
-            )
-        }
-    }
-}
-
-/// Materializes the selected leaf indices for writers that still consume an
-/// explicit index list (the fixed-length byte-array coercions).
-fn selection_indices(selection: ValueSelectionRef<'_>) -> Vec<usize> {
-    match selection {
-        ValueSelectionRef::Dense { offset, len } => (offset..offset + len).collect(),
-        ValueSelectionRef::Sparse(indices) => indices.to_vec(),
-        #[cfg(feature = "arrow")]
-        ValueSelectionRef::Empty => Vec::new(),
+        ColumnWriter::FixedLenByteArrayColumnWriter(typed) => typed.write_batch_internal(
+            FixedLenByteArraySource::new(FixedLenByteArrayStorage::from_column(column), selection),
+            levels.def_level_data(),
+            levels.rep_level_data(),
+            None,
+            None,
+            None,
+        ),
     }
 }
 
@@ -2465,115 +2550,251 @@ fn value_indices_include_nulls(nulls: Option<&NullBuffer>, indices: ValueIndices
 
 /// Returns 12-byte values representing 3 values of months, days and milliseconds (4-bytes each).
 /// An Arrow YearMonth interval only stores months, thus only the first 4 bytes are populated.
+fn get_fixed_len_byte_array_values(
+    column: &dyn arrow_array::Array,
+    indices: ValueIndices<'_>,
+) -> Result<Vec<FixedLenByteArray>> {
+    match column.data_type() {
+        ArrowDataType::Interval(interval_unit) => match interval_unit {
+            IntervalUnit::YearMonth => {
+                let array = column.as_primitive::<IntervalYearMonthType>();
+                Ok(get_interval_ym_array_slice(array, indices))
+            }
+            IntervalUnit::DayTime => {
+                let array = column.as_primitive::<IntervalDayTimeType>();
+                Ok(get_interval_dt_array_slice(array, indices))
+            }
+            _ => Err(ParquetError::NYI(format!(
+                "Attempting to write an Arrow interval type {interval_unit:?} to parquet that is not yet implemented"
+            ))),
+        },
+        ArrowDataType::FixedSizeBinary(_) => {
+            let array = column.as_fixed_size_binary();
+            Ok(get_fsb_array_slice(array, indices))
+        }
+        ArrowDataType::Decimal32(_, _) => {
+            let array = column.as_primitive::<Decimal32Type>();
+            Ok(get_decimal_32_array_slice(array, indices))
+        }
+        ArrowDataType::Decimal64(_, _) => {
+            let array = column.as_primitive::<Decimal64Type>();
+            Ok(get_decimal_64_array_slice(array, indices))
+        }
+        ArrowDataType::Decimal128(_, _) => {
+            let array = column.as_primitive::<Decimal128Type>();
+            Ok(get_decimal_128_array_slice(array, indices))
+        }
+        ArrowDataType::Decimal256(_, _) => {
+            let array = column.as_primitive::<Decimal256Type>();
+            Ok(get_decimal_256_array_slice(array, indices))
+        }
+        ArrowDataType::Float16 => {
+            let array = column.as_primitive::<Float16Type>();
+            Ok(get_float_16_array_slice(array, indices))
+        }
+        _ => Err(ParquetError::NYI(
+            "Attempting to write an Arrow type that is not yet implemented".to_string(),
+        )),
+    }
+}
+
+fn map_value_indices<T>(indices: ValueIndices<'_>, mut f: impl FnMut(usize) -> T) -> Vec<T> {
+    let mut values = Vec::with_capacity(indices.len());
+    indices.for_each(|i| values.push(f(i)));
+    values
+}
+
+/// Returns 12-byte values representing 3 values of months, days and milliseconds (4-bytes each).
+/// An Arrow YearMonth interval only stores months, thus only the first 4 bytes are populated.
 fn get_interval_ym_array_slice(
     array: &arrow_array::IntervalYearMonthArray,
-    indices: impl ExactSizeIterator<Item = usize>,
+    indices: ValueIndices<'_>,
 ) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
+    map_value_indices(indices, |i| {
         let mut value = array.value(i).to_le_bytes().to_vec();
         let mut suffix = vec![0; 8];
         value.append(&mut suffix);
-        values.push(FixedLenByteArray::from(ByteArray::from(value)))
+        FixedLenByteArray::from(ByteArray::from(value))
+    })
+}
+
+fn get_interval_ym_array_dense_bytes(
+    array: &arrow_array::IntervalYearMonthArray,
+    offset: usize,
+    len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len * 12);
+    for i in offset..offset + len {
+        out.extend_from_slice(&array.value(i).to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
     }
-    values
+    out
 }
 
 /// Returns 12-byte values representing 3 values of months, days and milliseconds (4-bytes each).
 /// An Arrow DayTime interval only stores days and millis, thus the first 4 bytes are not populated.
 fn get_interval_dt_array_slice(
     array: &arrow_array::IntervalDayTimeArray,
-    indices: impl ExactSizeIterator<Item = usize>,
+    indices: ValueIndices<'_>,
 ) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
+    map_value_indices(indices, |i| {
         let mut out = [0; 12];
         let value = array.value(i);
         out[4..8].copy_from_slice(&value.days.to_le_bytes());
         out[8..12].copy_from_slice(&value.milliseconds.to_le_bytes());
-        values.push(FixedLenByteArray::from(ByteArray::from(out.to_vec())));
+        FixedLenByteArray::from(ByteArray::from(out.to_vec()))
+    })
+}
+
+fn get_interval_dt_array_dense_bytes(
+    array: &arrow_array::IntervalDayTimeArray,
+    offset: usize,
+    len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len * 12);
+    for i in offset..offset + len {
+        let value = array.value(i);
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&value.days.to_le_bytes());
+        out.extend_from_slice(&value.milliseconds.to_le_bytes());
     }
-    values
+    out
 }
 
 fn get_decimal_32_array_slice(
     array: &arrow_array::Decimal32Array,
-    indices: impl ExactSizeIterator<Item = usize>,
+    indices: ValueIndices<'_>,
 ) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
     let size = decimal_length_from_precision(array.precision());
-    for i in indices {
+    map_value_indices(indices, |i| {
         let as_be_bytes = array.value(i).to_be_bytes();
         let resized_value = as_be_bytes[(4 - size)..].to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
+        FixedLenByteArray::from(ByteArray::from(resized_value))
+    })
+}
+
+fn get_decimal_32_array_dense_bytes(
+    array: &arrow_array::Decimal32Array,
+    offset: usize,
+    len: usize,
+    size: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len * size);
+    for i in offset..offset + len {
+        let as_be_bytes = array.value(i).to_be_bytes();
+        out.extend_from_slice(&as_be_bytes[(4 - size)..]);
     }
-    values
+    out
 }
 
 fn get_decimal_64_array_slice(
     array: &arrow_array::Decimal64Array,
-    indices: impl ExactSizeIterator<Item = usize>,
+    indices: ValueIndices<'_>,
 ) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
     let size = decimal_length_from_precision(array.precision());
-    for i in indices {
+    map_value_indices(indices, |i| {
         let as_be_bytes = array.value(i).to_be_bytes();
         let resized_value = as_be_bytes[(8 - size)..].to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
+        FixedLenByteArray::from(ByteArray::from(resized_value))
+    })
+}
+
+fn get_decimal_64_array_dense_bytes(
+    array: &arrow_array::Decimal64Array,
+    offset: usize,
+    len: usize,
+    size: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len * size);
+    for i in offset..offset + len {
+        let as_be_bytes = array.value(i).to_be_bytes();
+        out.extend_from_slice(&as_be_bytes[(8 - size)..]);
     }
-    values
+    out
 }
 
 fn get_decimal_128_array_slice(
     array: &arrow_array::Decimal128Array,
-    indices: impl ExactSizeIterator<Item = usize>,
+    indices: ValueIndices<'_>,
 ) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
     let size = decimal_length_from_precision(array.precision());
-    for i in indices {
+    map_value_indices(indices, |i| {
         let as_be_bytes = array.value(i).to_be_bytes();
         let resized_value = as_be_bytes[(16 - size)..].to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
+        FixedLenByteArray::from(ByteArray::from(resized_value))
+    })
+}
+
+fn get_decimal_128_array_dense_bytes(
+    array: &arrow_array::Decimal128Array,
+    offset: usize,
+    len: usize,
+    size: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len * size);
+    for i in offset..offset + len {
+        let as_be_bytes = array.value(i).to_be_bytes();
+        out.extend_from_slice(&as_be_bytes[(16 - size)..]);
     }
-    values
+    out
 }
 
 fn get_decimal_256_array_slice(
     array: &arrow_array::Decimal256Array,
-    indices: impl ExactSizeIterator<Item = usize>,
+    indices: ValueIndices<'_>,
 ) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
     let size = decimal_length_from_precision(array.precision());
-    for i in indices {
+    map_value_indices(indices, |i| {
         let as_be_bytes = array.value(i).to_be_bytes();
         let resized_value = as_be_bytes[(32 - size)..].to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
+        FixedLenByteArray::from(ByteArray::from(resized_value))
+    })
+}
+
+fn get_decimal_256_array_dense_bytes(
+    array: &arrow_array::Decimal256Array,
+    offset: usize,
+    len: usize,
+    size: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len * size);
+    for i in offset..offset + len {
+        let as_be_bytes = array.value(i).to_be_bytes();
+        out.extend_from_slice(&as_be_bytes[(32 - size)..]);
     }
-    values
+    out
 }
 
 fn get_float_16_array_slice(
     array: &arrow_array::Float16Array,
-    indices: impl ExactSizeIterator<Item = usize>,
+    indices: ValueIndices<'_>,
 ) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
+    map_value_indices(indices, |i| {
         let value = array.value(i).to_le_bytes().to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(value)));
+        FixedLenByteArray::from(ByteArray::from(value))
+    })
+}
+
+fn get_float_16_array_dense_bytes(
+    array: &arrow_array::Float16Array,
+    offset: usize,
+    len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len * 2);
+    for i in offset..offset + len {
+        out.extend_from_slice(&array.value(i).to_le_bytes());
     }
-    values
+    out
 }
 
 fn get_fsb_array_slice(
     array: &arrow_array::FixedSizeBinaryArray,
-    indices: impl ExactSizeIterator<Item = usize>,
+    indices: ValueIndices<'_>,
 ) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
+    map_value_indices(indices, |i| {
         let value = array.value(i).to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(value)))
-    }
-    values
+        FixedLenByteArray::from(ByteArray::from(value))
+    })
 }
 
 #[cfg(test)]

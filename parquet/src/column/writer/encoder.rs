@@ -23,6 +23,10 @@ use crate::bloom_filter::Sbbf;
 use crate::column::writer::{
     compare_greater, fallback_encoding, has_dictionary_support, is_nan, update_max, update_min,
 };
+#[cfg(feature = "arrow")]
+use crate::column::writer::{compare_greater_byte_array, is_nan_byte_array};
+#[cfg(feature = "arrow")]
+use crate::data_type::FixedLenByteArray;
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::{
     BoolType, ByteArrayType, DataType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type,
@@ -30,10 +34,12 @@ use crate::data_type::{
 };
 #[cfg(feature = "arrow")]
 use crate::encodings::encoding::{
-    BoolEncoder, Int32Encoder, Int32Values, Int64Encoder, Int64Values, PackedBoolValues,
+    BoolEncoder, FixedLenByteArrayEncoder, FixedLenByteArrayValues, Int32Encoder, Int32Values,
+    Int64Encoder, Int64Values, PackedBoolValues,
 };
 use crate::encodings::encoding::{
-    BoolEncoderObject, DictEncoder, Encoder, EncoderFactory, Int32EncoderObject, Int64EncoderObject,
+    BoolEncoderObject, DictEncoder, Encoder, EncoderFactory, FixedLenByteArrayEncoderObject,
+    Int32EncoderObject, Int64EncoderObject,
 };
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
@@ -196,7 +202,7 @@ impl ColumnEncoderType for Int64Type {
 }
 
 impl ColumnEncoderType for FixedLenByteArrayType {
-    type Encoder = dyn Encoder<Self>;
+    type Encoder = FixedLenByteArrayEncoderObject;
 }
 
 impl ColumnEncoderType for Int96Type {
@@ -301,6 +307,97 @@ impl ColumnValueEncoderImpl<BoolType, BoolEncoderObject> {
 
         debug_assert!(self.dict_encoder.is_none());
         self.encoder.put_packed_bool(values)
+    }
+}
+
+#[allow(dead_code)]
+impl ColumnValueEncoderImpl<FixedLenByteArrayType, FixedLenByteArrayEncoderObject> {
+    #[cfg(feature = "arrow")]
+    pub(crate) fn supports_raw_fixed_len_byte_array(&self) -> bool {
+        self.dict_encoder.is_none()
+            && self.geo_stats_accumulator.is_none()
+            && matches!(
+                self.encoder.encoding(),
+                Encoding::PLAIN | Encoding::BYTE_STREAM_SPLIT
+            )
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_raw_fixed_len_byte_array(
+        &mut self,
+        values: FixedLenByteArrayValues<'_>,
+    ) -> Result<()> {
+        self.num_values += values.len();
+
+        if !values.is_empty() {
+            let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+                && self.descr.converted_type() != ConvertedType::INTERVAL;
+
+            if should_update_stats {
+                if let Some((min, max)) = self.raw_fixed_len_min_max(values) {
+                    update_min(&self.descr, &min, &mut self.min_value);
+                    update_max(&self.descr, &max, &mut self.max_value);
+                }
+            }
+
+            if let Some(bloom_filter) = &mut self.bloom_filter {
+                for value in values.iter() {
+                    bloom_filter.insert(value);
+                }
+            }
+        }
+
+        debug_assert!(self.dict_encoder.is_none());
+        self.encoder.put_fixed_len_byte_array(values)
+    }
+
+    #[cfg(feature = "arrow")]
+    fn raw_fixed_len_min_max(
+        &self,
+        values: FixedLenByteArrayValues<'_>,
+    ) -> Option<(FixedLenByteArray, FixedLenByteArray)> {
+        let mut min: Option<&[u8]> = None;
+        let mut max: Option<&[u8]> = None;
+
+        for value in values.iter() {
+            if is_nan_byte_array(&self.descr, value) {
+                continue;
+            }
+
+            if min.is_none_or(|current| compare_greater_byte_array(&self.descr, current, value)) {
+                min = Some(value);
+            }
+            if max.is_none_or(|current| compare_greater_byte_array(&self.descr, value, current)) {
+                max = Some(value);
+            }
+        }
+
+        Some(raw_fixed_len_min_max_values(&self.descr, min?, max?))
+    }
+}
+
+#[cfg(feature = "arrow")]
+fn raw_fixed_len_min_max_values(
+    descr: &ColumnDescriptor,
+    min: &[u8],
+    max: &[u8],
+) -> (FixedLenByteArray, FixedLenByteArray) {
+    if descr.logical_type_ref() == Some(&LogicalType::Float16) {
+        let min = raw_float16_stat_zero(min, f16::NEG_ZERO);
+        let max = raw_float16_stat_zero(max, f16::ZERO);
+        return (min.to_vec().into(), max.to_vec().into());
+    }
+
+    (min.to_vec().into(), max.to_vec().into())
+}
+
+#[cfg(feature = "arrow")]
+fn raw_float16_stat_zero(value: &[u8], replacement: f16) -> [u8; 2] {
+    let value: [u8; 2] = value.try_into().unwrap();
+    if f16::from_le_bytes(value) == f16::ZERO {
+        replacement.to_le_bytes()
+    } else {
+        value
     }
 }
 
