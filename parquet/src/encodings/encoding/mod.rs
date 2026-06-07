@@ -20,6 +20,14 @@
 use std::{cmp, marker::PhantomData};
 
 use crate::basic::*;
+#[cfg(all(feature = "arrow", test))]
+use crate::column::value::GroupedSelectionRef;
+#[cfg(feature = "arrow")]
+use crate::column::value::{IndexSpan, PhysicalIndexPlan};
+#[cfg(feature = "arrow")]
+use crate::column::value::{
+    Sink, ValueSelectionRef, gather_run_groups_tiled, gather_tiled, map_values,
+};
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::*;
 use crate::encodings::rle::RleEncoder;
@@ -27,9 +35,14 @@ use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{BitWriter, num_required_bits};
 
+#[cfg(feature = "arrow")]
+use crate::util::bit_util::get_bit;
+#[cfg(feature = "arrow")]
+use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
 use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamSplitEncoder};
 use bytes::Bytes;
 pub use dict_encoder::DictEncoder;
+pub(crate) use dict_encoder::RunIndexBuffer;
 
 mod byte_stream_split_encoder;
 mod dict_encoder;
@@ -78,8 +91,432 @@ pub trait Encoder<T: DataType>: Send {
     fn flush_buffer(&mut self) -> Result<Bytes>;
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PackedBoolSelection<'a> {
+    /// An unpacked `&[bool]` slice from the low-level `write_batch` path: one byte per
+    /// value, no bit-packing. The bits are packed lazily when the encoder pulls them
+    /// (`put_indexed_packed`), so the slice path is allocation-free and shares the
+    /// boolean [`Sink`] with Arrow input in every build.
+    Unpacked { values: &'a [bool] },
+    /// A directly addressable packed Arrow range. Cache this compact shape at
+    /// construction so the statistics and encoder passes do not repeatedly
+    /// interrogate a comparatively large physical-index plan.
+    #[cfg(feature = "arrow")]
+    Dense { bit_offset: usize, len: usize },
+    #[cfg(feature = "arrow")]
+    Sparse {
+        bit_offset: usize,
+        indices: &'a [usize],
+    },
+    /// A recursively lowered Arrow selection. Flat dictionaries use scalar
+    /// traversal to avoid span-coalescing overhead for alternating keys; other
+    /// plans use spans for packed copies, popcounts, and repeated runs.
+    #[cfg(feature = "arrow")]
+    Plan {
+        bit_offset: usize,
+        plan: PhysicalIndexPlan<'a>,
+        scalar: bool,
+    },
+}
+
+#[cfg(feature = "arrow")]
+#[inline]
+fn put_repeated_bit(bit_writer: &mut BitWriter, bit: bool, count: usize) {
+    let word = if bit { u64::MAX } else { 0 };
+    let mut remaining = count;
+    while remaining >= 64 {
+        bit_writer.put_value(word, 64);
+        remaining -= 64;
+    }
+    if remaining != 0 {
+        let tail = if bit { (1_u64 << remaining) - 1 } else { 0 };
+        bit_writer.put_value(tail, remaining);
+    }
+}
+
+/// Borrowed packed boolean values.
+///
+/// Bits are addressed in the same least-significant-bit-first order used by
+/// Arrow boolean buffers and Parquet boolean encodings.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackedBoolValues<'a> {
+    /// Backing bit buffer for the packed (Arrow) selections. Unused by
+    /// [`PackedBoolSelection::Unpacked`], hence the non-`arrow` dead-code allow.
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    bytes: &'a [u8],
+    selection: PackedBoolSelection<'a>,
+}
+
+impl<'a> PackedBoolValues<'a> {
+    /// Wrap an unpacked `&[bool]` run — the slice `write_batch` path. Bits are packed
+    /// lazily when the encoder pulls them (`put_indexed_packed`), so this is
+    /// allocation-free and drives through the same boolean [`Sink`] as Arrow input.
+    pub(crate) fn from_bool_slice(values: &'a [bool]) -> Self {
+        Self {
+            bytes: &[],
+            selection: PackedBoolSelection::Unpacked { values },
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn new_physical(
+        bytes: &'a [u8],
+        bit_offset: usize,
+        plan: PhysicalIndexPlan<'a>,
+    ) -> Self {
+        let selection = match plan.direct_physical_range() {
+            Some(range) => PackedBoolSelection::Dense {
+                bit_offset: bit_offset + range.start,
+                len: range.len(),
+            },
+            None => match plan.unmapped_selection() {
+                Some(ValueSelectionRef::Sparse(indices)) => PackedBoolSelection::Sparse {
+                    bit_offset,
+                    indices,
+                },
+                _ => PackedBoolSelection::Plan {
+                    bit_offset,
+                    plan,
+                    scalar: plan.has_dictionary_mapping() && !plan.is_grouped(),
+                },
+            },
+        };
+        Self { bytes, selection }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self.selection {
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Dense { len, .. } => len,
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Sparse { indices, .. } => indices.len(),
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Plan { plan, .. } => plan.len(),
+            PackedBoolSelection::Unpacked { values } => values.len(),
+        }
+    }
+
+    /// Resolve the selection and yield each selected bit. `Unpacked` is placed
+    /// last to keep the Arrow arms grouped together.
+    #[inline]
+    fn for_each(self, mut f: impl FnMut(bool)) {
+        match self.selection {
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Dense { bit_offset, len } => {
+                for index in 0..len {
+                    f(get_bit(self.bytes, bit_offset + index));
+                }
+            }
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Sparse {
+                bit_offset,
+                indices,
+            } => {
+                for &index in indices {
+                    f(get_bit(self.bytes, bit_offset + index));
+                }
+            }
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Plan {
+                bit_offset, plan, ..
+            } => {
+                let bytes = self.bytes;
+                let _ = plan.try_for_each_index(|index| -> Result<(), ()> {
+                    f(get_bit(bytes, bit_offset + index));
+                    Ok(())
+                });
+            }
+            PackedBoolSelection::Unpacked { values } => {
+                for &b in values {
+                    f(b);
+                }
+            }
+        }
+    }
+
+    /// Yield source-provided run groups. Run-end input can produce multi-bit
+    /// groups; every other selection emits one group per bit. Adjacent groups
+    /// may contain the same value because grouping follows storage, not value
+    /// equality.
+    #[inline]
+    fn for_each_run_group(self, mut f: impl FnMut(bool, usize)) {
+        match self.selection {
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Plan {
+                bit_offset, plan, ..
+            } if plan.is_grouped() => {
+                let bytes = self.bytes;
+                let _ = plan.try_for_each_index_group(|index, count| -> Result<(), ()> {
+                    f(get_bit(bytes, bit_offset + index), count);
+                    Ok(())
+                });
+            }
+            _ => self.for_each(|b| f(b, 1)),
+        }
+    }
+
+    #[inline]
+    fn put_indexed_packed(self, bit_writer: &mut BitWriter) {
+        #[cfg(feature = "arrow")]
+        match self.selection {
+            PackedBoolSelection::Dense { bit_offset, len } => {
+                bit_writer.put_bits(self.bytes, bit_offset, len);
+                return;
+            }
+            PackedBoolSelection::Plan {
+                bit_offset,
+                plan,
+                scalar: false,
+            } => {
+                let _: Result<(), ()> = plan.try_for_each_span(|span| {
+                    match span {
+                        IndexSpan::Range { start, len } => {
+                            bit_writer.put_bits(self.bytes, bit_offset + start, len);
+                        }
+                        IndexSpan::Repeat { index, count } => {
+                            let bit = get_bit(self.bytes, bit_offset + index);
+                            put_repeated_bit(bit_writer, bit, count);
+                        }
+                    }
+                    Ok(())
+                });
+                return;
+            }
+            _ => {}
+        }
+        // Stream the selected bits once, packing them LSB-first into words.
+        let mut word: u64 = 0;
+        let mut bits: usize = 0;
+        self.for_each(|b| {
+            word |= (b as u64) << bits;
+            bits += 1;
+            if bits == 64 {
+                bit_writer.put_value(word, 64);
+                word = 0;
+                bits = 0;
+            }
+        });
+        if bits > 0 {
+            bit_writer.put_value(word, bits);
+        }
+    }
+
+    pub(crate) fn true_count(self) -> usize {
+        match self.selection {
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Dense { bit_offset, len } => {
+                UnalignedBitChunk::new(self.bytes, bit_offset, len).count_ones()
+            }
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Sparse {
+                bit_offset,
+                indices,
+            } => indices
+                .iter()
+                .filter(|&&index| get_bit(self.bytes, bit_offset + index))
+                .count(),
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Plan { scalar: true, .. } => {
+                let mut count = 0;
+                self.for_each(|value| count += usize::from(value));
+                count
+            }
+            #[cfg(feature = "arrow")]
+            PackedBoolSelection::Plan {
+                bit_offset,
+                plan,
+                scalar: false,
+            } => {
+                let mut count = 0;
+                let _: Result<(), ()> = plan.try_for_each_span(|span| {
+                    match span {
+                        IndexSpan::Range { start, len } => {
+                            count += UnalignedBitChunk::new(self.bytes, bit_offset + start, len)
+                                .count_ones();
+                        }
+                        IndexSpan::Repeat {
+                            index,
+                            count: repeated,
+                        } => {
+                            count += repeated * get_bit(self.bytes, bit_offset + index) as usize;
+                        }
+                    }
+                    Ok(())
+                });
+                count
+            }
+            // Unpacked (slice path): no bitmap to popcount, so count directly.
+            PackedBoolSelection::Unpacked { values } => values.iter().filter(|b| **b).count(),
+        }
+    }
+}
+/// Values per gathered/expanded numeric batch. Bounds peak memory on the gather
+/// path while amortizing the out-of-line `commit` boundary.
+#[cfg(feature = "arrow")]
+pub(crate) const NUMERIC_BATCH_VALUES: usize = 64;
+
+/// One batch of scalar numeric values handed to the numeric [`Sink`]. `Flat`
+/// contains one value per logical output; `RunGroups` pairs each selected run
+/// value with its logical count. These correspond to byte-array's two batch
+/// shapes and FLBA's gathered/run-group shapes. `Flat` may borrow a dense Arrow
+/// slice or producer-owned scratch; `RunGroups` borrows value/count scratch.
+#[derive(Clone, Copy)]
+pub(crate) enum NumericBatch<'c, T> {
+    /// One logical output per value.
+    Flat(&'c [T]),
+    /// A bounded tile of selected run groups: `values[i]` spans `counts[i]`
+    /// logical outputs. Every count is non-zero and nulls were already removed
+    /// by selection planning.
+    #[cfg(feature = "arrow")]
+    RunGroups {
+        values: &'c [T],
+        counts: &'c [usize],
+    },
+}
+
+/// Emit one recursively lowered Arrow physical-index plan. Identity ranges stay
+/// borrowed and repeated/run-mapped positions cross as run groups.
+#[cfg(feature = "arrow")]
+pub(crate) fn emit_physical_identity<'source, T, S>(
+    sink: &mut S,
+    values: &'source [T],
+    plan: PhysicalIndexPlan<'source>,
+) -> Result<()>
+where
+    T: Copy + 'static,
+    S: for<'batch> Sink<NumericBatch<'batch, T>>,
+{
+    if plan.is_grouped() {
+        return emit_physical_cast(sink, values, plan, |value| value);
+    }
+
+    if let Some(selection) = plan.unmapped_selection() {
+        return match selection {
+            ValueSelectionRef::Empty => Ok(()),
+            ValueSelectionRef::Dense { offset, len } => {
+                if len != 0 {
+                    sink.commit(NumericBatch::Flat(&values[offset..offset + len]))?;
+                }
+                Ok(())
+            }
+            ValueSelectionRef::Ranges(ranges) => ranges.try_for_each_range(|offset, len| {
+                sink.commit(NumericBatch::Flat(&values[offset..offset + len]))
+            }),
+            ValueSelectionRef::Sparse(_) => emit_physical_cast(sink, values, plan, |value| value),
+            ValueSelectionRef::Grouped(_) => unreachable!("grouped plans handled above"),
+        };
+    }
+
+    if let Some(range) = plan.direct_physical_range() {
+        return sink.commit(NumericBatch::Flat(&values[range]));
+    }
+
+    plan.try_for_each_span(|span| match span {
+        IndexSpan::Range { start, len } => {
+            if len != 0 {
+                sink.commit(NumericBatch::Flat(&values[start..start + len]))?;
+            }
+            Ok(())
+        }
+        IndexSpan::Repeat { index, count } => sink.commit(NumericBatch::RunGroups {
+            values: &values[index..index + 1],
+            counts: &[count],
+        }),
+    })
+}
+
+/// Cast one recursively lowered Arrow physical-index plan. Run-backed input is
+/// gathered as bounded `(value, count)` groups; non-run input is gathered into
+/// bounded flat tiles.
+#[cfg(feature = "arrow")]
+pub(crate) fn emit_physical_cast<'source, T, D, F, S>(
+    sink: &mut S,
+    data: &'source [D],
+    plan: PhysicalIndexPlan<'source>,
+    cast: F,
+) -> Result<()>
+where
+    T: Copy + 'static,
+    D: Copy,
+    F: Fn(D) -> T + Copy,
+    S: for<'batch> Sink<NumericBatch<'batch, T>>,
+{
+    let values = map_values(plan, |index| cast(data[index]));
+    if plan.is_grouped() {
+        gather_run_groups_tiled::<NUMERIC_BATCH_VALUES, _, _>(values, |values, counts| {
+            sink.commit(NumericBatch::RunGroups { values, counts })
+        })
+    } else {
+        gather_tiled::<NUMERIC_BATCH_VALUES, _, _, _>(values, |values| {
+            sink.commit(NumericBatch::Flat(values))
+        })
+    }
+}
+
+/// Borrowed fixed-length byte-array values.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FixedLenByteArrayValues<'a> {
+    bytes: &'a [u8],
+    type_length: usize,
+    len: usize,
+}
+
+impl<'a> FixedLenByteArrayValues<'a> {
+    pub(crate) fn new(bytes: &'a [u8], type_length: usize, len: usize) -> Self {
+        assert_eq!(
+            bytes.len(),
+            type_length
+                .checked_mul(len)
+                .expect("fixed-length byte-array values length overflow")
+        );
+        Self {
+            bytes,
+            type_length,
+            len,
+        }
+    }
+
+    pub(crate) fn iter(self) -> impl ExactSizeIterator<Item = &'a [u8]> {
+        (0..self.len).map(move |idx| {
+            let start = idx * self.type_length;
+            &self.bytes[start..start + self.type_length]
+        })
+    }
+}
+
+/// Encoder extension for packed boolean values.
+#[doc(hidden)]
+pub(crate) trait BoolEncoder: Encoder<BoolType> {
+    fn put_packed_bool(&mut self, _values: PackedBoolValues<'_>) -> Result<()> {
+        Err(general_err!(
+            "Packed boolean values are not supported by this encoder"
+        ))
+    }
+}
+
+/// Encoder extension for raw fixed-length byte-array values.
+#[doc(hidden)]
+pub(crate) trait FixedLenByteArrayEncoder: Encoder<FixedLenByteArrayType> {
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        for value in values.iter() {
+            let value = FixedLenByteArray::from(ByteArray::from(value.to_vec()));
+            self.put(std::slice::from_ref(&value))?;
+        }
+        Ok(())
+    }
+
+    /// Reserve room for `additional_bytes` of appended fixed-length values.
+    fn reserve_fixed_len(&mut self, _additional_bytes: usize) {}
+
+    /// Append one fixed-length value to the encoder.
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.put_fixed_len_byte_array(FixedLenByteArrayValues::new(value, value.len(), 1))
+    }
+}
+
 /// Gets a encoder for the particular data type `T` and encoding `encoding`. Memory usage
 /// for the encoder instance is tracked by `mem_tracker`.
+#[cfg(any(test, feature = "test_common", feature = "experimental"))]
 pub fn get_encoder<T: DataType>(
     encoding: Encoding,
     descr: &ColumnDescPtr,
@@ -104,6 +541,328 @@ pub fn get_encoder<T: DataType>(
         e => return Err(nyi_err!("Encoding {} is not supported", e)),
     };
     Ok(encoder)
+}
+
+/// The cold, dict-aware surface of a column's value encoder. The flat per-family
+/// encoder enums implement it so the generic `ColumnValueEncoderImpl` can flush and
+/// size a column without knowing which encoding is active. The hot per-value path is
+/// *not* here — the family `Sink`s match the concrete enum's `Dictionary` variant
+/// directly (a 2-way branch), so this adds no dispatch to the value loop.
+pub(crate) trait ColumnEncode<T: DataType>: Sized {
+    /// Build the initial encoder: the dictionary when supported (eagerly validating
+    /// the fallback encoding so an unsupported one fails fast at construction),
+    /// otherwise the configured fallback encoding.
+    fn new_column_encoder(
+        dict_supported: bool,
+        fallback_encoding: Encoding,
+        descr: &ColumnDescPtr,
+    ) -> Result<Self>;
+    /// Whether the active encoding is the dictionary.
+    fn is_dictionary(&self) -> bool;
+    /// If dictionary-encoding, serialize the dictionary page as `(buf, num_values,
+    /// is_sorted)` and transition in place to the fallback encoding (dictionary
+    /// fallback); otherwise `None`.
+    fn take_dict_page(
+        &mut self,
+        fallback_encoding: Encoding,
+        descr: &ColumnDescPtr,
+    ) -> Result<Option<(Bytes, usize, bool)>>;
+    /// Serialize and reset the current data page: `(buf, encoding)`.
+    fn flush_data_page(&mut self) -> Result<(Bytes, Encoding)>;
+    /// Encoded dictionary-page size, or `None` when not dictionary-encoding.
+    fn dict_page_size(&self) -> Option<usize>;
+    /// Estimated encoded data-page size.
+    fn data_page_size(&self) -> usize;
+    /// Estimated heap footprint.
+    fn memory_size(&self) -> usize;
+}
+
+/// Builds a flat per-family value-encoder enum: the `Dictionary` variant (the
+/// column-chunk-spanning dictionary) plus the non-dictionary page encodings as peers.
+/// The object-safe [`Encoder`] forwarding covers only the non-dictionary variants —
+/// the `Dictionary` variant is never routed through `Encoder` (the family `Sink`
+/// special-cases it) — and the cold [`ColumnEncode`] surface handles dictionary-aware
+/// flushing/sizing. Each family provides an inherent `from_encoding` (its
+/// descriptor-aware BYTE_STREAM_SPLIT constructor differs).
+macro_rules! column_encoder {
+    ($name:ident $(<$generic:ident : $bound:path>)?, $ty:ty, $bss:ty) => {
+        pub(crate) enum $name $(<$generic: $bound>)? {
+            Dictionary(DictEncoder<$ty>),
+            Plain(PlainEncoder<$ty>),
+            Rle(RleValueEncoder<$ty>),
+            DeltaBinaryPacked(Box<DeltaBitPackEncoder<$ty>>),
+            DeltaLengthByteArray(Box<DeltaLengthByteArrayEncoder<$ty>>),
+            DeltaByteArray(Box<DeltaByteArrayEncoder<$ty>>),
+            ByteStreamSplit($bss),
+        }
+
+        impl $(<$generic: $bound>)? Encoder<$ty> for $name $(<$generic>)? {
+            fn put(&mut self, values: &[<$ty as DataType>::T]) -> Result<()> {
+                match self {
+                    Self::Dictionary(_) => unreachable!("dictionary variant is not routed through Encoder"),
+                    Self::Plain(e) => e.put(values),
+                    Self::Rle(e) => e.put(values),
+                    Self::DeltaBinaryPacked(e) => e.put(values),
+                    Self::DeltaLengthByteArray(e) => e.put(values),
+                    Self::DeltaByteArray(e) => e.put(values),
+                    Self::ByteStreamSplit(e) => e.put(values),
+                }
+            }
+
+            fn encoding(&self) -> Encoding {
+                match self {
+                    Self::Dictionary(_) => unreachable!("dictionary variant is not routed through Encoder"),
+                    Self::Plain(e) => e.encoding(),
+                    Self::Rle(e) => e.encoding(),
+                    Self::DeltaBinaryPacked(e) => e.encoding(),
+                    Self::DeltaLengthByteArray(e) => e.encoding(),
+                    Self::DeltaByteArray(e) => e.encoding(),
+                    Self::ByteStreamSplit(e) => e.encoding(),
+                }
+            }
+
+            fn estimated_data_encoded_size(&self) -> usize {
+                match self {
+                    Self::Dictionary(_) => unreachable!("dictionary variant is not routed through Encoder"),
+                    Self::Plain(e) => e.estimated_data_encoded_size(),
+                    Self::Rle(e) => e.estimated_data_encoded_size(),
+                    Self::DeltaBinaryPacked(e) => e.estimated_data_encoded_size(),
+                    Self::DeltaLengthByteArray(e) => e.estimated_data_encoded_size(),
+                    Self::DeltaByteArray(e) => e.estimated_data_encoded_size(),
+                    Self::ByteStreamSplit(e) => e.estimated_data_encoded_size(),
+                }
+            }
+
+            fn estimated_memory_size(&self) -> usize {
+                match self {
+                    Self::Dictionary(_) => unreachable!("dictionary variant is not routed through Encoder"),
+                    Self::Plain(e) => e.estimated_memory_size(),
+                    Self::Rle(e) => e.estimated_memory_size(),
+                    Self::DeltaBinaryPacked(e) => e.estimated_memory_size(),
+                    Self::DeltaLengthByteArray(e) => e.estimated_memory_size(),
+                    Self::DeltaByteArray(e) => e.estimated_memory_size(),
+                    Self::ByteStreamSplit(e) => e.estimated_memory_size(),
+                }
+            }
+
+            fn flush_buffer(&mut self) -> Result<Bytes> {
+                match self {
+                    Self::Dictionary(_) => unreachable!("dictionary variant is not routed through Encoder"),
+                    Self::Plain(e) => e.flush_buffer(),
+                    Self::Rle(e) => e.flush_buffer(),
+                    Self::DeltaBinaryPacked(e) => e.flush_buffer(),
+                    Self::DeltaLengthByteArray(e) => e.flush_buffer(),
+                    Self::DeltaByteArray(e) => e.flush_buffer(),
+                    Self::ByteStreamSplit(e) => e.flush_buffer(),
+                }
+            }
+        }
+
+        impl<D $(, $generic)?> ColumnEncode<D> for $name $(<$generic>)?
+        where
+            D: DataType<T = <$ty as DataType>::T>,
+            $($generic: $bound,)?
+        {
+            fn new_column_encoder(
+                dict_supported: bool,
+                fallback_encoding: Encoding,
+                descr: &ColumnDescPtr,
+            ) -> Result<Self> {
+                if dict_supported {
+                    // Eagerly validate the fallback encoding (fail fast on an
+                    // unsupported one) and initialize the dictionary.
+                    Self::from_encoding(fallback_encoding, descr)?;
+                    Ok(Self::Dictionary(DictEncoder::new(descr.clone())))
+                } else {
+                    Self::from_encoding(fallback_encoding, descr)
+                }
+            }
+
+            fn is_dictionary(&self) -> bool {
+                matches!(self, Self::Dictionary(_))
+            }
+
+            fn take_dict_page(
+                &mut self,
+                fallback_encoding: Encoding,
+                descr: &ColumnDescPtr,
+            ) -> Result<Option<(Bytes, usize, bool)>> {
+                if !<Self as ColumnEncode<D>>::is_dictionary(self) {
+                    return Ok(None);
+                }
+                // Abandon the dictionary by building the fallback encoder,
+                // swapping it in, and consuming the extracted dictionary into
+                // its page.
+                let fallback = Self::from_encoding(fallback_encoding, descr)?;
+                let Self::Dictionary(dict) = std::mem::replace(self, fallback) else {
+                    unreachable!("is_dictionary checked above");
+                };
+                let num_values = dict.num_entries();
+                let is_sorted = dict.is_sorted();
+                let buf = dict.write_dict()?;
+                Ok(Some((buf, num_values, is_sorted)))
+            }
+
+            fn flush_data_page(&mut self) -> Result<(Bytes, Encoding)> {
+                match self {
+                    Self::Dictionary(dict) => Ok((dict.write_indices()?, Encoding::RLE_DICTIONARY)),
+                    other => Ok((
+                        <Self as Encoder<$ty>>::flush_buffer(other)?,
+                        <Self as Encoder<$ty>>::encoding(other),
+                    )),
+                }
+            }
+
+            fn dict_page_size(&self) -> Option<usize> {
+                match self {
+                    Self::Dictionary(dict) => Some(dict.dict_encoded_size()),
+                    _ => None,
+                }
+            }
+
+            fn data_page_size(&self) -> usize {
+                match self {
+                    Self::Dictionary(dict) => {
+                        <DictEncoder<$ty> as Encoder<$ty>>::estimated_data_encoded_size(dict)
+                    }
+                    other => <Self as Encoder<$ty>>::estimated_data_encoded_size(other),
+                }
+            }
+
+            fn memory_size(&self) -> usize {
+                match self {
+                    Self::Dictionary(dict) => {
+                        <DictEncoder<$ty> as Encoder<$ty>>::estimated_memory_size(dict)
+                    }
+                    other => <Self as Encoder<$ty>>::estimated_memory_size(other),
+                }
+            }
+
+        }
+    };
+}
+
+/// Shared encoding selection for static-dispatch encoder objects.
+///
+/// This mirrors [`get_encoder`], but returns concrete enum variants instead of
+/// `Box<dyn Encoder<_>>`. Callers provide the `BYTE_STREAM_SPLIT` arm because
+/// fixed-length byte arrays need a descriptor-aware encoder there.
+macro_rules! encoder_object_from_encoding {
+    ($encoding:expr, $bss:expr $(,)?) => {
+        match $encoding {
+            Encoding::PLAIN => Self::Plain(PlainEncoder::new()),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                return Err(general_err!(
+                    "Cannot initialize this encoding through this function"
+                ));
+            }
+            Encoding::RLE => Self::Rle(RleValueEncoder::new()),
+            Encoding::DELTA_BINARY_PACKED => Self::DeltaBinaryPacked(Box::default()),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => Self::DeltaLengthByteArray(Box::default()),
+            Encoding::DELTA_BYTE_ARRAY => Self::DeltaByteArray(Box::default()),
+            Encoding::BYTE_STREAM_SPLIT => $bss,
+            e => return Err(nyi_err!("Encoding {} is not supported", e)),
+        }
+    };
+}
+
+column_encoder!(
+    BoolColumnEncoder,
+    BoolType,
+    ByteStreamSplitEncoder<BoolType>
+);
+
+impl BoolEncoder for BoolColumnEncoder {
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        match self {
+            Self::Dictionary(_) => unreachable!("bool has no dictionary encoder"),
+            Self::Plain(e) => e.put_packed_bool(values),
+            Self::Rle(e) => e.put_packed_bool(values),
+            Self::DeltaBinaryPacked(e) => e.put_packed_bool(values),
+            Self::DeltaLengthByteArray(e) => e.put_packed_bool(values),
+            Self::DeltaByteArray(e) => e.put_packed_bool(values),
+            Self::ByteStreamSplit(e) => e.put_packed_bool(values),
+        }
+    }
+}
+impl BoolColumnEncoder {
+    fn from_encoding(encoding: Encoding, _descr: &ColumnDescPtr) -> Result<Self> {
+        Ok(encoder_object_from_encoding!(
+            encoding,
+            Self::ByteStreamSplit(ByteStreamSplitEncoder::new())
+        ))
+    }
+}
+
+column_encoder!(
+    FlbaColumnEncoder,
+    FixedLenByteArrayType,
+    VariableWidthByteStreamSplitEncoder<FixedLenByteArrayType>
+);
+
+impl FixedLenByteArrayEncoder for FlbaColumnEncoder {
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        match self {
+            Self::Dictionary(_) => {
+                unreachable!("dictionary variant is not routed through the fallback encoder")
+            }
+            Self::Plain(e) => e.put_fixed_len_byte_array(values),
+            Self::Rle(e) => e.put_fixed_len_byte_array(values),
+            Self::DeltaBinaryPacked(e) => e.put_fixed_len_byte_array(values),
+            Self::DeltaLengthByteArray(e) => e.put_fixed_len_byte_array(values),
+            Self::DeltaByteArray(e) => e.put_fixed_len_byte_array(values),
+            Self::ByteStreamSplit(e) => e.put_fixed_len_byte_array(values),
+        }
+    }
+
+    fn reserve_fixed_len(&mut self, additional_bytes: usize) {
+        match self {
+            Self::Dictionary(_) => {
+                unreachable!("dictionary variant is not routed through the fallback encoder")
+            }
+            Self::Plain(e) => e.reserve_fixed_len(additional_bytes),
+            Self::Rle(e) => e.reserve_fixed_len(additional_bytes),
+            Self::DeltaBinaryPacked(e) => e.reserve_fixed_len(additional_bytes),
+            Self::DeltaLengthByteArray(e) => e.reserve_fixed_len(additional_bytes),
+            Self::DeltaByteArray(e) => e.reserve_fixed_len(additional_bytes),
+            Self::ByteStreamSplit(e) => e.reserve_fixed_len(additional_bytes),
+        }
+    }
+
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        match self {
+            Self::Dictionary(_) => {
+                unreachable!("dictionary variant is not routed through the fallback encoder")
+            }
+            Self::Plain(e) => e.append_fixed_len_value(value),
+            Self::Rle(e) => e.append_fixed_len_value(value),
+            Self::DeltaBinaryPacked(e) => e.append_fixed_len_value(value),
+            Self::DeltaLengthByteArray(e) => e.append_fixed_len_value(value),
+            Self::DeltaByteArray(e) => e.append_fixed_len_value(value),
+            Self::ByteStreamSplit(e) => e.append_fixed_len_value(value),
+        }
+    }
+}
+impl FlbaColumnEncoder {
+    fn from_encoding(encoding: Encoding, descr: &ColumnDescPtr) -> Result<Self> {
+        Ok(encoder_object_from_encoding!(
+            encoding,
+            Self::ByteStreamSplit(VariableWidthByteStreamSplitEncoder::new(
+                descr.type_length()
+            ))
+        ))
+    }
+}
+
+column_encoder!(NumericColumnEncoder<T: DataType>, T, ByteStreamSplitEncoder<T>);
+
+impl<T: DataType> NumericColumnEncoder<T> {
+    fn from_encoding(encoding: Encoding, _descr: &ColumnDescPtr) -> Result<Self> {
+        Ok(encoder_object_from_encoding!(
+            encoding,
+            Self::ByteStreamSplit(ByteStreamSplitEncoder::new())
+        ))
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -173,6 +932,37 @@ impl<T: DataType> Encoder<T> for PlainEncoder<T> {
     /// Return the estimated memory size of this encoder.
     fn estimated_memory_size(&self) -> usize {
         self.buffer.capacity() * std::mem::size_of::<u8>() + self.bit_writer.estimated_memory_size()
+    }
+}
+
+impl BoolEncoder for PlainEncoder<BoolType> {
+    #[inline]
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        values.put_indexed_packed(&mut self.bit_writer);
+        Ok(())
+    }
+}
+
+impl FixedLenByteArrayEncoder for PlainEncoder<FixedLenByteArrayType> {
+    #[inline]
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        self.buffer.extend_from_slice(values.bytes);
+        Ok(())
+    }
+
+    /// PLAIN stores fixed-length values back-to-back, so each streamed value is
+    /// appended straight into the page buffer — one copy, no intermediate buffer.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn reserve_fixed_len(&mut self, additional_bytes: usize) {
+        self.buffer.reserve(additional_bytes);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(value);
+        Ok(())
     }
 }
 
@@ -267,6 +1057,25 @@ impl<T: DataType> Encoder<T> for RleValueEncoder<T> {
             .map_or(0, |enc| enc.estimated_memory_size())
     }
 }
+
+impl BoolEncoder for RleValueEncoder<BoolType> {
+    #[inline(never)]
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        let rle_encoder = self.encoder.get_or_insert_with(|| {
+            let mut buffer = Vec::with_capacity(DEFAULT_RLE_BUFFER_LEN);
+            // Reserve space for length
+            buffer.extend_from_slice(&[0; 4]);
+            RleEncoder::new_from_buf(1, buffer)
+        });
+
+        // Run-end input emits one O(1) put per selected run group; every other
+        // selection emits per-bit puts.
+        values.for_each_run_group(|b, n| rle_encoder.put_run(b as u64, n));
+        Ok(())
+    }
+}
+
+impl FixedLenByteArrayEncoder for RleValueEncoder<FixedLenByteArrayType> {}
 
 // ----------------------------------------------------------------------
 // DELTA_BINARY_PACKED encoding
@@ -433,30 +1242,43 @@ impl<T: DataType> DeltaBitPackEncoder<T> {
         );
         Ok(())
     }
-}
 
-// Implementation is shared between Int32Type and Int64Type,
-// see `DeltaBitPackEncoderConversion` below for specifics.
-impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
-    fn put(&mut self, values: &[T::T]) -> Result<()> {
-        if values.is_empty() {
+    #[inline]
+    pub(crate) fn put_i64(&mut self, value: i64) -> Result<()> {
+        if self.total_values == 0 {
+            self.first_value = value;
+            self.current_value = value;
+            self.total_values = 1;
             return Ok(());
         }
 
-        // Define values to encode, initialize state
+        self.total_values += 1;
+        self.deltas[self.values_in_block] = self.subtract(value, self.current_value);
+        self.current_value = value;
+        self.values_in_block += 1;
+        if self.values_in_block == self.block_size {
+            self.flush_block_values()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn put_i64_values(&mut self, len: usize, mut value_at: impl FnMut(usize) -> i64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
         let mut idx = if self.total_values == 0 {
-            self.first_value = self.as_i64(values, 0);
+            self.first_value = value_at(0);
             self.current_value = self.first_value;
             1
         } else {
             0
         };
-        // Add all values (including first value)
-        self.total_values += values.len();
+        self.total_values += len;
 
-        // Write block
-        while idx < values.len() {
-            let value = self.as_i64(values, idx);
+        while idx < len {
+            let value = value_at(idx);
             self.deltas[self.values_in_block] = self.subtract(value, self.current_value);
             self.current_value = value;
             idx += 1;
@@ -466,6 +1288,16 @@ impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
             }
         }
         Ok(())
+    }
+}
+
+// Implementation is shared between Int32Type and Int64Type,
+// see `DeltaBitPackEncoderConversion` below for specifics.
+impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
+    fn put(&mut self, values: &[T::T]) -> Result<()> {
+        self.put_i64_values(values.len(), |idx| {
+            values[idx].as_i64().expect(DELTA_BIT_PACK_TYPE_ERROR)
+        })
     }
 
     // Performance Note:
@@ -510,12 +1342,13 @@ impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
     }
 }
 
+impl BoolEncoder for DeltaBitPackEncoder<BoolType> {}
+impl FixedLenByteArrayEncoder for DeltaBitPackEncoder<FixedLenByteArrayType> {}
+
 /// Helper trait to define specific conversions and subtractions when computing deltas
 trait DeltaBitPackEncoderConversion<T: DataType> {
     // Method should panic if type is not supported, otherwise no-op
     fn assert_supported_type();
-
-    fn as_i64(&self, values: &[T::T], index: usize) -> i64;
 
     fn subtract(&self, left: i64, right: i64) -> i64;
 
@@ -529,11 +1362,6 @@ impl<T: DataType> DeltaBitPackEncoderConversion<T> for DeltaBitPackEncoder<T> {
     #[inline]
     fn assert_supported_type() {
         ensure_phys_ty!(Type::INT32 | Type::INT64, "{}", DELTA_BIT_PACK_TYPE_ERROR);
-    }
-
-    #[inline]
-    fn as_i64(&self, values: &[T::T], index: usize) -> i64 {
-        values[index].as_i64().expect(DELTA_BIT_PACK_TYPE_ERROR)
     }
 
     #[inline]
@@ -566,8 +1394,9 @@ impl<T: DataType> DeltaBitPackEncoderConversion<T> for DeltaBitPackEncoder<T> {
 pub struct DeltaLengthByteArrayEncoder<T: DataType> {
     // length encoder
     len_encoder: DeltaBitPackEncoder<Int32Type>,
-    // byte array data
-    data: Vec<ByteArray>,
+    // concatenated value bytes, appended directly (no per-value `ByteArray`
+    // allocation); the lengths in `len_encoder` delimit them.
+    data: Vec<u8>,
     // data size in bytes of encoded values
     encoded_size: usize,
     _phantom: PhantomData<T>,
@@ -589,6 +1418,20 @@ impl<T: DataType> DeltaLengthByteArrayEncoder<T> {
             _phantom: PhantomData,
         }
     }
+
+    /// Append a batch of byte slices already borrowed from a source buffer:
+    /// feed their lengths to the length encoder, then copy the bytes into the
+    /// contiguous data buffer — with no per-value `ByteArray` allocation. Used
+    /// by the fixed-width DELTA_BYTE_ARRAY suffix path.
+    fn put_byte_slices(&mut self, slices: &[&[u8]]) -> Result<()> {
+        let lengths: Vec<i32> = slices.iter().map(|s| s.len() as i32).collect();
+        self.len_encoder.put(&lengths)?;
+        for s in slices {
+            self.encoded_size += s.len();
+            self.data.extend_from_slice(s);
+        }
+        Ok(())
+    }
 }
 
 impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
@@ -608,7 +1451,7 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
         self.len_encoder.put(&lengths)?;
         for byte_array in val_it() {
             self.encoded_size += byte_array.len();
-            self.data.push(byte_array.clone());
+            self.data.extend_from_slice(byte_array.data());
         }
 
         Ok(())
@@ -635,9 +1478,7 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
         let mut total_bytes = vec![];
         let lengths = self.len_encoder.flush_buffer()?;
         total_bytes.extend_from_slice(&lengths);
-        self.data.iter().for_each(|byte_array| {
-            total_bytes.extend_from_slice(byte_array.data());
-        });
+        total_bytes.extend_from_slice(&self.data);
         self.data.clear();
         self.encoded_size = 0;
 
@@ -646,8 +1487,35 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
 
     /// return the estimated memory size of this encoder.
     fn estimated_memory_size(&self) -> usize {
-        self.len_encoder.estimated_memory_size() + self.data.len() + std::mem::size_of::<Self>()
+        self.len_encoder.estimated_memory_size()
+            + self.data.capacity()
+            + std::mem::size_of::<Self>()
     }
+}
+
+impl BoolEncoder for DeltaLengthByteArrayEncoder<BoolType> {}
+impl FixedLenByteArrayEncoder for DeltaLengthByteArrayEncoder<FixedLenByteArrayType> {
+    /// DELTA_LENGTH_BYTE_ARRAY is defined for BYTE_ARRAY only, and this crate's
+    /// own reader rejects it for FIXED_LEN_BYTE_ARRAY, so encoding one would
+    /// emit a page no conforming reader can decode. The impl exists solely to
+    /// satisfy the family enum's dispatch.
+    fn put_fixed_len_byte_array(&mut self, _values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        Err(unsupported_flba_delta_length())
+    }
+
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, _value: &[u8]) -> Result<()> {
+        Err(unsupported_flba_delta_length())
+    }
+}
+
+fn unsupported_flba_delta_length() -> ParquetError {
+    general_err!(
+        "Encoding {} is not supported for physical type {:?}",
+        Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        Type::FIXED_LEN_BYTE_ARRAY
+    )
 }
 
 // ----------------------------------------------------------------------
@@ -680,6 +1548,18 @@ impl<T: DataType> DeltaByteArrayEncoder<T> {
     }
 }
 
+/// Length of the byte prefix shared by `previous` and `current` — the
+/// DELTA_BYTE_ARRAY front-coding match length.
+#[inline]
+fn common_prefix_len(previous: &[u8], current: &[u8]) -> usize {
+    let max = cmp::min(previous.len(), current.len());
+    let mut n = 0;
+    while n < max && previous[n] == current[n] {
+        n += 1;
+    }
+    n
+}
+
 impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
     fn put(&mut self, values: &[T::T]) -> Result<()> {
         let mut prefix_lengths: Vec<i32> = vec![];
@@ -698,13 +1578,7 @@ impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
 
         for byte_array in values {
             let current = byte_array.data();
-            // Maximum prefix length that is shared between previous value and current
-            // value
-            let prefix_len = cmp::min(self.previous.len(), current.len());
-            let mut match_len = 0;
-            while match_len < prefix_len && self.previous[match_len] == current[match_len] {
-                match_len += 1;
-            }
+            let match_len = common_prefix_len(&self.previous, current);
             prefix_lengths.push(match_len as i32);
             suffixes.push(byte_array.slice(match_len, byte_array.len() - match_len));
             // Update previous for the next prefix
@@ -760,18 +1634,365 @@ impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
     }
 }
 
+impl BoolEncoder for DeltaByteArrayEncoder<BoolType> {}
+impl FixedLenByteArrayEncoder for DeltaByteArrayEncoder<FixedLenByteArrayType> {
+    /// Front-code a dense fixed-width run directly from the Arrow buffer.
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        let mut prefix_lengths: Vec<i32> = Vec::with_capacity(values.len);
+        // Suffixes are borrowed directly from the Arrow buffer — no per-value
+        // `ByteArray`/`to_vec` materialization; `put_byte_slices` copies them
+        // once into the suffix writer's contiguous buffer.
+        let mut suffixes: Vec<&[u8]> = Vec::with_capacity(values.len);
+        for current in values.iter() {
+            let match_len = common_prefix_len(&self.previous, current);
+            prefix_lengths.push(match_len as i32);
+            suffixes.push(&current[match_len..]);
+            self.previous.clear();
+            self.previous.extend_from_slice(current);
+        }
+        self.prefix_len_encoder.put(&prefix_lengths)?;
+        self.suffix_writer.put_byte_slices(&suffixes)?;
+        Ok(())
+    }
+
+    /// Front-code one streamed fixed-width value.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        let match_len = common_prefix_len(&self.previous, value);
+        self.prefix_len_encoder.put(&[match_len as i32])?;
+        self.suffix_writer.put_byte_slices(&[&value[match_len..]])?;
+        self.previous.clear();
+        self.previous.extend_from_slice(value);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::sync::Arc;
 
+    #[cfg(feature = "arrow")]
+    use crate::column::value::{DictionaryKeys, RangesSelectionRef, SelectionRange};
     use crate::encodings::decoding::{Decoder, DictDecoder, PlainDecoder, get_decoder};
     use crate::schema::types::{ColumnDescPtr, ColumnDescriptor, ColumnPath, Type as SchemaType};
     use crate::util::bit_util;
     use crate::util::test_common::rand_gen::{RandGen, random_bytes};
 
     const TEST_SET_SIZE: usize = 1024;
+
+    #[cfg(feature = "arrow")]
+    #[derive(Debug, PartialEq, Eq)]
+    enum CollectedBatch {
+        Flat(usize),
+        RunGroups(usize),
+    }
+
+    #[cfg(feature = "arrow")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct NoDefaultNumeric(i32);
+
+    /// A test [`Sink`] that reconstructs the logical values a numeric emitter
+    /// writes — expanding run-group batches and flat batches alike
+    /// into one flat vector of logical values.
+    #[cfg(feature = "arrow")]
+    struct CollectSink<T> {
+        got: Vec<T>,
+        batches: Vec<CollectedBatch>,
+    }
+
+    #[cfg(feature = "arrow")]
+    impl<'batch, T: Copy + 'static> Sink<NumericBatch<'batch, T>> for CollectSink<T> {
+        fn commit(&mut self, values: NumericBatch<'batch, T>) -> Result<()> {
+            match values {
+                NumericBatch::Flat(values) => {
+                    self.batches.push(CollectedBatch::Flat(values.len()));
+                    self.got.extend_from_slice(values);
+                }
+                NumericBatch::RunGroups { values, counts } => {
+                    self.batches.push(CollectedBatch::RunGroups(values.len()));
+                    for (&value, &count) in values.iter().zip(counts) {
+                        for _ in 0..count {
+                            self.got.push(value);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    fn collect<T: Copy + 'static>(
+        f: impl FnOnce(&mut CollectSink<T>) -> Result<()>,
+    ) -> CollectSink<T> {
+        let mut sink = CollectSink {
+            got: Vec::new(),
+            batches: Vec::new(),
+        };
+        f(&mut sink).unwrap();
+        sink
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn emit_int32_ranges_borrow_one_batch_per_span() {
+        let values: Vec<i32> = (0..130).collect();
+
+        let dense = collect(|sink| {
+            emit_physical_identity(
+                sink,
+                &values,
+                PhysicalIndexPlan::identity(ValueSelectionRef::Dense {
+                    offset: 0,
+                    len: values.len(),
+                }),
+            )
+        });
+        assert_eq!(dense.batches, [CollectedBatch::Flat(130)]);
+
+        let spans = [SelectionRange::new(2..6, 4), SelectionRange::new(10..15, 9)];
+        let ranges = RangesSelectionRef::new(&spans, 9);
+        let output = collect(|sink| {
+            emit_physical_identity(
+                sink,
+                &values,
+                PhysicalIndexPlan::identity(ValueSelectionRef::Ranges(ranges)),
+            )
+        });
+
+        assert_eq!(output.got, (2..6).chain(10..15).collect::<Vec<_>>());
+        assert_eq!(
+            output.batches,
+            [CollectedBatch::Flat(4), CollectedBatch::Flat(5)]
+        );
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn numeric_gather_does_not_require_default_values() {
+        let raw: Vec<i32> = (0..130).collect();
+        let expected: Vec<_> = raw.iter().copied().map(NoDefaultNumeric).collect();
+
+        let cast = collect(|sink| {
+            emit_physical_cast(
+                sink,
+                &raw,
+                PhysicalIndexPlan::identity(ValueSelectionRef::Dense {
+                    offset: 0,
+                    len: raw.len(),
+                }),
+                NoDefaultNumeric,
+            )
+        });
+        assert_eq!(cast.got, expected);
+        assert_eq!(
+            cast.batches,
+            [
+                CollectedBatch::Flat(64),
+                CollectedBatch::Flat(64),
+                CollectedBatch::Flat(2),
+            ]
+        );
+
+        let indices = (0..expected.len()).collect::<Vec<_>>();
+        let ends = (1..=expected.len()).collect::<Vec<_>>();
+        let plan = PhysicalIndexPlan::identity(ValueSelectionRef::Grouped(
+            GroupedSelectionRef::new(&indices, &ends),
+        ));
+        let grouped = collect(|sink| emit_physical_identity(sink, &expected, plan));
+        assert_eq!(grouped.got, expected);
+        assert_eq!(
+            grouped.batches,
+            [
+                CollectedBatch::RunGroups(64),
+                CollectedBatch::RunGroups(64),
+                CollectedBatch::RunGroups(2),
+            ]
+        );
+
+        let keys: Vec<i32> = (0..raw.len() as i32).collect();
+        let plan = PhysicalIndexPlan::dictionary(
+            ValueSelectionRef::Dense {
+                offset: 0,
+                len: keys.len(),
+            },
+            DictionaryKeys::I32(&keys),
+        );
+        let mapped = collect(|sink| emit_physical_cast(sink, &raw, plan, NoDefaultNumeric));
+        assert_eq!(mapped.got, expected);
+        assert_eq!(
+            mapped.batches,
+            [
+                CollectedBatch::Flat(64),
+                CollectedBatch::Flat(64),
+                CollectedBatch::Flat(2),
+            ]
+        );
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn physical_numeric_spans_preserve_ranges_and_repeats() {
+        let values = [10_i32, 20, 30, 40, 50];
+
+        let sparse_values = (0..260).collect::<Vec<_>>();
+        let selected = (0..130).map(|index| index * 2).collect::<Vec<_>>();
+        let sparse = collect(|sink| {
+            emit_physical_identity(
+                sink,
+                &sparse_values,
+                PhysicalIndexPlan::identity(ValueSelectionRef::Sparse(&selected)),
+            )
+        });
+        assert_eq!(sparse.got, selected);
+        assert_eq!(
+            sparse.batches,
+            [
+                CollectedBatch::Flat(64),
+                CollectedBatch::Flat(64),
+                CollectedBatch::Flat(2),
+            ]
+        );
+
+        let keys = [0_i32, 1, 1, 2, 3, 4];
+        let plan = PhysicalIndexPlan::dictionary(
+            ValueSelectionRef::Dense { offset: 0, len: 6 },
+            DictionaryKeys::I32(&keys),
+        );
+
+        let output = collect(|sink| emit_physical_identity(sink, &values, plan));
+        assert_eq!(output.got, [10, 20, 20, 30, 40, 50]);
+        assert_eq!(
+            output.batches,
+            [
+                CollectedBatch::Flat(1),
+                CollectedBatch::RunGroups(1),
+                CollectedBatch::Flat(3),
+            ]
+        );
+
+        let cast = collect(|sink| emit_physical_cast(sink, &values, plan, i64::from));
+        assert_eq!(cast.got, [10_i64, 20, 20, 30, 40, 50]);
+        assert_eq!(cast.batches, [CollectedBatch::Flat(6)]);
+
+        let keys = [99_i32, 0, 1, 99, 2];
+        let selected = [1_usize, 2, 4];
+        let plan = PhysicalIndexPlan::dictionary(
+            ValueSelectionRef::Sparse(&selected),
+            DictionaryKeys::I32(&keys),
+        );
+        let contiguous = collect(|sink| emit_physical_identity(sink, &values, plan));
+        assert_eq!(contiguous.got, [10, 20, 30]);
+        assert_eq!(contiguous.batches, [CollectedBatch::Flat(3)]);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn physical_numeric_grouped_identity_uses_group_counts() {
+        let values = [7_i32, 9];
+        let indices = [0_usize, 1, 0];
+        let ends = [2, 5, 6];
+        let plan = PhysicalIndexPlan::identity(ValueSelectionRef::Grouped(
+            GroupedSelectionRef::new(&indices, &ends),
+        ));
+
+        let output = collect(|sink| emit_physical_identity(sink, &values, plan));
+        assert_eq!(output.got, [7, 7, 9, 9, 9, 7]);
+        assert_eq!(output.batches, [CollectedBatch::RunGroups(3)]);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn physical_boolean_dictionary_streams_sliced_keys_directly() {
+        let bit_offset = 5;
+        let bits = [0b1011_0101, 0b0101_1010];
+        let mut keys = Vec::with_capacity(160);
+        for row in 0..160 {
+            keys.push((row % 6) as i16);
+        }
+        let plan = PhysicalIndexPlan::dictionary(
+            ValueSelectionRef::Dense {
+                offset: 0,
+                len: keys.len(),
+            },
+            DictionaryKeys::I16(&keys),
+        )
+        .slice(7, 137);
+        let packed = PackedBoolValues::new_physical(&bits, bit_offset, plan);
+        assert!(matches!(
+            packed.selection,
+            PackedBoolSelection::Plan { scalar: true, .. }
+        ));
+
+        let expected = (7..144)
+            .map(|row| bit_util::get_bit(&bits, bit_offset + keys[row] as usize))
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        packed.for_each(|value| actual.push(value));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            packed.true_count(),
+            expected.iter().filter(|&&value| value).count()
+        );
+
+        let mut encoder = PlainEncoder::<BoolType>::new();
+        encoder.put_packed_bool(packed).unwrap();
+        let encoded = encoder.flush_buffer().unwrap();
+        assert_eq!(encoded.len(), expected.len().div_ceil(8));
+        for (index, expected) in expected.into_iter().enumerate() {
+            assert_eq!(bit_util::get_bit(&encoded, index), expected);
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn physical_boolean_identity_descriptors() {
+        let bits = [0b1010_1101, 0b0111_0010, 0b1100_1001];
+        let plan = PhysicalIndexPlan::identity(ValueSelectionRef::Dense { offset: 3, len: 14 });
+        let packed = PackedBoolValues::new_physical(&bits, 2, plan);
+
+        assert!(matches!(
+            packed.selection,
+            PackedBoolSelection::Dense { .. }
+        ));
+        assert_eq!(
+            packed.true_count(),
+            (3..17)
+                .filter(|&index| bit_util::get_bit(&bits, 2 + index))
+                .count()
+        );
+
+        let indices = [0, 2, 5, 9];
+        let plan = PhysicalIndexPlan::identity(ValueSelectionRef::Sparse(&indices));
+        let packed = PackedBoolValues::new_physical(&bits, 2, plan);
+        assert!(matches!(
+            packed.selection,
+            PackedBoolSelection::Sparse { .. }
+        ));
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn physical_boolean_grouped_identity_preserves_repeat_counts() {
+        let bits = [0b0000_0001];
+        let indices = [0_usize, 1, 2];
+        let ends = [2, 5, 6];
+        let plan = PhysicalIndexPlan::identity(ValueSelectionRef::Grouped(
+            GroupedSelectionRef::new(&indices, &ends),
+        ));
+        let packed = PackedBoolValues::new_physical(&bits, 0, plan);
+        assert!(matches!(
+            packed.selection,
+            PackedBoolSelection::Plan { scalar: false, .. }
+        ));
+        let mut groups = Vec::new();
+        packed.for_each_run_group(|value, count| groups.push((value, count)));
+        assert_eq!(groups, [(true, 2), (false, 3), (false, 1)]);
+        assert_eq!(packed.true_count(), 2);
+    }
 
     #[test]
     fn test_get_encoders() {
@@ -812,6 +2033,76 @@ mod tests {
         BoolType::test(Encoding::PLAIN, TEST_SET_SIZE, -1);
         BoolType::test(Encoding::PLAIN_DICTIONARY, TEST_SET_SIZE, -1);
         BoolType::test(Encoding::RLE, TEST_SET_SIZE, -1);
+    }
+
+    #[cfg(feature = "arrow")]
+    fn assert_plain_packed_bool<'a>(
+        input: &'a [u8],
+        bit_offset: usize,
+        plan: PhysicalIndexPlan<'a>,
+        expected_indices: &[usize],
+    ) {
+        let values = PackedBoolValues::new_physical(input, bit_offset, plan);
+        assert_eq!(
+            values.true_count(),
+            expected_indices
+                .iter()
+                .filter(|&&idx| bit_util::get_bit(input, bit_offset + idx))
+                .count()
+        );
+
+        let mut encoder = PlainEncoder::<BoolType>::new();
+        encoder.put_packed_bool(values).unwrap();
+        let encoded = encoder.flush_buffer().unwrap();
+        assert_eq!(encoded.len(), expected_indices.len().div_ceil(8));
+        for (out_idx, &input_idx) in expected_indices.iter().enumerate() {
+            assert_eq!(
+                bit_util::get_bit(&encoded, out_idx),
+                bit_util::get_bit(input, bit_offset + input_idx),
+                "mismatch at output bit {out_idx}"
+            );
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_plain_encoder_selected_packed_bool() {
+        let input = [
+            0b1010_1101,
+            0b0111_0010,
+            0b1100_1001,
+            0b0011_1110,
+            0b0101_0101,
+            0b1000_1111,
+            0b1111_0000,
+            0b0001_1011,
+            0b1011_0110,
+            0b0100_1001,
+            0b1110_0011,
+            0b0010_1100,
+            0b1001_0111,
+            0b0110_1010,
+        ];
+        let indices: Vec<_> = (0..93).filter(|idx| idx % 3 != 1).collect();
+        assert_plain_packed_bool(
+            &input,
+            5,
+            PhysicalIndexPlan::identity(ValueSelectionRef::Sparse(&indices)),
+            &indices,
+        );
+
+        let spans = [
+            SelectionRange::new(2..11, 9),
+            SelectionRange::new(17..33, 25),
+        ];
+        let ranges = RangesSelectionRef::new(&spans, 25);
+        let indices = (2..11).chain(17..33).collect::<Vec<_>>();
+        assert_plain_packed_bool(
+            &input,
+            3,
+            PhysicalIndexPlan::identity(ValueSelectionRef::Ranges(ranges)),
+            &indices,
+        );
     }
 
     #[test]

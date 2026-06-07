@@ -24,17 +24,20 @@
 mod cdc;
 mod cdc_generated;
 
-pub(crate) use cdc::ContentDefinedChunker;
+#[cfg(feature = "arrow")]
+pub(crate) use cdc::CdcFramer;
 
 /// A chunk of data with level and value offsets for record-shredded nested data.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CdcChunk {
+pub(crate) struct CdcFrame {
     /// The start offset of this chunk inside the given levels.
-    pub level_offset: usize,
+    pub(crate) level_offset: usize,
     /// The number of levels in this chunk.
-    pub num_levels: usize,
+    pub(crate) num_levels: usize,
     /// The start index into `non_null_indices` for this chunk.
-    pub value_offset: usize,
+    pub(crate) value_offset: usize,
     /// The number of `non_null_indices` entries in this chunk.
-    pub num_values: usize,
+    pub(crate) num_values: usize,
+    /// Whether the writer must finish its current page before this frame.
+    pub(crate) break_before: bool,
 }

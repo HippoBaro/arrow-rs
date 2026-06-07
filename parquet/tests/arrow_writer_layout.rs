@@ -371,21 +371,14 @@ fn test_string() {
         layout: Layout {
             row_groups: vec![RowGroup {
                 columns: vec![ColumnChunk {
-                    pages: (0..15)
+                    pages: (0..16)
                         .map(|_| Page {
-                            rows: 130,
+                            rows: 125,
                             page_header_size: 38,
-                            compressed_size: 1040,
+                            compressed_size: 1000,
                             encoding: Encoding::PLAIN,
                             page_type: PageType::DATA_PAGE,
                         })
-                        .chain(std::iter::once(Page {
-                            rows: 50,
-                            page_header_size: 37,
-                            compressed_size: 400,
-                            encoding: Encoding::PLAIN,
-                            page_type: PageType::DATA_PAGE,
-                        }))
                         .collect(),
                     dictionary_page: None,
                 }],
@@ -410,37 +403,33 @@ fn test_string() {
                 columns: vec![ColumnChunk {
                     pages: vec![
                         Page {
-                            rows: 126,
+                            rows: 125,
                             page_header_size: 38,
                             compressed_size: 114,
                             encoding: Encoding::RLE_DICTIONARY,
                             page_type: PageType::DATA_PAGE,
                         },
                         Page {
-                            rows: 1254,
+                            rows: 1250,
                             page_header_size: 40,
-                            compressed_size: 10032,
+                            compressed_size: 10000,
                             encoding: Encoding::PLAIN,
                             page_type: PageType::DATA_PAGE,
                         },
                         Page {
-                            rows: 620,
+                            rows: 625,
                             page_header_size: 38,
-                            compressed_size: 4960,
+                            compressed_size: 5000,
                             encoding: Encoding::PLAIN,
                             page_type: PageType::DATA_PAGE,
                         },
                     ],
                     // The byte-budget chunker sub-batches the dictionary
-                    // phase. The mini-batch deliberately includes the value
-                    // that crosses the 1000-byte limit so the spill triggers
-                    // on this chunk rather than carrying a sliver into the
-                    // next page, giving a 126-row dictionary page at 1008
-                    // bytes.
+                    // phase at the exact remaining byte limit.
                     dictionary_page: Some(Page {
-                        rows: 126,
+                        rows: 125,
                         page_header_size: 38,
-                        compressed_size: 1008,
+                        compressed_size: 1000,
                         encoding: Encoding::PLAIN,
                         page_type: PageType::DICTIONARY_PAGE,
                     }),
@@ -610,7 +599,7 @@ fn test_per_column_data_page_size_limit() {
 
 #[test]
 fn test_fixed_size_binary() {
-    // FixedSizeBinary values larger than the data page byte limit.
+    // FixedSizeBinary values that divide the data-page byte limit exactly.
     let value_size = 1024usize;
     let num_rows = 64usize;
     let values: Vec<u8> = (0..num_rows)
@@ -633,24 +622,16 @@ fn test_fixed_size_binary() {
         layout: Layout {
             row_groups: vec![RowGroup {
                 columns: vec![ColumnChunk {
-                    // 12 pages of 5 values (5 * 1024 = 5120 B, the boundary
-                    // value pushes each page just past the 4096 B limit) plus
-                    // a final page with the remaining 4 values.
-                    pages: (0..12)
+                    // Four fixed-width values exactly fill the 4096-byte
+                    // budget, yielding 16 equal pages.
+                    pages: (0..16)
                         .map(|_| Page {
-                            rows: 5,
-                            page_header_size: 157,
-                            compressed_size: 5120,
-                            encoding: Encoding::PLAIN,
-                            page_type: PageType::DATA_PAGE,
-                        })
-                        .chain(std::iter::once(Page {
                             rows: 4,
                             page_header_size: 157,
                             compressed_size: 4096,
                             encoding: Encoding::PLAIN,
                             page_type: PageType::DATA_PAGE,
-                        }))
+                        })
                         .collect(),
                     dictionary_page: None,
                 }],
@@ -848,8 +829,8 @@ fn test_nullable_large_values() {
     // budget must count only the non-null values (the def-level value
     // count), not the level count — otherwise the estimate would be wrong
     // for sparse columns. With a 16 KiB page limit each 32 KiB value still
-    // gets its own page (carrying its adjacent leading null), giving 16
-    // two-row pages. Mirrors the raw-writer
+    // gets its own page; null-only rows are packed around those values, giving
+    // 16 pages with row counts [3, 2 x 14, 1]. Mirrors the raw-writer
     // `test_column_writer_caps_page_size_with_nullable_large_values`.
     let value_size = 32 * 1024;
     let big = "x".repeat(value_size);
@@ -870,10 +851,14 @@ fn test_nullable_large_values() {
         layout: Layout {
             row_groups: vec![RowGroup {
                 columns: vec![ColumnChunk {
-                    // Each page holds one null + one 32 KiB value (2 rows).
-                    pages: (0..16)
-                        .map(|_| Page {
-                            rows: 2,
+                    // Each page carries one 32 KiB value. Null-only rows are
+                    // packed around those values because they do not add value bytes.
+                    pages: [3]
+                        .into_iter()
+                        .chain(std::iter::repeat_n(2, 14))
+                        .chain([1])
+                        .map(|rows| Page {
+                            rows,
                             page_header_size: 21,
                             compressed_size: 32778,
                             encoding: Encoding::PLAIN,

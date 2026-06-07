@@ -16,11 +16,11 @@
 // under the License.
 
 use crate::basic::{Encoding, Type};
-use crate::data_type::{AsBytes, DataType, SliceAsBytes};
+use crate::data_type::{AsBytes, BoolType, DataType, FixedLenByteArrayType, SliceAsBytes};
 
 use crate::errors::{ParquetError, Result};
 
-use super::Encoder;
+use super::{BoolEncoder, Encoder, FixedLenByteArrayEncoder, FixedLenByteArrayValues};
 
 use bytes::{BufMut, Bytes};
 use std::cmp;
@@ -111,6 +111,8 @@ impl<T: DataType> Encoder<T> for ByteStreamSplitEncoder<T> {
         self.buffer.capacity() * std::mem::size_of::<u8>()
     }
 }
+
+impl BoolEncoder for ByteStreamSplitEncoder<BoolType> {}
 
 pub struct VariableWidthByteStreamSplitEncoder<T> {
     buffer: Vec<u8>,
@@ -210,6 +212,7 @@ impl<T: DataType> Encoder<T> for VariableWidthByteStreamSplitEncoder<T> {
         };
         // split_streams_const() is faster up to type_width == 8
         match type_size {
+            0 => {}
             2 => split_streams_const::<2>(&self.buffer, &mut encoded),
             3 => split_streams_const::<3>(&self.buffer, &mut encoded),
             4 => split_streams_const::<4>(&self.buffer, &mut encoded),
@@ -227,5 +230,81 @@ impl<T: DataType> Encoder<T> for VariableWidthByteStreamSplitEncoder<T> {
     /// return the estimated memory size of this encoder.
     fn estimated_memory_size(&self) -> usize {
         self.buffer.capacity() * std::mem::size_of::<u8>()
+    }
+}
+
+impl FixedLenByteArrayEncoder for VariableWidthByteStreamSplitEncoder<FixedLenByteArrayType> {
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        if values.type_length != self.type_width {
+            return Err(general_err!(
+                "Mismatched FixedLenByteArray sizes: {} != {}",
+                values.type_length,
+                self.type_width
+            ));
+        }
+
+        self.buffer.extend_from_slice(values.bytes);
+        Ok(())
+    }
+
+    /// BYTE_STREAM_SPLIT accumulates the raw value bytes contiguously and transposes
+    /// them into byte-streams at `flush_buffer`, so a streamed value is simply
+    /// appended — no intermediate buffer.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn reserve_fixed_len(&mut self, additional_bytes: usize) {
+        self.buffer.reserve(additional_bytes);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(value);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::basic::{Encoding, Type};
+    use crate::column::writer::{get_column_writer, get_typed_column_writer};
+    use crate::data_type::{ByteArray, FixedLenByteArray, FixedLenByteArrayType};
+    use crate::errors::Result;
+    use crate::file::properties::WriterProperties;
+    use crate::file::writer::{SerializedPageWriter, TrackedWrite};
+    use crate::schema::types::{ColumnDescriptor, ColumnPath, Type as SchemaType};
+
+    fn write_mismatched_fixed_len_value() -> Result<usize> {
+        let mut output = Vec::new();
+        let mut output = TrackedWrite::new(&mut output);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut output));
+        let primitive = SchemaType::primitive_type_builder("col", Type::FIXED_LEN_BYTE_ARRAY)
+            .with_length(2)
+            .build()
+            .unwrap();
+        let descriptor = Arc::new(ColumnDescriptor::new(
+            Arc::new(primitive),
+            0,
+            0,
+            ColumnPath::from("col"),
+        ));
+        let properties = Arc::new(
+            WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::BYTE_STREAM_SPLIT)
+                .build(),
+        );
+        let writer = get_column_writer(descriptor, properties, page_writer);
+        let mut writer = get_typed_column_writer::<FixedLenByteArrayType>(writer);
+        let malformed = FixedLenByteArray::from(ByteArray::from(vec![1_u8, 2, 3]));
+        writer.write_batch(&[malformed], None, None)
+    }
+
+    #[test]
+    fn byte_stream_split_reports_mismatched_fixed_len_value_as_error() {
+        let error = write_mismatched_fixed_len_value().unwrap_err().to_string();
+        assert!(error.contains("Mismatched FixedLenByteArray sizes: 3 != 2"));
     }
 }

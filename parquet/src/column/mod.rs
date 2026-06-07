@@ -127,4 +127,5 @@ pub(crate) mod page_encryption;
 pub(crate) mod page_encryption;
 pub mod page_store;
 pub mod reader;
+pub(crate) mod value;
 pub mod writer;

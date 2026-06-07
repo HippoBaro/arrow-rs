@@ -921,7 +921,7 @@ impl<'a> SerializedColumnWriter<'a> {
 
     /// Returns a reference to a typed [`ColumnWriterImpl`]
     pub fn typed<T: DataType>(&mut self) -> &mut ColumnWriterImpl<'a, T> {
-        get_typed_column_writer_mut(&mut self.inner)
+        get_typed_column_writer_mut::<T>(&mut self.inner)
     }
 
     /// Close this [`SerializedColumnWriter`]

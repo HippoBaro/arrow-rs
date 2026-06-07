@@ -540,6 +540,7 @@ pub trait SliceAsBytes: Sized {
 }
 
 impl AsBytes for [u8] {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self
     }
@@ -548,6 +549,7 @@ impl AsBytes for [u8] {
 macro_rules! gen_as_bytes {
     ($source_ty:ident) => {
         impl AsBytes for $source_ty {
+            #[inline]
             #[allow(clippy::size_of_in_element_count)]
             fn as_bytes(&self) -> &[u8] {
                 // SAFETY: macro is only used with primitive types that have no padding, so the
@@ -624,6 +626,7 @@ unimplemented_slice_as_bytes!(ByteArray);
 unimplemented_slice_as_bytes!(FixedLenByteArray);
 
 impl AsBytes for bool {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: a bool is guaranteed to be either 0x00 or 0x01 in memory, so the memory is
         // valid.
@@ -639,12 +642,14 @@ impl AsBytes for Int96 {
 }
 
 impl AsBytes for ByteArray {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self.data()
     }
 }
 
 impl AsBytes for FixedLenByteArray {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self.data()
     }
@@ -684,11 +689,24 @@ pub(crate) mod private {
     use crate::basic::Type;
     use crate::file::metadata::HeapSize;
 
+    /// Convert a byte-array payload length to its four-byte PLAIN prefix.
+    #[inline]
+    pub(crate) fn byte_array_length(len: usize) -> Result<u32> {
+        len.try_into().map_err(|_| {
+            general_err!(
+                "Byte array length {} exceeds the Parquet limit of {} bytes",
+                len,
+                u32::MAX
+            )
+        })
+    }
+
     /// Sealed trait to start to remove specialisation from implementations
     ///
     /// This is done to force the associated value type to be unimplementable outside of this
     /// crate, and thus hint to the type system (and end user) traits are public for the contract
     /// and not for extension.
+    #[allow(private_bounds)]
     pub trait ParquetValueType:
         PartialEq
         + std::fmt::Debug
@@ -703,6 +721,7 @@ pub(crate) mod private {
         + HeapSize
         + crate::encodings::decoding::private::GetDecoder
         + crate::file::statistics::private::MakeStatistics
+        + crate::column::writer::encoder::PhysicalValueDispatch
     {
         const PHYSICAL_TYPE: Type;
 
@@ -745,6 +764,7 @@ pub(crate) mod private {
         ///
         /// This is essentially the same as `std::convert::TryInto<u64>` but can't be
         /// implemented for `f32` and `f64`, types that would fail orphan rules
+        #[inline]
         fn as_u64(&self) -> Result<u64> {
             self.as_i64()
                 .map_err(|_| general_err!("Type cannot be converted to u64"))
@@ -1011,7 +1031,7 @@ pub(crate) mod private {
             _: &mut BitWriter,
         ) -> Result<()> {
             for value in values {
-                let len: u32 = value.len().try_into().unwrap();
+                let len = byte_array_length(value.len())?;
                 writer.write_all(&len.to_ne_bytes())?;
                 let raw = value.data();
                 writer.write_all(raw)?;
@@ -1231,6 +1251,7 @@ pub trait DataType: 'static + Send {
         Self: Sized;
 
     /// Returns a mutable reference to the underlying [`ColumnWriterImpl`] for the given
+    /// [`ColumnWriter`].
     fn get_column_writer_mut<'a, 'b: 'a>(
         column_writer: &'a mut ColumnWriter<'b>,
     ) -> Option<&'a mut ColumnWriterImpl<'b, Self>>
@@ -1268,8 +1289,8 @@ macro_rules! make_type {
             }
 
             fn get_column_writer_ref<'a, 'b: 'a>(
-                column_writer: &'a ColumnWriter<'b>,
-            ) -> Option<&'a ColumnWriterImpl<'b, Self>> {
+                column_writer: &'b ColumnWriter<'a>,
+            ) -> Option<&'b ColumnWriterImpl<'a, Self>> {
                 match column_writer {
                     ColumnWriter::$writer_ident(w) => Some(w),
                     _ => None,
@@ -1380,6 +1401,19 @@ mod tests {
         );
         let buf = vec![6u8, 7u8, 8u8, 9u8, 10u8];
         assert_eq!(ByteArray::from(buf).data(), &[6u8, 7u8, 8u8, 9u8, 10u8]);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_byte_array_length_rejects_overflow() {
+        assert_eq!(
+            private::byte_array_length(u32::MAX as usize).unwrap(),
+            u32::MAX
+        );
+        let error = private::byte_array_length(u32::MAX as usize + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds the Parquet limit"));
     }
 
     #[test]

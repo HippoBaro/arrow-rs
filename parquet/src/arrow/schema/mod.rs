@@ -311,12 +311,97 @@ pub fn encode_arrow_schema(schema: &Schema) -> String {
     BASE64_STANDARD.encode(&len_prefix_schema)
 }
 
+/// Normalize `field` to the dense logical type reconstructed by the reader.
+///
+/// This removes run-end encoding at any nesting depth and dictionary wrappers
+/// around nested values that Parquet expands into leaf columns.
 fn flatten_ree_field(field: &Field) -> Field {
     match field.data_type() {
-        DataType::RunEndEncoded(_, value_field) => field
+        DataType::RunEndEncoded(_, value_field) => {
+            let value = flatten_ree_field(value_field);
+            field
+                .clone()
+                .with_data_type(value.data_type().clone())
+                .with_nullable(field.is_nullable() || value.is_nullable())
+        }
+        DataType::Dictionary(key, value_type) => {
+            // Dictionary values have no Field of their own, but an REE directly
+            // beneath the dictionary still describes the nullability of the
+            // dictionary's logical value. Use a synthetic field to retain that
+            // contract while recursively removing deeper REE wrappers.
+            let value = flatten_ree_field(&Field::new("", value_type.as_ref().clone(), false));
+            let value_type = value.data_type();
+            // Parquet expands nested dictionary values into leaf columns, so
+            // the reader must see their dense type in the schema hint. View
+            // values need the same treatment for a different reason: the reader
+            // has no dictionary reader for them, so recording the wrapper would
+            // make the file unreadable through its own hint.
+            let data_type = if value_type.is_nested()
+                || matches!(value_type, DataType::Utf8View | DataType::BinaryView)
+            {
+                value_type.clone()
+            } else {
+                DataType::Dictionary(key.clone(), Box::new(value_type.clone()))
+            };
+            field
+                .clone()
+                .with_data_type(data_type)
+                .with_nullable(field.is_nullable() || value.is_nullable())
+        }
+        _ => field
             .clone()
-            .with_data_type(value_field.data_type().clone()),
-        _ => field.clone(),
+            .with_data_type(flatten_ree_type(field.data_type())),
+    }
+}
+
+fn flatten_ree_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::RunEndEncoded(_, value_field) => {
+            flatten_ree_field(value_field).data_type().clone()
+        }
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|f| Arc::new(flatten_ree_field(f)))
+                .collect(),
+        ),
+        DataType::List(f) => DataType::List(Arc::new(flatten_ree_field(f))),
+        DataType::LargeList(f) => DataType::LargeList(Arc::new(flatten_ree_field(f))),
+        DataType::FixedSizeList(f, n) => {
+            DataType::FixedSizeList(Arc::new(flatten_ree_field(f)), *n)
+        }
+        DataType::ListView(f) => DataType::ListView(Arc::new(flatten_ree_field(f))),
+        DataType::LargeListView(f) => DataType::LargeListView(Arc::new(flatten_ree_field(f))),
+        DataType::Map(f, sorted) => DataType::Map(Arc::new(flatten_ree_field(f)), *sorted),
+        // Not reachable today, since `flatten_ree_field` matches `Dictionary`
+        // before it ever delegates here. Delegating rather than reimplementing
+        // keeps the dictionary policy in one place if that ever changes.
+        DataType::Dictionary(..) => flatten_ree_field(&Field::new("", dt.clone(), false))
+            .data_type()
+            .clone(),
+        _ => dt.clone(),
+    }
+}
+
+/// Whether `dt` needs flattening before being written as Arrow schema metadata.
+fn needs_metadata_flattening(dt: &DataType) -> bool {
+    match dt {
+        DataType::RunEndEncoded(_, _) => true,
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|f| needs_metadata_flattening(f.data_type())),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::Map(f, _) => needs_metadata_flattening(f.data_type()),
+        DataType::Dictionary(_, value) => {
+            value.is_nested()
+                || matches!(value.as_ref(), DataType::Utf8View | DataType::BinaryView)
+                || needs_metadata_flattening(value)
+        }
+        _ => false,
     }
 }
 
@@ -327,12 +412,12 @@ fn flatten_ree_field(field: &Field) -> Field {
 ///
 /// [`ARROW_SCHEMA_META_KEY`]: crate::arrow::ARROW_SCHEMA_META_KEY
 pub fn add_encoded_arrow_schema_to_metadata(schema: &Schema, props: &mut WriterProperties) {
-    let has_ree = schema
+    let needs_flattening = schema
         .fields()
         .iter()
-        .any(|f| matches!(f.data_type(), DataType::RunEndEncoded(_, _)));
+        .any(|f| needs_metadata_flattening(f.data_type()));
     let flat_schema;
-    let schema = if has_ree {
+    let schema = if needs_flattening {
         let flat_fields: Vec<Field> = schema
             .fields()
             .iter()
@@ -858,11 +943,16 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             let dict_field = field.clone().with_data_type(value.as_ref().clone());
             arrow_to_parquet_type(&dict_field, coerce_types)
         }
-        DataType::RunEndEncoded(_, value_field) => {
-            let ree_value_field = field
+        DataType::RunEndEncoded(_, value) => {
+            // Run-end encoding is a physical layout. The Parquet column uses the
+            // run value type and is optional when either the run array or its
+            // values are nullable, so schema conversion recurses into the value
+            // field here.
+            let value_field = field
                 .clone()
-                .with_data_type(value_field.data_type().clone());
-            arrow_to_parquet_type(&ree_value_field, coerce_types)
+                .with_data_type(value.data_type().clone())
+                .with_nullable(field.is_nullable() || value.is_nullable());
+            arrow_to_parquet_type(&value_field, coerce_types)
         }
     }
 }
@@ -1986,6 +2076,116 @@ mod tests {
             .convert(&arrow_schema);
 
         converted_arrow_schema.unwrap();
+    }
+
+    #[test]
+    fn test_run_end_schema_conversion_recurses_into_value_type() {
+        fn run_end_type(value_type: DataType, nullable_values: bool) -> DataType {
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", value_type, nullable_values)),
+            )
+        }
+
+        // A leaf REE contributes the value's physical type and combined
+        // nullability to the Parquet schema.
+        let leaf_schema = Schema::new(vec![Field::new(
+            "ree",
+            run_end_type(DataType::Int32, true),
+            false,
+        )]);
+        let converted = ArrowSchemaConverter::new().convert(&leaf_schema).unwrap();
+        assert_eq!(converted.columns().len(), 1);
+        assert_eq!(converted.column(0).name(), "ree");
+        assert_eq!(converted.column(0).physical_type(), PhysicalType::INT32);
+        assert_eq!(converted.column(0).max_def_level(), 1);
+
+        // Non-leaf value types recurse into the value type rather than
+        // exposing Arrow's physical run-end wrapper in the Parquet schema.
+        let list_schema = Schema::new(vec![Field::new(
+            "ree_list",
+            run_end_type(
+                DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
+                true,
+            ),
+            true,
+        )]);
+        let converted = ArrowSchemaConverter::new().convert(&list_schema).unwrap();
+        assert_eq!(converted.columns().len(), 1);
+        assert_eq!(converted.column(0).physical_type(), PhysicalType::INT32);
+        assert!(
+            converted.column(0).max_rep_level() >= 1,
+            "list element should be repeated"
+        );
+
+        let dictionary_schema = Schema::new(vec![Field::new(
+            "ree_dictionary",
+            run_end_type(
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+            ),
+            true,
+        )]);
+        let converted = ArrowSchemaConverter::new()
+            .convert(&dictionary_schema)
+            .unwrap();
+        assert_eq!(converted.columns().len(), 1);
+        assert_eq!(
+            converted.column(0).physical_type(),
+            PhysicalType::BYTE_ARRAY
+        );
+    }
+
+    #[test]
+    fn test_flatten_ree_field_merges_value_nullability() {
+        let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
+        let inner = Arc::new(Field::new("inner", DataType::Int32, true));
+        let nested = Arc::new(Field::new(
+            "nested",
+            DataType::RunEndEncoded(Arc::clone(&run_ends), inner),
+            false,
+        ));
+        let field = Field::new("outer", DataType::RunEndEncoded(run_ends, nested), false);
+
+        let flattened = flatten_ree_field(&field);
+        assert_eq!(flattened.data_type(), &DataType::Int32);
+        assert!(flattened.is_nullable());
+    }
+
+    #[test]
+    fn test_flatten_ree_field_descends_dictionary_values() {
+        let ree = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Int64, true)),
+        );
+        let field = Field::new(
+            "dictionary_ree",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(ree)),
+            false,
+        );
+
+        assert!(needs_metadata_flattening(field.data_type()));
+        let flattened = flatten_ree_field(&field);
+        assert_eq!(
+            flattened.data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int64))
+        );
+        assert!(flattened.is_nullable());
+        assert!(!needs_metadata_flattening(flattened.data_type()));
+
+        let mut props = WriterProperties::builder().build();
+        add_encoded_arrow_schema_to_metadata(&Schema::new(vec![field]), &mut props);
+        let encoded = props
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|kv| kv.key == crate::arrow::ARROW_SCHEMA_META_KEY)
+            .unwrap()
+            .value
+            .as_deref()
+            .unwrap();
+        let decoded = get_arrow_schema_from_metadata(encoded).unwrap();
+        assert_eq!(decoded.field(0), &flattened);
     }
 
     #[test]

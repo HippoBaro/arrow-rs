@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(feature = "arrow")]
-use crate::column::writer::LevelDataRef;
+use crate::column::value::{RangesSelectionCursor, ValueSelectionRef};
+use crate::column::writer::{LevelDataRef, RunLevelCursor};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::CdcOptions;
 use crate::schema::types::ColumnDescriptor;
 
-use super::CdcChunk;
+use super::CdcFrame;
 use super::cdc_generated::{GEARHASH_TABLE, NUM_GEARHASH_TABLES};
 
 /// CDC (Content-Defined Chunking) divides data into variable-sized chunks based on
@@ -57,9 +57,9 @@ use super::cdc_generated::{GEARHASH_TABLE, NUM_GEARHASH_TABLES};
 /// ## Implementation
 ///
 /// Only the parquet writer needs to be aware of content-defined chunking; the reader is
-/// unaffected. Each parquet column writer holds a `ContentDefinedChunker` instance
-/// depending on the writer's properties. The chunker's state is maintained across the
-/// entire column without being reset between pages and row groups.
+/// unaffected. Each parquet column writer holds a `CdcFramer` depending on the writer's
+/// properties. Its rolling-hash state is maintained across the entire column without
+/// being reset between pages, planner segments, and row groups.
 ///
 /// This implements a [FastCDC]-inspired algorithm using gear hashing. The input data is
 /// fed byte-by-byte into a rolling hash; when the hash matches a predefined mask, a new
@@ -85,14 +85,11 @@ use super::cdc_generated::{GEARHASH_TABLE, NUM_GEARHASH_TABLES};
 /// [FastCDC]: https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia
 /// [central-limit-theorem normalization]: https://www.cidrdb.org/cidr2023/papers/p43-low.pdf
 #[derive(Debug)]
-pub(crate) struct ContentDefinedChunker {
+struct ContentDefinedChunker {
     /// Maximum definition level for this column.
     max_def_level: i16,
     /// Maximum repetition level for this column.
     max_rep_level: i16,
-    /// Definition level at the nearest REPEATED ancestor.
-    repeated_ancestor_def_level: i16,
-
     /// Minimum chunk size in bytes.
     /// The rolling hash will not be updated until this size is reached for each chunk.
     /// All data sent through the hash function counts towards the chunk size, including
@@ -119,8 +116,44 @@ pub(crate) struct ContentDefinedChunker {
     chunk_size: i64,
 }
 
+/// Column-global CDC state shared by consecutive Arrow leaf batches.
+#[cfg(feature = "arrow")]
+#[derive(Debug)]
+pub(crate) struct CdcFramer {
+    chunker: ContentDefinedChunker,
+}
+
+#[cfg(feature = "arrow")]
+impl CdcFramer {
+    pub(crate) fn new(desc: &ColumnDescriptor, options: &CdcOptions) -> Result<Self> {
+        Ok(Self {
+            chunker: ContentDefinedChunker::new(desc, options)?,
+        })
+    }
+
+    /// Return non-empty frames covering one leaf batch while retaining the
+    /// rolling hash for the next batch.
+    pub(crate) fn frame_arrow_segment(
+        &mut self,
+        def_levels: LevelDataRef<'_>,
+        rep_levels: LevelDataRef<'_>,
+        value_selection: ValueSelectionRef<'_>,
+        array: &dyn arrow_array::Array,
+    ) -> Result<Vec<CdcFrame>> {
+        let num_levels = match (def_levels.len(), rep_levels.len()) {
+            (0, 0) => value_selection.len(),
+            (def, rep) => def.max(rep),
+        };
+        if num_levels == 0 {
+            return Ok(Vec::new());
+        }
+        self.chunker
+            .get_arrow_chunks(def_levels, rep_levels, value_selection, array)
+    }
+}
+
 impl ContentDefinedChunker {
-    pub fn new(desc: &ColumnDescriptor, options: &CdcOptions) -> Result<Self> {
+    fn new(desc: &ColumnDescriptor, options: &CdcOptions) -> Result<Self> {
         let rolling_hash_mask = Self::calculate_mask(
             options.min_chunk_size as i64,
             options.max_chunk_size as i64,
@@ -129,7 +162,6 @@ impl ContentDefinedChunker {
         Ok(Self {
             max_def_level: desc.max_def_level(),
             max_rep_level: desc.max_rep_level(),
-            repeated_ancestor_def_level: desc.repeated_ancestor_def_level(),
             min_chunk_size: options.min_chunk_size as i64,
             max_chunk_size: options.max_chunk_size as i64,
             rolling_hash_mask,
@@ -275,166 +307,285 @@ impl ContentDefinedChunker {
     ///
     /// After each triplet [`need_new_chunk`](Self::need_new_chunk) is called to
     /// evaluate if we need to create a new chunk.
+    #[cfg(test)]
     fn calculate<F>(
         &mut self,
         def_levels: LevelDataRef<'_>,
         rep_levels: LevelDataRef<'_>,
+        value_selection: ValueSelectionRef<'_>,
+        num_levels: usize,
+        roll_value: F,
+    ) -> Vec<CdcFrame>
+    where
+        F: FnMut(&mut Self, usize),
+    {
+        self.calculate_indices(
+            def_levels,
+            rep_levels,
+            value_selection.cursor(),
+            num_levels,
+            roll_value,
+        )
+    }
+
+    fn calculate_indices<I, F>(
+        &mut self,
+        def_levels: LevelDataRef<'_>,
+        rep_levels: LevelDataRef<'_>,
+        mut values: I,
         num_levels: usize,
         mut roll_value: F,
-    ) -> Vec<CdcChunk>
+    ) -> Vec<CdcFrame>
     where
+        I: ExactSizeIterator<Item = usize>,
         F: FnMut(&mut Self, usize),
     {
         let has_def_levels = self.max_def_level > 0;
         let has_rep_levels = self.max_rep_level > 0;
 
-        let mut chunks = Vec::new();
-        let mut prev_offset: usize = 0;
-        let mut prev_value_offset: usize = 0;
-        let mut value_offset: usize = 0;
+        if has_rep_levels {
+            // Run-composed nested leaves keep definition levels in the same
+            // run-end representation as their selected values, while list
+            // repetition levels are normally materialized. Resolve that
+            // representation once instead of dispatching two erased level
+            // cursors for every shredded tuple.
+            return match (def_levels, rep_levels) {
+                (LevelDataRef::Runs(defs), LevelDataRef::Materialized(reps)) => self
+                    .calculate_nested_indices(
+                        RunLevelCursor::new(defs),
+                        reps.iter().copied(),
+                        values,
+                        num_levels,
+                        roll_value,
+                    ),
+                (defs, reps) => self.calculate_nested_indices(
+                    defs.cursor(),
+                    reps.cursor(),
+                    values,
+                    num_levels,
+                    roll_value,
+                ),
+            };
+        }
 
-        if !has_rep_levels && !has_def_levels {
-            // Fastest path: non-nested, non-null data.
-            // Every level corresponds to exactly one non-null value, so
-            // value_offset == level_offset and num_values == num_levels.
-            //
-            // Example: required Int32, array = [10, 20, 30]
-            //   level:         0   1   2
-            //   value_offset:  0   1   2
-            for offset in 0..num_levels {
-                roll_value(self, offset);
-                if self.need_new_chunk() {
-                    chunks.push(CdcChunk {
+        if has_def_levels {
+            // Dispatch once on the compact definition-level representation.
+            // Keeping a concrete iterator in the dominant flat-nullable loop
+            // avoids matching `LevelDataCursor` for every logical row.
+            return match def_levels {
+                LevelDataRef::Absent => {
+                    unreachable!("definition levels required when max_def_level > 0")
+                }
+                LevelDataRef::Materialized(defs) => self.calculate_nullable_indices(
+                    defs.iter().copied(),
+                    values,
+                    num_levels,
+                    roll_value,
+                ),
+                LevelDataRef::Uniform { value, count } => self.calculate_nullable_indices(
+                    std::iter::repeat_n(value, count),
+                    values,
+                    num_levels,
+                    roll_value,
+                ),
+                LevelDataRef::Runs(levels) => self.calculate_nullable_indices(
+                    RunLevelCursor::new(levels),
+                    values,
+                    num_levels,
+                    roll_value,
+                ),
+            };
+        }
+
+        // Fastest path: non-nested, non-null data. Every level corresponds to
+        // exactly one selected value, so value and level offsets are equal.
+        let mut frames = Vec::new();
+        let mut prev_offset = 0;
+        let mut break_before = false;
+        for offset in 0..num_levels {
+            let array_index = values.next().expect("one selected value per level");
+            roll_value(self, array_index);
+            if self.need_new_chunk() {
+                if offset > prev_offset {
+                    frames.push(CdcFrame {
                         level_offset: prev_offset,
                         num_levels: offset - prev_offset,
                         value_offset: prev_offset,
                         num_values: offset - prev_offset,
+                        break_before,
                     });
-                    prev_offset = offset;
                 }
-            }
-            prev_value_offset = prev_offset;
-            value_offset = num_levels;
-        } else if !has_rep_levels {
-            // Non-nested data with nulls. value_offset only increments for
-            // non-null values (def == max_def), so it diverges from the
-            // level offset when nulls are present.
-            //
-            // Example: optional Int32, array = [1, null, 2, null, 3]
-            //   def_levels:    [1, 0, 1, 0, 1]
-            //   level:          0  1  2  3  4
-            //   value_offset:   0     1     2  (only increments on def==1)
-            #[allow(clippy::needless_range_loop)]
-            for offset in 0..num_levels {
-                let def_level = def_levels
-                    .value_at(offset)
-                    .expect("def_levels required when max_def_level > 0");
-                self.roll_level(def_level);
-                if def_level == self.max_def_level {
-                    // For non-nested data, the leaf array has one slot per
-                    // level (nulls are array elements), so `offset` (the
-                    // level index) is the correct array index for hashing.
-                    roll_value(self, offset);
-                }
-                // Check boundary before incrementing value_offset so that
-                // num_values reflects only entries in the completed chunk.
-                if self.need_new_chunk() {
-                    chunks.push(CdcChunk {
-                        level_offset: prev_offset,
-                        num_levels: offset - prev_offset,
-                        value_offset: prev_value_offset,
-                        num_values: value_offset - prev_value_offset,
-                    });
-                    prev_offset = offset;
-                    prev_value_offset = value_offset;
-                }
-                if def_level == self.max_def_level {
-                    value_offset += 1;
-                }
-            }
-        } else {
-            // Nested data with nulls. Two counters are needed:
-            //
-            //   leaf_offset: index into the leaf values array for hashing,
-            //     incremented for all leaf slots (def >= repeated_ancestor_def_level),
-            //     including null elements.
-            //
-            //   value_offset: index into non_null_indices for chunk boundaries,
-            //     incremented only for non-null leaf values (def == max_def_level).
-            //
-            // These diverge when nullable elements exist inside lists.
-            //
-            // Example: List<Int32?> with repeated_ancestor_def_level=2, max_def=3
-            //   row 0: [1, null, 2]   (3 leaf slots, 2 non-null)
-            //   row 1: [3]            (1 leaf slot, 1 non-null)
-            //
-            //   leaf array:    [1, null, 2, 3]
-            //   def_levels:    [3,  2,   3, 3]
-            //   rep_levels:    [0,  1,   1, 0]
-            //
-            //   level  def  leaf_offset  value_offset  action
-            //   ─────  ───  ───────────  ────────────  ──────────────────────────
-            //     0     3       0             0        roll_value(0), value++, leaf++
-            //     1     2       1             1        leaf++ only (null element)
-            //     2     3       2             1        roll_value(2), value++, leaf++
-            //     3     3       3             2        roll_value(3), value++, leaf++
-            //
-            // roll_value(2) correctly indexes leaf array position 2 (value "2").
-            // Using value_offset=1 would index position 1 (the null slot).
-            //
-            // Using value_offset for roll_value would hash the wrong array slot.
-            let mut leaf_offset: usize = 0;
-
-            for offset in 0..num_levels {
-                let def_level = def_levels
-                    .value_at(offset)
-                    .expect("def_levels required for nested data");
-                let rep_level = rep_levels
-                    .value_at(offset)
-                    .expect("rep_levels required for nested data");
-
-                self.roll_level(def_level);
-                self.roll_level(rep_level);
-                if def_level == self.max_def_level {
-                    roll_value(self, leaf_offset);
-                }
-
-                // Check boundary before incrementing value_offset so that
-                // num_values reflects only entries in the completed chunk.
-                if rep_level == 0 && self.need_new_chunk() {
-                    let levels_to_write = offset - prev_offset;
-                    if levels_to_write > 0 {
-                        chunks.push(CdcChunk {
-                            level_offset: prev_offset,
-                            num_levels: levels_to_write,
-                            value_offset: prev_value_offset,
-                            num_values: value_offset - prev_value_offset,
-                        });
-                        prev_offset = offset;
-                        prev_value_offset = value_offset;
-                    }
-                }
-                if def_level == self.max_def_level {
-                    value_offset += 1;
-                }
-                if def_level >= self.repeated_ancestor_def_level {
-                    leaf_offset += 1;
-                }
+                prev_offset = offset;
+                break_before = true;
             }
         }
 
-        // Add the last chunk if we have any levels left.
         if prev_offset < num_levels {
-            chunks.push(CdcChunk {
+            frames.push(CdcFrame {
                 level_offset: prev_offset,
                 num_levels: num_levels - prev_offset,
-                value_offset: prev_value_offset,
-                num_values: value_offset - prev_value_offset,
+                value_offset: prev_offset,
+                num_values: num_levels - prev_offset,
+                break_before,
             });
         }
 
         #[cfg(debug_assertions)]
-        self.validate_chunks(&chunks, num_levels, value_offset);
+        {
+            self.validate_frames(&frames, num_levels, num_levels);
+            debug_assert_eq!(values.len(), 0, "value cursor not exhausted");
+        }
+
+        frames
+    }
+
+    /// Nested columns require coordinated definition, repetition, and value
+    /// streams. Keeping the iterators generic lets common compact pairs use
+    /// concrete cursors while retaining one copy of the boundary logic.
+    #[inline(never)]
+    fn calculate_nested_indices<I, D, R, F>(
+        &mut self,
+        mut defs: D,
+        mut reps: R,
+        mut values: I,
+        num_levels: usize,
+        mut roll_value: F,
+    ) -> Vec<CdcFrame>
+    where
+        I: ExactSizeIterator<Item = usize>,
+        D: ExactSizeIterator<Item = i16>,
+        R: ExactSizeIterator<Item = i16>,
+        F: FnMut(&mut Self, usize),
+    {
+        let mut frames = Vec::new();
+        let mut prev_offset = 0;
+        let mut prev_value_offset = 0;
+        let mut value_offset = 0;
+        let mut break_before = false;
+
+        for offset in 0..num_levels {
+            let def_level = defs.next().expect("definition level for nested value");
+            let rep_level = reps.next().expect("repetition level for nested value");
+
+            self.roll_level(def_level);
+            self.roll_level(rep_level);
+            if def_level == self.max_def_level {
+                let array_index = values.next().expect("selected value at max definition");
+                roll_value(self, array_index);
+            }
+
+            // A boundary is attached to the following row, before the value
+            // offset advances for the row-start tuple just hashed.
+            if rep_level == 0 && self.need_new_chunk() {
+                let levels_to_write = offset - prev_offset;
+                if levels_to_write > 0 {
+                    frames.push(CdcFrame {
+                        level_offset: prev_offset,
+                        num_levels: levels_to_write,
+                        value_offset: prev_value_offset,
+                        num_values: value_offset - prev_value_offset,
+                        break_before,
+                    });
+                    prev_offset = offset;
+                    prev_value_offset = value_offset;
+                }
+                break_before = true;
+            }
+            if def_level == self.max_def_level {
+                value_offset += 1;
+            }
+        }
+
+        if prev_offset < num_levels {
+            frames.push(CdcFrame {
+                level_offset: prev_offset,
+                num_levels: num_levels - prev_offset,
+                value_offset: prev_value_offset,
+                num_values: value_offset - prev_value_offset,
+                break_before,
+            });
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            self.validate_frames(&frames, num_levels, value_offset);
+            debug_assert_eq!(defs.len(), 0, "definition cursor not exhausted");
+            debug_assert_eq!(reps.len(), 0, "repetition cursor not exhausted");
+            debug_assert_eq!(values.len(), 0, "value cursor not exhausted");
+        }
+
+        frames
+    }
+
+    /// Non-nested nullable columns dominate the CDC scan. Preserve a concrete
+    /// slice iterator for materialized levels so the per-row loop does not pay
+    /// the compact-level cursor dispatch needed by run-backed inputs.
+    #[inline(never)]
+    fn calculate_nullable_indices<I, D, F>(
+        &mut self,
+        mut defs: D,
+        mut values: I,
+        num_levels: usize,
+        mut roll_value: F,
+    ) -> Vec<CdcFrame>
+    where
+        I: ExactSizeIterator<Item = usize>,
+        D: ExactSizeIterator<Item = i16>,
+        F: FnMut(&mut Self, usize),
+    {
+        let mut chunks = Vec::new();
+        let mut prev_offset = 0;
+        let mut prev_value_offset = 0;
+        let mut value_offset = 0;
+        let mut break_before = false;
+
+        for offset in 0..num_levels {
+            let def_level = defs
+                .next()
+                .expect("def_levels required when max_def_level > 0");
+            self.roll_level(def_level);
+            if def_level == self.max_def_level {
+                let array_index = values.next().expect("selected value at max definition");
+                roll_value(self, array_index);
+            }
+            // Check the boundary before incrementing `value_offset` so the
+            // completed frame excludes the current value and the new frame
+            // starts with it.
+            if self.need_new_chunk() {
+                if offset > prev_offset {
+                    chunks.push(CdcFrame {
+                        level_offset: prev_offset,
+                        num_levels: offset - prev_offset,
+                        value_offset: prev_value_offset,
+                        num_values: value_offset - prev_value_offset,
+                        break_before,
+                    });
+                }
+                prev_offset = offset;
+                prev_value_offset = value_offset;
+                break_before = true;
+            }
+            if def_level == self.max_def_level {
+                value_offset += 1;
+            }
+        }
+
+        if prev_offset < num_levels {
+            chunks.push(CdcFrame {
+                level_offset: prev_offset,
+                num_levels: num_levels - prev_offset,
+                value_offset: prev_value_offset,
+                num_values: value_offset - prev_value_offset,
+                break_before,
+            });
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            self.validate_frames(&chunks, num_levels, value_offset);
+            debug_assert_eq!(defs.len(), 0, "definition cursor not exhausted");
+            debug_assert_eq!(values.len(), 0, "value cursor not exhausted");
+        }
 
         chunks
     }
@@ -442,21 +593,64 @@ impl ContentDefinedChunker {
     /// Compute CDC chunk boundaries by dispatching on the Arrow array's data type
     /// to feed value bytes into the rolling hash.
     #[cfg(feature = "arrow")]
-    pub(crate) fn get_arrow_chunks(
+    fn get_arrow_chunks(
         &mut self,
         def_levels: LevelDataRef<'_>,
         rep_levels: LevelDataRef<'_>,
+        value_selection: ValueSelectionRef<'_>,
         array: &dyn arrow_array::Array,
-    ) -> Result<Vec<CdcChunk>> {
+    ) -> Result<Vec<CdcFrame>> {
+        // Dense selections are the common case for required columns. Match
+        // once here so the per-value CDC loop is monomorphized over a concrete
+        // range instead of repeatedly dispatching through ValueSelectionCursor.
+        if let ValueSelectionRef::Dense { offset, len } = value_selection {
+            return self.arrow_chunks_indexed(def_levels, rep_levels, offset..offset + len, array);
+        }
+        if let ValueSelectionRef::Sparse(indices) = value_selection {
+            return self.arrow_chunks_indexed(
+                def_levels,
+                rep_levels,
+                indices.iter().copied(),
+                array,
+            );
+        }
+        if let ValueSelectionRef::Ranges(ranges) = value_selection {
+            return self.arrow_chunks_indexed(
+                def_levels,
+                rep_levels,
+                RangesSelectionCursor::new(ranges),
+                array,
+            );
+        }
+        self.arrow_chunks_indexed(def_levels, rep_levels, value_selection.cursor(), array)
+    }
+
+    /// Hash Arrow values addressed by an already-resolved source index stream.
+    /// Dictionary arrays are hashed from their physical key array.
+    #[cfg(feature = "arrow")]
+    fn arrow_chunks_indexed<I>(
+        &mut self,
+        def_levels: LevelDataRef<'_>,
+        rep_levels: LevelDataRef<'_>,
+        indices: I,
+        array: &dyn arrow_array::Array,
+    ) -> Result<Vec<CdcFrame>>
+    where
+        I: ExactSizeIterator<Item = usize>,
+    {
         use arrow_array::cast::AsArray;
         use arrow_schema::DataType;
+
+        let array = array
+            .as_any_dictionary_opt()
+            .map_or(array, |dictionary| dictionary.keys());
 
         // For nested (list) data, null list entries can own non-zero child
         // ranges in the leaf array, so `array.len()` may exceed the number of
         // levels.  Always drive the loop by the level count; fall back to the
         // array length only when there are no levels at all.
         let num_levels = match (def_levels.len(), rep_levels.len()) {
-            (0, 0) => array.len(),
+            (0, 0) => indices.len(),
             (d, r) => d.max(r),
         };
 
@@ -465,18 +659,25 @@ impl ContentDefinedChunker {
                 let data = array.to_data();
                 let buffer = data.buffers()[0].as_slice();
                 let values = &buffer[data.offset() * $N..];
-                self.calculate(def_levels, rep_levels, num_levels, |c, i| {
-                    let offset = i * $N;
-                    let slice = &values[offset..offset + $N];
-                    c.roll_fixed::<$N>(slice.try_into().unwrap());
-                })
+                self.calculate_indices(
+                    def_levels,
+                    rep_levels,
+                    indices,
+                    num_levels,
+                    #[inline(always)]
+                    |c, i| {
+                        let offset = i * $N;
+                        let slice = &values[offset..offset + $N];
+                        c.roll_fixed::<$N>(slice.try_into().unwrap());
+                    },
+                )
             }};
         }
 
         macro_rules! binary_like {
             ($a:expr) => {{
                 let a = $a;
-                self.calculate(def_levels, rep_levels, num_levels, |c, i| {
+                self.calculate_indices(def_levels, rep_levels, indices, num_levels, |c, i| {
                     c.roll(a.value(i).as_ref());
                 })
             }};
@@ -484,11 +685,14 @@ impl ContentDefinedChunker {
 
         let dtype = array.data_type();
         let chunks = match dtype {
-            DataType::Null => self.calculate(def_levels, rep_levels, num_levels, |_, _| {}),
+            DataType::Null => {
+                self.calculate_indices(def_levels, rep_levels, indices, num_levels, |_, _| {})
+            }
             DataType::Boolean => {
                 let a = array.as_boolean();
-                self.calculate(def_levels, rep_levels, num_levels, |c, i| {
-                    c.roll_fixed(&[a.value(i) as u8]);
+                let values = a.values();
+                self.calculate_indices(def_levels, rep_levels, indices, num_levels, |c, i| {
+                    c.roll_fixed(&[values.value(i) as u8]);
                 })
             }
             DataType::Int8 | DataType::UInt8 => fixed_width!(1),
@@ -520,8 +724,17 @@ impl ContentDefinedChunker {
             DataType::BinaryView => binary_like!(array.as_binary_view()),
             DataType::Utf8View => binary_like!(array.as_string_view()),
             DataType::Dictionary(_, _) => {
-                let dict = array.as_any_dictionary();
-                self.get_arrow_chunks(def_levels, rep_levels, dict.keys())?
+                return Err(ParquetError::General(
+                    "content-defined chunking does not support nested dictionary values"
+                        .to_string(),
+                ));
+            }
+            // Outer run-end input is unwrapped by `get_arrow_chunks`; reaching
+            // this arm means run-end values nested inside another encoding.
+            DataType::RunEndEncoded(_, _) => {
+                return Err(ParquetError::General(
+                    "content-defined chunking does not support nested run-end encoding".to_string(),
+                ));
             }
             _ => {
                 return Err(ParquetError::General(format!(
@@ -533,40 +746,42 @@ impl ContentDefinedChunker {
     }
 
     #[cfg(debug_assertions)]
-    fn validate_chunks(&self, chunks: &[CdcChunk], num_levels: usize, total_values: usize) {
-        assert!(!chunks.is_empty(), "chunks must be non-empty");
+    fn validate_frames(&self, frames: &[CdcFrame], num_levels: usize, total_values: usize) {
+        assert!(!frames.is_empty(), "frames must be non-empty");
 
-        let first = &chunks[0];
-        assert_eq!(first.level_offset, 0, "first chunk must start at level 0");
-        assert_eq!(first.value_offset, 0, "first chunk must start at value 0");
+        let first = &frames[0];
+        assert!(first.num_levels > 0, "frame must have levels");
+        assert_eq!(first.level_offset, 0, "first frame must start at level 0");
+        assert_eq!(first.value_offset, 0, "first frame must start at value 0");
 
         let mut sum_levels = first.num_levels;
         let mut sum_values = first.num_values;
-        for i in 1..chunks.len() {
-            let chunk = &chunks[i];
-            let prev = &chunks[i - 1];
-            assert!(chunk.num_levels > 0, "chunk must have levels");
+        for i in 1..frames.len() {
+            let frame = &frames[i];
+            let prev = &frames[i - 1];
+            assert!(frame.num_levels > 0, "frame must have levels");
+            assert!(frame.break_before, "subsequent frame must start a page");
             assert_eq!(
-                chunk.level_offset,
+                frame.level_offset,
                 prev.level_offset + prev.num_levels,
                 "level offsets must be contiguous"
             );
             assert_eq!(
-                chunk.value_offset,
+                frame.value_offset,
                 prev.value_offset + prev.num_values,
                 "value offsets must be contiguous"
             );
-            sum_levels += chunk.num_levels;
-            sum_values += chunk.num_values;
+            sum_levels += frame.num_levels;
+            sum_values += frame.num_values;
         }
-        assert_eq!(sum_levels, num_levels, "chunks must cover all levels");
-        assert_eq!(sum_values, total_values, "chunks must cover all values");
+        assert_eq!(sum_levels, num_levels, "frames must cover all levels");
+        assert_eq!(sum_values, total_values, "frames must cover all values");
 
-        let last = chunks.last().unwrap();
+        let last = frames.last().unwrap();
         assert_eq!(
             last.level_offset + last.num_levels,
             num_levels,
-            "last chunk must end at num_levels"
+            "last frame must end at num_levels"
         );
     }
 }
@@ -576,8 +791,11 @@ mod tests {
     use super::*;
     use crate::basic::Type as PhysicalType;
     #[cfg(feature = "arrow")]
+    use crate::column::value::ValueSelectionRef;
     use crate::column::writer::LevelDataRef;
     use crate::schema::types::{ColumnPath, Type};
+    #[cfg(feature = "arrow")]
+    use arrow_array::Int32Array;
     use std::sync::Arc;
 
     fn make_desc(max_def_level: i16, max_rep_level: i16) -> ColumnDescriptor {
@@ -629,6 +847,10 @@ mod tests {
         let chunks = chunker.calculate(
             LevelDataRef::Absent,
             LevelDataRef::Absent,
+            ValueSelectionRef::Dense {
+                offset: 0,
+                len: num_values,
+            },
             num_values,
             |c, i| {
                 c.roll_fixed::<4>(&(i as i32).to_le_bytes());
@@ -655,6 +877,10 @@ mod tests {
         let chunks = chunker.calculate(
             LevelDataRef::Absent,
             LevelDataRef::Absent,
+            ValueSelectionRef::Dense {
+                offset: 0,
+                len: num_values,
+            },
             num_values,
             |c, i| {
                 c.roll_fixed::<4>(&(i as i32).to_le_bytes());
@@ -668,7 +894,7 @@ mod tests {
         let mut total_levels = 0;
         for (i, chunk) in chunks.iter().enumerate() {
             assert_eq!(chunk.level_offset, total_levels);
-            if i < chunks.len() - 1 {
+            if i < chunks.len() {
                 assert!(chunk.num_levels > 0);
             }
             total_levels += chunk.num_levels;
@@ -689,10 +915,28 @@ mod tests {
         };
 
         let mut chunker1 = ContentDefinedChunker::new(&make_desc(0, 0), &options).unwrap();
-        let chunks1 = chunker1.calculate(LevelDataRef::Absent, LevelDataRef::Absent, 200, roll);
+        let chunks1 = chunker1.calculate(
+            LevelDataRef::Absent,
+            LevelDataRef::Absent,
+            ValueSelectionRef::Dense {
+                offset: 0,
+                len: 200,
+            },
+            200,
+            roll,
+        );
 
         let mut chunker2 = ContentDefinedChunker::new(&make_desc(0, 0), &options).unwrap();
-        let chunks2 = chunker2.calculate(LevelDataRef::Absent, LevelDataRef::Absent, 200, roll);
+        let chunks2 = chunker2.calculate(
+            LevelDataRef::Absent,
+            LevelDataRef::Absent,
+            ValueSelectionRef::Dense {
+                offset: 0,
+                len: 200,
+            },
+            200,
+            roll,
+        );
 
         assert_eq!(chunks1.len(), chunks2.len());
         for (a, b) in chunks1.iter().zip(chunks2.iter()) {
@@ -700,6 +944,7 @@ mod tests {
             assert_eq!(a.num_levels, b.num_levels);
             assert_eq!(a.value_offset, b.value_offset);
             assert_eq!(a.num_values, b.num_values);
+            assert_eq!(a.break_before, b.break_before);
         }
     }
 
@@ -719,10 +964,16 @@ mod tests {
             .map(|i| if i % 3 == 0 { 0 } else { 1 })
             .collect();
         let expected_non_null: usize = def_levels.iter().filter(|&&d| d == 1).count();
+        let indices: Vec<usize> = def_levels
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &level)| (level == 1).then_some(idx))
+            .collect();
 
         let chunks = chunker.calculate(
             LevelDataRef::Materialized(&def_levels),
             LevelDataRef::Absent,
+            ValueSelectionRef::Sparse(&indices),
             num_levels,
             |c, i| {
                 c.roll_fixed::<4>(&(i as i32).to_le_bytes());
@@ -737,6 +988,210 @@ mod tests {
         // With nulls present, total_values < total_levels
         assert!(total_values < total_levels);
     }
+
+    #[cfg(feature = "arrow")]
+    fn reference_page_starts(frames: &[CdcFrame]) -> Vec<usize> {
+        frames
+            .iter()
+            .filter(|frame| frame.break_before)
+            .map(|frame| frame.level_offset)
+            .collect()
+    }
+
+    #[cfg(feature = "arrow")]
+    fn framed_page_starts(base: usize, frames: &[CdcFrame]) -> Vec<usize> {
+        frames
+            .iter()
+            .filter(|frame| frame.break_before)
+            .map(|frame| base + frame.level_offset)
+            .collect()
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_framer_is_invariant_to_direct_segment_partitioning() {
+        let options = CdcOptions {
+            min_chunk_size: 0,
+            max_chunk_size: 64,
+            norm_level: 0,
+        };
+        let desc = make_desc(0, 0);
+        let array = Int32Array::from_iter_values(0..40);
+
+        let mut reference = ContentDefinedChunker::new(&desc, &options).unwrap();
+        let reference = reference
+            .get_arrow_chunks(
+                LevelDataRef::Absent,
+                LevelDataRef::Absent,
+                ValueSelectionRef::Dense { offset: 0, len: 40 },
+                &array,
+            )
+            .unwrap();
+        let expected_starts = reference_page_starts(&reference);
+        assert!(!expected_starts.is_empty());
+
+        // Every possible non-empty two-segment partition must describe the
+        // same page boundaries as one direct segment.
+        for split in 1..40 {
+            let mut framer = CdcFramer::new(&desc, &options).unwrap();
+            let first = framer
+                .frame_arrow_segment(
+                    LevelDataRef::Absent,
+                    LevelDataRef::Absent,
+                    ValueSelectionRef::Dense {
+                        offset: 0,
+                        len: split,
+                    },
+                    &array,
+                )
+                .unwrap();
+            let second = framer
+                .frame_arrow_segment(
+                    LevelDataRef::Absent,
+                    LevelDataRef::Absent,
+                    ValueSelectionRef::Dense {
+                        offset: split,
+                        len: 40 - split,
+                    },
+                    &array,
+                )
+                .unwrap();
+
+            let mut actual = framed_page_starts(0, &first);
+            actual.extend(framed_page_starts(split, &second));
+            assert_eq!(actual, expected_starts, "partition at {split}");
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_framer_preserves_nested_boundary_at_segment_start() {
+        let options = CdcOptions {
+            min_chunk_size: 0,
+            max_chunk_size: 64,
+            norm_level: 0,
+        };
+        let desc = make_desc(1, 1);
+        let array = Int32Array::from_iter_values(0..40);
+        let defs = vec![1; 40];
+        let reps = vec![0; 40];
+
+        let mut reference = ContentDefinedChunker::new(&desc, &options).unwrap();
+        let reference = reference
+            .get_arrow_chunks(
+                LevelDataRef::Materialized(&defs),
+                LevelDataRef::Materialized(&reps),
+                ValueSelectionRef::Dense { offset: 0, len: 40 },
+                &array,
+            )
+            .unwrap();
+        let expected_starts = reference_page_starts(&reference);
+        let split = expected_starts[0];
+
+        // The first row of the second segment is the row that completes the
+        // boundary. Nested scanning cannot return an empty prefix, so the
+        // framer must carry the boundary as `break_before`.
+        let mut framer = CdcFramer::new(&desc, &options).unwrap();
+        let first = framer
+            .frame_arrow_segment(
+                LevelDataRef::Materialized(&defs[..split]),
+                LevelDataRef::Materialized(&reps[..split]),
+                ValueSelectionRef::Dense {
+                    offset: 0,
+                    len: split,
+                },
+                &array,
+            )
+            .unwrap();
+        let second = framer
+            .frame_arrow_segment(
+                LevelDataRef::Materialized(&defs[split..]),
+                LevelDataRef::Materialized(&reps[split..]),
+                ValueSelectionRef::Dense {
+                    offset: split,
+                    len: 40 - split,
+                },
+                &array,
+            )
+            .unwrap();
+
+        assert!(second[0].break_before);
+        let mut actual = framed_page_starts(0, &first);
+        actual.extend(framed_page_starts(split, &second));
+        assert_eq!(actual, expected_starts);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_dictionary_frames_depend_on_key_layout() {
+        use arrow_array::{ArrayRef, DictionaryArray, Int8Array, StringArray, types::Int8Type};
+        use arrow_buffer::NullBuffer;
+
+        let options = CdcOptions {
+            min_chunk_size: 64,
+            max_chunk_size: 256,
+            norm_level: 0,
+        };
+        let desc = make_desc(0, 0);
+        let len = 4_096;
+        let keys = (0..len).map(|i| (i * 17 + i / 7) % 3).collect::<Vec<_>>();
+        let values = ["alpha", "medium-value", "a-considerably-longer-value"];
+        let plain: ArrayRef = Arc::new(StringArray::from_iter_values(keys.iter().enumerate().map(
+            |(i, &key)| {
+                if i % 17 == 0 || i % 19 == 0 {
+                    ""
+                } else {
+                    values[key]
+                }
+            },
+        )));
+        let remap = [1_i8, 2, 0];
+        let dictionary = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::new(
+                    keys.iter()
+                        .enumerate()
+                        .map(|(i, &key)| {
+                            if i % 17 == 0 {
+                                99
+                            } else if i % 19 == 0 {
+                                3
+                            } else {
+                                remap[key]
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    Some((0..len).map(|i| i % 17 != 0).collect::<NullBuffer>()),
+                ),
+                Arc::new(StringArray::from(vec![
+                    Some(values[2]),
+                    Some(values[0]),
+                    Some(values[1]),
+                    None,
+                ])),
+            )
+            .unwrap(),
+        );
+        let frames = |array: &dyn arrow_array::Array| {
+            ContentDefinedChunker::new(&desc, &options)
+                .unwrap()
+                .get_arrow_chunks(
+                    LevelDataRef::Absent,
+                    LevelDataRef::Absent,
+                    ValueSelectionRef::Dense { offset: 0, len },
+                    array,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|frame| (frame.level_offset, frame.num_levels, frame.break_before))
+                .collect::<Vec<_>>()
+        };
+        let expected = frames(dictionary.keys());
+        assert!(expected.len() > 1);
+        assert_eq!(frames(dictionary.as_ref()), expected);
+        assert_ne!(frames(plain.as_ref()), expected);
+    }
 }
 
 /// Integration tests that exercise CDC through the Arrow writer/reader roundtrip.
@@ -748,13 +1203,16 @@ mod arrow_tests {
 
     use arrow::util::data_gen::create_random_batch;
     use arrow_array::cast::AsArray;
-    use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, RecordBatch};
-    use arrow_buffer::Buffer;
+    use arrow_array::{
+        Array, ArrayRef, BooleanArray, Int32Array, Int32RunArray, ListArray, RecordBatch,
+    };
+    use arrow_buffer::{Buffer, OffsetBuffer};
     use arrow_data::ArrayData;
     use arrow_schema::{DataType, Field, Fields, Schema};
 
     use crate::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use crate::arrow::arrow_writer::ArrowWriter;
+    use crate::column::value::ValueSelectionRef;
     use crate::column::writer::LevelDataRef;
     use crate::file::properties::{CdcOptions, WriterProperties};
     use crate::file::reader::{FileReader, SerializedFileReader};
@@ -2239,13 +2697,26 @@ mod arrow_tests {
         let array: Int32Array = (0..n).map(|i| test_hash(0, i as u64) as i32).collect();
         let mut chunker = super::ContentDefinedChunker::new(&desc, &options).unwrap();
         let chunks = chunker
-            .get_arrow_chunks(LevelDataRef::Absent, LevelDataRef::Absent, &array)
+            .get_arrow_chunks(
+                LevelDataRef::Absent,
+                LevelDataRef::Absent,
+                ValueSelectionRef::Dense { offset: 0, len: n },
+                &array,
+            )
             .unwrap();
 
         let sliced = array.slice(offset, n - offset);
         let mut chunker2 = super::ContentDefinedChunker::new(&desc, &options).unwrap();
         let chunks2 = chunker2
-            .get_arrow_chunks(LevelDataRef::Absent, LevelDataRef::Absent, &sliced)
+            .get_arrow_chunks(
+                LevelDataRef::Absent,
+                LevelDataRef::Absent,
+                ValueSelectionRef::Dense {
+                    offset: 0,
+                    len: n - offset,
+                },
+                &sliced,
+            )
             .unwrap();
 
         let values: Vec<usize> = chunks.iter().map(|c| c.num_values).collect();
@@ -2263,6 +2734,66 @@ mod arrow_tests {
             &values[1..],
             &values2[1..],
             "all chunks after the first must be identical"
+        );
+    }
+
+    #[test]
+    fn test_cdc_dense_selection_matches_sparse_indices() {
+        use crate::basic::Type as PhysicalType;
+        use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
+
+        let options = CdcOptions {
+            min_chunk_size: 64,
+            max_chunk_size: 256,
+            norm_level: 0,
+        };
+        let desc = {
+            let tp = Type::primitive_type_builder("col", PhysicalType::BOOLEAN)
+                .build()
+                .unwrap();
+            ColumnDescriptor::new(Arc::new(tp), 0, 0, ColumnPath::new(vec![]))
+        };
+
+        let offset = 17;
+        let len = 4096;
+        let array: BooleanArray = (0..offset + len)
+            .map(|i| Some(test_hash(11, i as u64) & 1 != 0))
+            .collect();
+        let sparse: Vec<_> = (offset..offset + len).collect();
+
+        let mut dense_chunker = super::ContentDefinedChunker::new(&desc, &options).unwrap();
+        let dense = dense_chunker
+            .get_arrow_chunks(
+                LevelDataRef::Absent,
+                LevelDataRef::Absent,
+                ValueSelectionRef::Dense { offset, len },
+                &array,
+            )
+            .unwrap();
+
+        let mut sparse_chunker = super::ContentDefinedChunker::new(&desc, &options).unwrap();
+        let sparse = sparse_chunker
+            .get_arrow_chunks(
+                LevelDataRef::Absent,
+                LevelDataRef::Absent,
+                ValueSelectionRef::Sparse(&sparse),
+                &array,
+            )
+            .unwrap();
+
+        let chunk_shape = |chunk: &super::CdcFrame| {
+            (
+                chunk.level_offset,
+                chunk.num_levels,
+                chunk.value_offset,
+                chunk.num_values,
+                chunk.break_before,
+            )
+        };
+        assert!(dense.len() > 1, "test input must produce multiple chunks");
+        assert_eq!(
+            dense.iter().map(chunk_shape).collect::<Vec<_>>(),
+            sparse.iter().map(chunk_shape).collect::<Vec<_>>()
         );
     }
 
@@ -2297,6 +2828,51 @@ mod arrow_tests {
             None,
             true,
         );
+    }
+
+    /// A zero-length slice may retain its parent run-end buffers. CDC must use
+    /// the slice's logical length, rather than the retained physical run count,
+    /// when deciding whether there is a run to resolve.
+    #[test]
+    fn test_cdc_empty_list_with_end_sliced_run_end_values() {
+        let run_ends = Int32Array::from(vec![1]);
+        let run_values = Int32Array::from(vec![42]);
+        let run_array = Int32RunArray::try_new(&run_ends, &run_values).unwrap();
+        let empty_values: ArrayRef = Arc::new(run_array.slice(run_array.len(), 0));
+
+        assert_eq!(empty_values.len(), 0);
+        assert_eq!(empty_values.to_data().child_data()[0].len(), 1);
+
+        let item = Arc::new(Field::new_list_field(
+            empty_values.data_type().clone(),
+            false,
+        ));
+        let list: ArrayRef = Arc::new(ListArray::new(
+            item,
+            OffsetBuffer::new(vec![0_i32, 0, 0].into()),
+            empty_values,
+            None,
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![list]).unwrap();
+
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_content_defined_chunking(Some(CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 256,
+                norm_level: 0,
+            }))
+            .build();
+        let mut output = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut output, batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
     }
 
     /// Test CDC with deeply nested types: List<List<Int32>>, List<Struct<List<Int32>>>
