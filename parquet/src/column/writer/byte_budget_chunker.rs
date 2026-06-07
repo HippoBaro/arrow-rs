@@ -18,8 +18,8 @@
 //! See [`ByteBudgetChunker`] for byte-budget-aware mini-batch sizing.
 
 use crate::basic::Type;
-use crate::column::writer::LevelDataRef;
 use crate::column::writer::encoder::ColumnValueEncoder;
+use crate::column::writer::{ColumnValueSource, LevelDataRef};
 use crate::file::properties::WriterProperties;
 use crate::schema::types::ColumnDescriptor;
 
@@ -108,15 +108,18 @@ impl ByteBudgetChunker {
     /// `#[inline]`: this is a tiny per-chunk dispatcher; the actual byte
     /// inspection lives in the out-of-line `byte_budget_sub_batch_size`.
     #[inline]
-    pub(crate) fn pick_sub_batch_size<E: ColumnValueEncoder>(
+    pub(crate) fn pick_sub_batch_size<E, S>(
         &self,
         encoder: &E,
-        values: &E::Values,
-        value_indices: Option<&[usize]>,
+        source: S,
         chunk_def: LevelDataRef<'_>,
         values_offset: usize,
         chunk_size: usize,
-    ) -> usize {
+    ) -> usize
+    where
+        E: ColumnValueEncoder,
+        S: ColumnValueSource<E>,
+    {
         if chunk_size == 0 {
             return chunk_size;
         }
@@ -136,9 +139,8 @@ impl ByteBudgetChunker {
             }
             self.page_byte_limit
         };
-        self.byte_budget_sub_batch_size::<E>(
-            values,
-            value_indices,
+        self.byte_budget_sub_batch_size::<E, S>(
+            source,
             chunk_def,
             values_offset,
             chunk_size,
@@ -152,15 +154,18 @@ impl ByteBudgetChunker {
     /// `#[inline(never)]` keeps this slow path out of the hot
     /// `write_batch_internal` loop; numeric and bool columns never reach it.
     #[inline(never)]
-    fn byte_budget_sub_batch_size<E: ColumnValueEncoder>(
+    fn byte_budget_sub_batch_size<E, S>(
         &self,
-        values: &E::Values,
-        value_indices: Option<&[usize]>,
+        source: S,
         chunk_def: LevelDataRef<'_>,
         values_offset: usize,
         chunk_size: usize,
         budget: usize,
-    ) -> usize {
+    ) -> usize
+    where
+        E: ColumnValueEncoder,
+        S: ColumnValueSource<E>,
+    {
         // How many of this chunk's levels carry an actual value. For a
         // non-nullable, unrepeated column every level is a value, so
         // `value_count` is O(1) (`Absent`/`Uniform` def levels); only
@@ -169,20 +174,16 @@ impl ByteBudgetChunker {
         if vals_in_chunk == 0 {
             return chunk_size;
         }
-        // Ask the encoder how many of the next values fit in one page byte
-        // budget. Dispatch on whether the caller supplied gather indices;
-        // this mirrors how `write_mini_batch` picks `write_gather` vs
-        // `write`.
-        let fit = match value_indices {
-            Some(idx) => {
-                let end = (values_offset + vals_in_chunk).min(idx.len());
-                let start = values_offset.min(end);
-                E::count_values_within_byte_budget_gather(values, &idx[start..end], budget)
-            }
-            None => {
-                E::count_values_within_byte_budget(values, values_offset, vals_in_chunk, budget)
-            }
-        };
+        // Restrict the source to this chunk's values
+        // `[values_offset, values_offset + vals_in_chunk)`, clamped to the
+        // values that remain, then ask how many of them fit in one page byte
+        // budget. The source carries its own dense/sparse selection, so this
+        // mirrors how `write_mini_batch` picks `write_gather` vs `write`.
+        let remaining = source.len().saturating_sub(values_offset);
+        let take = vals_in_chunk.min(remaining);
+        let fit = source
+            .slice(values_offset, take)
+            .count_within_byte_budget(budget);
         match fit {
             None => chunk_size,
             Some(values_per_subbatch) => {
