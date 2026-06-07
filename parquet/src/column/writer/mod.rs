@@ -428,6 +428,131 @@ impl<'a> LevelDataRef<'a> {
     }
 }
 
+/// A selected set of values that can be written to a [`ColumnValueEncoder`].
+///
+/// This abstracts over the physical representation of the values, allowing
+/// callers to expose their native storage shape without forcing all sources
+/// through a `&[T]`.
+pub(crate) trait ColumnValueSource<E: ColumnValueEncoder>: Copy {
+    fn len(self) -> usize;
+
+    fn slice(self, offset: usize, len: usize) -> Self;
+
+    fn write_to(self, encoder: &mut E) -> Result<()>;
+
+    /// Returns how many of the selected values, counting from the front,
+    /// encode within `budget` bytes, or `None` when no cheap estimate is
+    /// available (the caller then treats the whole selection as fitting).
+    ///
+    /// Mirrors [`ColumnValueEncoder::count_values_within_byte_budget`] and is
+    /// used by [`ByteBudgetChunker`] to bound a mini-batch by page byte size.
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize>;
+}
+
+/// Borrowed view of a selected set of values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValueSelection<'a> {
+    #[cfg(feature = "arrow")]
+    Empty,
+    Dense {
+        offset: usize,
+        len: usize,
+    },
+    Sparse(&'a [usize]),
+}
+
+impl<'a> ValueSelection<'a> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            #[cfg(feature = "arrow")]
+            Self::Empty => 0,
+            Self::Dense { len, .. } => len,
+            Self::Sparse(indices) => indices.len(),
+        }
+    }
+
+    pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
+        match self {
+            #[cfg(feature = "arrow")]
+            Self::Empty => {
+                debug_assert_eq!(offset, 0);
+                debug_assert_eq!(len, 0);
+                Self::Empty
+            }
+            Self::Dense {
+                offset: base,
+                len: _selection_len,
+            } => Self::Dense {
+                offset: base + offset,
+                len,
+            },
+            Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
+        }
+    }
+}
+
+/// A physical value storage shape paired with the selected logical values to write.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Selected<'a, S> {
+    storage: S,
+    selection: ValueSelection<'a>,
+}
+
+impl<'a, S> Selected<'a, S> {
+    pub(crate) fn new(storage: S, selection: ValueSelection<'a>) -> Self {
+        Self { storage, selection }
+    }
+}
+
+impl<'a, S: Copy> Selected<'a, S> {
+    pub(crate) fn len(self) -> usize {
+        self.selection.len()
+    }
+
+    pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
+        Self {
+            storage: self.storage,
+            selection: self.selection.slice(offset, len),
+        }
+    }
+}
+
+pub(crate) type SliceColumnValueSource<'a, V> = Selected<'a, &'a V>;
+
+impl<'a, E> ColumnValueSource<E> for Selected<'a, &'a E::Values>
+where
+    E: ColumnValueEncoder,
+{
+    fn len(self) -> usize {
+        Selected::len(self)
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Selected::slice(self, offset, len)
+    }
+
+    fn write_to(self, encoder: &mut E) -> Result<()> {
+        match self.selection {
+            #[cfg(feature = "arrow")]
+            ValueSelection::Empty => Ok(()),
+            ValueSelection::Dense { offset, len } => encoder.write(self.storage, offset, len),
+            ValueSelection::Sparse(indices) => encoder.write_gather(self.storage, indices),
+        }
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        match self.selection {
+            #[cfg(feature = "arrow")]
+            ValueSelection::Empty => None,
+            ValueSelection::Dense { offset, len } => {
+                E::count_values_within_byte_budget(self.storage, offset, len, budget)
+            }
+            ValueSelection::Sparse(indices) => {
+                E::count_values_within_byte_budget_gather(self.storage, indices, budget)
+            }
+        }
+    }
+}
 /// Typed column writer for a primitive column.
 pub type ColumnWriterImpl<'a, T> = GenericColumnWriter<'a, ColumnValueEncoderImpl<T>>;
 
@@ -534,16 +659,18 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn write_batch_internal(
+    pub(crate) fn write_source_batch_internal<S>(
         &mut self,
-        values: &E::Values,
-        value_indices: Option<&[usize]>,
+        source: S,
         def_levels: LevelDataRef<'_>,
         rep_levels: LevelDataRef<'_>,
         min: Option<&E::T>,
         max: Option<&E::T>,
         distinct_count: Option<u64>,
-    ) -> Result<usize> {
+    ) -> Result<usize>
+    where
+        S: ColumnValueSource<E>,
+    {
         // Check if number of definition levels is the same as number of repetition levels.
         if def_levels.len() != 0 && rep_levels.len() != 0 && def_levels.len() != rep_levels.len() {
             return Err(general_err!(
@@ -566,7 +693,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         let num_levels = if num_levels > 0 {
             num_levels
         } else {
-            value_indices.map_or(values.len(), |i| i.len())
+            source.len()
         };
 
         if let Some(min) = min {
@@ -620,27 +747,19 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             // `chunk_size` for the former.
             let sub_batch_size = chunker.pick_sub_batch_size(
                 &self.encoder,
-                values,
-                value_indices,
+                source,
                 chunk_def,
                 values_offset,
                 chunk_size,
             );
 
             if sub_batch_size >= chunk_size {
-                values_offset += self.write_mini_batch(
-                    values,
-                    values_offset,
-                    value_indices,
-                    chunk_size,
-                    chunk_def,
-                    chunk_rep,
-                )?;
+                values_offset +=
+                    self.write_mini_batch(source, values_offset, chunk_size, chunk_def, chunk_rep)?;
             } else {
                 values_offset += self.write_granular_chunk(
-                    values,
+                    source,
                     values_offset,
-                    value_indices,
                     chunk_size,
                     chunk_def,
                     chunk_rep,
@@ -652,6 +771,34 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
 
         // Return total number of values processed.
         Ok(values_offset)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_batch_internal(
+        &mut self,
+        values: &E::Values,
+        value_indices: Option<&[usize]>,
+        def_levels: LevelDataRef<'_>,
+        rep_levels: LevelDataRef<'_>,
+        min: Option<&E::T>,
+        max: Option<&E::T>,
+        distinct_count: Option<u64>,
+    ) -> Result<usize> {
+        let value_selection = match value_indices {
+            Some(indices) => ValueSelection::Sparse(indices),
+            None => ValueSelection::Dense {
+                offset: 0,
+                len: values.len(),
+            },
+        };
+        self.write_source_batch_internal(
+            SliceColumnValueSource::new(values, value_selection),
+            def_levels,
+            rep_levels,
+            min,
+            max,
+            distinct_count,
+        )
     }
 
     /// Writes batch of values, definition levels and repetition levels.
@@ -672,9 +819,12 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         def_levels: Option<&[i16]>,
         rep_levels: Option<&[i16]>,
     ) -> Result<usize> {
-        self.write_batch_internal(
-            values,
-            None,
+        let value_selection = ValueSelection::Dense {
+            offset: 0,
+            len: values.len(),
+        };
+        self.write_source_batch_internal(
+            SliceColumnValueSource::new(values, value_selection),
             LevelDataRef::from(def_levels),
             LevelDataRef::from(rep_levels),
             None,
@@ -699,9 +849,12 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         max: Option<&E::T>,
         distinct_count: Option<u64>,
     ) -> Result<usize> {
-        self.write_batch_internal(
-            values,
-            None,
+        let value_selection = ValueSelection::Dense {
+            offset: 0,
+            len: values.len(),
+        };
+        self.write_source_batch_internal(
+            SliceColumnValueSource::new(values, value_selection),
             LevelDataRef::from(def_levels),
             LevelDataRef::from(rep_levels),
             min,
@@ -823,16 +976,18 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// the hot `write_batch_internal` loop.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
-    fn write_granular_chunk(
+    fn write_granular_chunk<S>(
         &mut self,
-        values: &E::Values,
+        source: S,
         values_offset: usize,
-        value_indices: Option<&[usize]>,
         chunk_size: usize,
         chunk_def: LevelDataRef<'_>,
         chunk_rep: LevelDataRef<'_>,
         sub_batch_size: usize,
-    ) -> Result<usize> {
+    ) -> Result<usize>
+    where
+        S: ColumnValueSource<E>,
+    {
         // The chunker always sizes a sub-batch to at least one level, so each
         // iteration below makes progress (`sub_end > sub_start`).
         debug_assert!(sub_batch_size >= 1, "chunker must size at least one level");
@@ -858,9 +1013,8 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             };
             let sub_len = sub_end - sub_start;
             let written = self.write_mini_batch(
-                values,
+                source,
                 values_offset + values_consumed,
-                value_indices,
                 sub_len,
                 chunk_def.slice(sub_start, sub_len),
                 chunk_rep.slice(sub_start, sub_len),
@@ -882,15 +1036,17 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// Writes mini batch of values, definition and repetition levels.
     /// This allows fine-grained processing of values and maintaining a reasonable
     /// page size.
-    fn write_mini_batch(
+    fn write_mini_batch<S>(
         &mut self,
-        values: &E::Values,
+        source: S,
         values_offset: usize,
-        value_indices: Option<&[usize]>,
         num_levels: usize,
         def_levels: LevelDataRef<'_>,
         rep_levels: LevelDataRef<'_>,
-    ) -> Result<usize> {
+    ) -> Result<usize>
+    where
+        S: ColumnValueSource<E>,
+    {
         // Process definition levels and determine how many values to write.
         let values_to_write = if self.descr.max_def_level() > 0 {
             let max_def = self.descr.max_def_level();
@@ -993,13 +1149,18 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             self.page_metrics.num_buffered_rows += num_levels as u32;
         }
 
-        match value_indices {
-            Some(indices) => {
-                let indices = &indices[values_offset..values_offset + values_to_write];
-                self.encoder.write_gather(values, indices)?;
-            }
-            None => self.encoder.write(values, values_offset, values_to_write)?,
+        let available_values = source.len().saturating_sub(values_offset);
+        if values_to_write > available_values {
+            return Err(general_err!(
+                "Expected to write {} values, but have only {}",
+                values_to_write,
+                available_values
+            ));
         }
+
+        source
+            .slice(values_offset, values_to_write)
+            .write_to(&mut self.encoder)?;
 
         self.page_metrics.num_buffered_values += num_levels as u32;
 
@@ -1654,13 +1815,18 @@ fn update_max<T: ParquetValueType>(descr: &ColumnDescriptor, val: &T, max: &mut 
 fn is_nan<T: ParquetValueType>(descr: &ColumnDescriptor, val: &T) -> bool {
     match T::PHYSICAL_TYPE {
         Type::FLOAT | Type::DOUBLE => val != val,
-        Type::FIXED_LEN_BYTE_ARRAY if descr.logical_type_ref() == Some(&LogicalType::Float16) => {
-            let val = val.as_bytes();
-            let val = f16::from_le_bytes([val[0], val[1]]);
-            val.is_nan()
-        }
+        Type::FIXED_LEN_BYTE_ARRAY => is_nan_byte_array(descr, val.as_bytes()),
         _ => false,
     }
+}
+
+pub(crate) fn is_nan_byte_array(descr: &ColumnDescriptor, val: &[u8]) -> bool {
+    if descr.logical_type_ref() == Some(&LogicalType::Float16) {
+        let val = f16::from_le_bytes([val[0], val[1]]);
+        return val.is_nan();
+    }
+
+    false
 }
 
 /// Perform a conditional update of `cur`, skipping any NaN values
@@ -1707,15 +1873,7 @@ fn compare_greater<T: ParquetValueType>(descr: &ColumnDescriptor, a: &T, b: &T) 
             };
         }
         Type::FIXED_LEN_BYTE_ARRAY | Type::BYTE_ARRAY => {
-            if let Some(LogicalType::Decimal(_)) = descr.logical_type_ref() {
-                return compare_greater_byte_array_decimals(a.as_bytes(), b.as_bytes());
-            }
-            if let ConvertedType::DECIMAL = descr.converted_type() {
-                return compare_greater_byte_array_decimals(a.as_bytes(), b.as_bytes());
-            }
-            if let Some(LogicalType::Float16) = descr.logical_type_ref() {
-                return compare_greater_f16(a.as_bytes(), b.as_bytes());
-            }
+            return compare_greater_byte_array(descr, a.as_bytes(), b.as_bytes());
         }
 
         _ => {}
@@ -1758,6 +1916,20 @@ fn has_dictionary_support(kind: Type, props: &WriterProperties) -> bool {
 #[inline]
 fn compare_greater_unsigned_int<T: ParquetValueType>(a: &T, b: &T) -> bool {
     a.as_u64().unwrap() > b.as_u64().unwrap()
+}
+
+pub(crate) fn compare_greater_byte_array(descr: &ColumnDescriptor, a: &[u8], b: &[u8]) -> bool {
+    if let Some(LogicalType::Decimal(_)) = descr.logical_type_ref() {
+        return compare_greater_byte_array_decimals(a, b);
+    }
+    if let ConvertedType::DECIMAL = descr.converted_type() {
+        return compare_greater_byte_array_decimals(a, b);
+    }
+    if let Some(LogicalType::Float16) = descr.logical_type_ref() {
+        return compare_greater_f16(a, b);
+    }
+
+    a > b
 }
 
 #[inline]
@@ -1947,6 +2119,33 @@ mod tests {
         let props = Default::default();
         let mut writer = get_test_column_writer::<Int32Type>(page_writer, 1, 0, props);
         let res = writer.write_batch(&[1, 2], Some(&[1, 1, 1, 1]), None);
+        assert!(res.is_err());
+        if let Err(err) = res {
+            assert_eq!(
+                format!("{err}"),
+                "Parquet error: Expected to write 4 values, but have only 2"
+            );
+        }
+    }
+
+    #[test]
+    fn test_column_writer_not_enough_selected_values_to_write() {
+        let page_writer = get_test_page_writer();
+        let props = Default::default();
+        let mut writer = get_test_column_writer::<Int32Type>(page_writer, 1, 0, props);
+        let values = [1, 2, 3, 4];
+        let res = writer.write_source_batch_internal(
+            SliceColumnValueSource::new(
+                values.as_slice(),
+                ValueSelection::Dense { offset: 0, len: 2 },
+            ),
+            LevelDataRef::Materialized(&[1, 1, 1, 1]),
+            LevelDataRef::Absent,
+            None,
+            None,
+            None,
+        );
+
         assert!(res.is_err());
         if let Err(err) = res {
             assert_eq!(
@@ -5188,11 +5387,14 @@ mod tests {
                 self.max_rep_level,
                 Arc::new(self.props),
             );
+            let value_selection = ValueSelection::Dense {
+                offset: 0,
+                len: self.values.len(),
+            };
 
             writer
-                .write_batch_internal(
-                    self.values,
-                    None,
+                .write_source_batch_internal(
+                    SliceColumnValueSource::new(self.values, value_selection),
                     self.def_levels,
                     self.rep_levels,
                     None,
@@ -5352,5 +5554,67 @@ mod tests {
                 .with_expected_def_levels(&expected_def_levels)
                 .run();
         }
+    }
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_sparse_value_selection() {
+        // Nullable column with a mix of nulls and values.
+        // def_levels: [1, 0, 1, 0, 1] — values at indices 0, 2, 4.
+        // ValueSelection::Sparse picks out the non-null positions.
+        let max_def_level = 1;
+        let all_values: Vec<i32> = vec![10, 20, 30, 40, 50];
+        let def_levels: &[i16] = &[1, 0, 1, 0, 1];
+        let non_null_indices: &[usize] = &[0, 2, 4];
+
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let mut writer = get_test_column_writer::<Int32Type>(
+            page_writer,
+            max_def_level,
+            0,
+            Arc::new(WriterProperties::default()),
+        );
+
+        writer
+            .write_source_batch_internal(
+                SliceColumnValueSource::new(
+                    all_values.as_slice(),
+                    ValueSelection::Sparse(non_null_indices),
+                ),
+                LevelDataRef::Materialized(def_levels),
+                LevelDataRef::Absent,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let result = writer.close().unwrap();
+        drop(write);
+
+        let props = ReaderProperties::builder()
+            .set_backward_compatible_lz4(false)
+            .build();
+        let page_reader = Box::new(
+            SerializedPageReader::new_with_properties(
+                Arc::new(file),
+                &result.metadata,
+                result.rows_written as usize,
+                None,
+                Arc::new(props),
+            )
+            .unwrap(),
+        );
+        let mut reader = get_test_column_reader::<Int32Type>(page_reader, max_def_level, 0);
+
+        let mut actual_values = Vec::with_capacity(5);
+        let mut actual_def = Vec::with_capacity(5);
+
+        let (_, values_read, levels_read) = reader
+            .read_records(5, Some(&mut actual_def), None, &mut actual_values)
+            .unwrap();
+
+        assert_eq!(&actual_values[..values_read], &[10, 30, 50]);
+        assert_eq!(&actual_def[..levels_read], def_levels);
     }
 }
