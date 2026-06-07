@@ -52,6 +52,8 @@ use crate::schema::types::{ColumnDescPtr, ColumnDescriptor};
 mod byte_budget_chunker;
 pub(crate) mod encoder;
 
+pub use crate::column::writer::encoder::ColumnEncoderType;
+
 use byte_budget_chunker::ByteBudgetChunker;
 
 macro_rules! downcast_writer {

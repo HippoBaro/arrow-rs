@@ -1201,7 +1201,7 @@ pub(crate) mod private {
 
 /// Contains the Parquet physical type information as well as the Rust primitive type
 /// presentation.
-pub trait DataType: 'static + Send {
+pub trait DataType: 'static + Send + crate::column::writer::ColumnEncoderType {
     /// The physical type of the Parquet data type.
     type T: private::ParquetValueType;
 
