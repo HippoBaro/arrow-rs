@@ -27,6 +27,12 @@ use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{BitWriter, num_required_bits};
 
+#[cfg(feature = "arrow")]
+use crate::util::bit_util::get_bit;
+#[cfg(feature = "arrow")]
+use arrow_buffer::ArrowNativeType;
+#[cfg(feature = "arrow")]
+use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
 use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamSplitEncoder};
 use bytes::Bytes;
 pub use dict_encoder::DictEncoder;
@@ -78,6 +84,419 @@ pub trait Encoder<T: DataType>: Send {
     fn flush_buffer(&mut self) -> Result<Bytes>;
 }
 
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RowSelection<'a> {
+    Empty,
+    Dense { offset: usize, len: usize },
+    Sparse(&'a [usize]),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> RowSelection<'a> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Dense { len, .. } => len,
+            Self::Sparse(indices) => indices.len(),
+        }
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        match self {
+            Self::Empty => {
+                debug_assert_eq!(offset, 0);
+                debug_assert_eq!(len, 0);
+                Self::Empty
+            }
+            Self::Dense {
+                offset: base,
+                len: _selection_len,
+            } => Self::Dense {
+                offset: base + offset,
+                len,
+            },
+            Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
+        }
+    }
+
+    #[inline(always)]
+    fn index_at(self, idx: usize) -> usize {
+        debug_assert!(idx < self.len());
+        match self {
+            Self::Empty => unreachable!("empty row selection has no values"),
+            Self::Dense { offset, .. } => offset + idx,
+            Self::Sparse(indices) => indices[idx],
+        }
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(usize) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Dense { offset, len } => {
+                for idx in offset..offset + len {
+                    f(idx)?;
+                }
+                Ok(())
+            }
+            Self::Sparse(indices) => {
+                for &idx in indices {
+                    f(idx)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DictionaryValueIndices<'a> {
+    I8(&'a [i8], RowSelection<'a>),
+    I16(&'a [i16], RowSelection<'a>),
+    I32(&'a [i32], RowSelection<'a>),
+    I64(&'a [i64], RowSelection<'a>),
+    U8(&'a [u8], RowSelection<'a>),
+    U16(&'a [u16], RowSelection<'a>),
+    U32(&'a [u32], RowSelection<'a>),
+    U64(&'a [u64], RowSelection<'a>),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> DictionaryValueIndices<'a> {
+    pub(crate) fn i8(keys: &'a [i8], selection: RowSelection<'a>) -> Self {
+        Self::I8(keys, selection)
+    }
+
+    pub(crate) fn i16(keys: &'a [i16], selection: RowSelection<'a>) -> Self {
+        Self::I16(keys, selection)
+    }
+
+    pub(crate) fn i32(keys: &'a [i32], selection: RowSelection<'a>) -> Self {
+        Self::I32(keys, selection)
+    }
+
+    pub(crate) fn i64(keys: &'a [i64], selection: RowSelection<'a>) -> Self {
+        Self::I64(keys, selection)
+    }
+
+    pub(crate) fn u8(keys: &'a [u8], selection: RowSelection<'a>) -> Self {
+        Self::U8(keys, selection)
+    }
+
+    pub(crate) fn u16(keys: &'a [u16], selection: RowSelection<'a>) -> Self {
+        Self::U16(keys, selection)
+    }
+
+    pub(crate) fn u32(keys: &'a [u32], selection: RowSelection<'a>) -> Self {
+        Self::U32(keys, selection)
+    }
+
+    pub(crate) fn u64(keys: &'a [u64], selection: RowSelection<'a>) -> Self {
+        Self::U64(keys, selection)
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::I8(_, selection)
+            | Self::I16(_, selection)
+            | Self::I32(_, selection)
+            | Self::I64(_, selection)
+            | Self::U8(_, selection)
+            | Self::U16(_, selection)
+            | Self::U32(_, selection)
+            | Self::U64(_, selection) => selection.len(),
+        }
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        match self {
+            Self::I8(keys, selection) => Self::I8(keys, selection.slice(offset, len)),
+            Self::I16(keys, selection) => Self::I16(keys, selection.slice(offset, len)),
+            Self::I32(keys, selection) => Self::I32(keys, selection.slice(offset, len)),
+            Self::I64(keys, selection) => Self::I64(keys, selection.slice(offset, len)),
+            Self::U8(keys, selection) => Self::U8(keys, selection.slice(offset, len)),
+            Self::U16(keys, selection) => Self::U16(keys, selection.slice(offset, len)),
+            Self::U32(keys, selection) => Self::U32(keys, selection.slice(offset, len)),
+            Self::U64(keys, selection) => Self::U64(keys, selection.slice(offset, len)),
+        }
+    }
+
+    #[inline(always)]
+    fn index_at(self, idx: usize) -> usize {
+        match self {
+            Self::I8(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::I16(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::I32(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::I64(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::U8(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::U16(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::U32(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::U64(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+        }
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(usize) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::I8(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::I16(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::I32(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::I64(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::U8(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::U16(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::U32(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::U64(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+        }
+    }
+}
+
+/// Borrowed packed boolean values.
+///
+/// Bits are addressed in the same least-significant-bit-first order used by
+/// Arrow boolean buffers and Parquet boolean encodings.
+#[derive(Debug, Clone, Copy)]
+#[cfg(feature = "arrow")]
+pub(crate) struct PackedBoolValues<'a> {
+    bytes: &'a [u8],
+    selection: PackedBoolSelection<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg(feature = "arrow")]
+enum PackedBoolSelection<'a> {
+    Dense {
+        bit_offset: usize,
+        len: usize,
+    },
+    Sparse {
+        bit_offset: usize,
+        indices: &'a [usize],
+    },
+    Indexed {
+        bit_offset: usize,
+        indices: ValueIndices<'a>,
+    },
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> PackedBoolValues<'a> {
+    pub(crate) fn new(bytes: &'a [u8], bit_offset: usize, len: usize) -> Self {
+        Self {
+            bytes,
+            selection: PackedBoolSelection::Dense { bit_offset, len },
+        }
+    }
+
+    pub(crate) fn new_sparse(bytes: &'a [u8], bit_offset: usize, indices: &'a [usize]) -> Self {
+        Self {
+            bytes,
+            selection: PackedBoolSelection::Sparse {
+                bit_offset,
+                indices,
+            },
+        }
+    }
+
+    pub(crate) fn new_indexed(
+        bytes: &'a [u8],
+        bit_offset: usize,
+        indices: ValueIndices<'a>,
+    ) -> Self {
+        Self {
+            bytes,
+            selection: PackedBoolSelection::Indexed {
+                bit_offset,
+                indices,
+            },
+        }
+    }
+
+    pub(crate) fn dense(self) -> Option<(&'a [u8], usize, usize)> {
+        match self.selection {
+            PackedBoolSelection::Dense { bit_offset, len } => Some((self.bytes, bit_offset, len)),
+            PackedBoolSelection::Sparse { .. } | PackedBoolSelection::Indexed { .. } => None,
+        }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self.selection {
+            PackedBoolSelection::Dense { len, .. } => len,
+            PackedBoolSelection::Sparse { indices, .. } => indices.len(),
+            PackedBoolSelection::Indexed { indices, .. } => indices.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Resolves the selection once, then yields each bit — so consumers avoid the
+    /// per-value `match self.selection` that `value()` pays on every call.
+    #[inline]
+    fn for_each(self, mut f: impl FnMut(bool)) {
+        let bytes = self.bytes;
+        match self.selection {
+            PackedBoolSelection::Dense { bit_offset, len } => {
+                for i in 0..len {
+                    f(get_bit(bytes, bit_offset + i));
+                }
+            }
+            PackedBoolSelection::Sparse {
+                bit_offset,
+                indices,
+            } => {
+                for &idx in indices {
+                    f(get_bit(bytes, bit_offset + idx));
+                }
+            }
+            PackedBoolSelection::Indexed {
+                bit_offset,
+                indices,
+            } => {
+                indices.for_each(|idx| f(get_bit(bytes, bit_offset + idx)));
+            }
+        }
+    }
+
+    #[inline]
+    fn put_indexed_packed(self, bit_writer: &mut BitWriter) {
+        // Stream the selected bits once, packing them LSB-first into 64-bit words —
+        // avoids the per-bit `value()` pull the old `indexed_packed_word` used.
+        let mut word: u64 = 0;
+        let mut bits: usize = 0;
+        self.for_each(|b| {
+            word |= (b as u64) << bits;
+            bits += 1;
+            if bits == 64 {
+                bit_writer.put_value(word, 64);
+                word = 0;
+                bits = 0;
+            }
+        });
+        if bits > 0 {
+            bit_writer.put_value(word, bits);
+        }
+    }
+
+    pub(crate) fn true_count(self) -> usize {
+        match self.selection {
+            // Dense: count set bits in the contiguous range in bulk (popcount)
+            // instead of testing each bit individually.
+            PackedBoolSelection::Dense { bit_offset, len } => {
+                UnalignedBitChunk::new(self.bytes, bit_offset, len).count_ones()
+            }
+            // Sparse/Indexed: selected bits are non-contiguous, so resolve the
+            // selection once and count via `for_each`.
+            PackedBoolSelection::Sparse { .. } | PackedBoolSelection::Indexed { .. } => {
+                let mut count = 0;
+                self.for_each(|b| count += b as usize);
+                count
+            }
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ValueIndices<'a> {
+    Empty,
+    Dense { offset: usize, len: usize },
+    Sparse(&'a [usize]),
+    Dictionary(DictionaryValueIndices<'a>),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> ValueIndices<'a> {
+    pub(crate) fn dictionary(indices: DictionaryValueIndices<'a>) -> Self {
+        Self::Dictionary(indices)
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Dense { len, .. } => len,
+            Self::Sparse(indices) => indices.len(),
+            Self::Dictionary(indices) => indices.len(),
+        }
+    }
+
+    pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
+        match self {
+            Self::Empty => {
+                debug_assert_eq!(offset, 0);
+                debug_assert_eq!(len, 0);
+                Self::Empty
+            }
+            Self::Dense {
+                offset: base,
+                len: _selection_len,
+            } => Self::Dense {
+                offset: base + offset,
+                len,
+            },
+            Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
+            Self::Dictionary(indices) => Self::Dictionary(indices.slice(offset, len)),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn index_at(self, idx: usize) -> usize {
+        debug_assert!(idx < self.len());
+        match self {
+            Self::Empty => unreachable!("empty indices have no values"),
+            Self::Dense { offset, .. } => offset + idx,
+            Self::Sparse(indices) => indices[idx],
+            Self::Dictionary(indices) => indices.index_at(idx),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_for_each<E>(
+        self,
+        mut f: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Dense { offset, len } => {
+                for idx in offset..offset + len {
+                    f(idx)?;
+                }
+                Ok(())
+            }
+            Self::Sparse(indices) => {
+                for &idx in indices {
+                    f(idx)?;
+                }
+                Ok(())
+            }
+            Self::Dictionary(indices) => indices.try_for_each(f),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn for_each(self, mut f: impl FnMut(usize)) {
+        let _ = self.try_for_each(|idx| -> Result<(), ()> {
+            f(idx);
+            Ok(())
+        });
+    }
+}
+
+/// Encodes packed boolean values.
+///
+/// This is a storage-shape fast path for Arrow boolean buffers.
+#[doc(hidden)]
+pub(crate) trait BoolEncoder: Encoder<BoolType> {
+    #[cfg(feature = "arrow")]
+    fn put_packed_bool(&mut self, _values: PackedBoolValues<'_>) -> Result<()> {
+        Err(general_err!(
+            "Packed boolean values are not supported by this encoder"
+        ))
+    }
+}
+
 /// Gets a encoder for the particular data type `T` and encoding `encoding`. Memory usage
 /// for the encoder instance is tracked by `mem_tracker`.
 pub fn get_encoder<T: DataType>(
@@ -106,11 +525,6 @@ pub fn get_encoder<T: DataType>(
     Ok(encoder)
 }
 
-/// Builds the encoder trait object held by a `ColumnValueEncoderImpl`.
-///
-/// The blanket implementation for `dyn Encoder<T>` defers to [`get_encoder`],
-/// giving the existing dynamic-dispatch behavior. Later commits add
-/// physical-type-specialized implementations.
 #[doc(hidden)]
 pub trait EncoderFactory<T: DataType>: Encoder<T> {
     fn get_encoder(encoding: Encoding, descr: &ColumnDescPtr) -> Result<Box<Self>>;
@@ -122,16 +536,62 @@ impl<T: DataType> EncoderFactory<T> for dyn Encoder<T> {
     }
 }
 
-/// Borrowed view of which leaf values a writer should encode.
-///
-/// The Arrow writer derives this from the selected (non-null) positions of a
-/// leaf column. Later commits extend it with a dictionary-keyed variant.
-#[cfg(feature = "arrow")]
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ValueIndices<'a> {
-    Empty,
-    Dense { offset: usize, len: usize },
-    Sparse(&'a [usize]),
+#[doc(hidden)]
+pub struct BoolEncoderObject(Box<dyn BoolEncoder>);
+
+macro_rules! delegate_encoder {
+    ($wrapper:ty, $ty:ty) => {
+        impl Encoder<$ty> for $wrapper {
+            fn put(&mut self, values: &[<$ty as DataType>::T]) -> Result<()> {
+                self.0.put(values)
+            }
+
+            fn encoding(&self) -> Encoding {
+                self.0.encoding()
+            }
+
+            fn estimated_data_encoded_size(&self) -> usize {
+                self.0.estimated_data_encoded_size()
+            }
+
+            fn estimated_memory_size(&self) -> usize {
+                self.0.estimated_memory_size()
+            }
+
+            fn flush_buffer(&mut self) -> Result<Bytes> {
+                self.0.flush_buffer()
+            }
+        }
+    };
+}
+
+delegate_encoder!(BoolEncoderObject, BoolType);
+
+impl BoolEncoder for BoolEncoderObject {
+    #[cfg(feature = "arrow")]
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        self.0.put_packed_bool(values)
+    }
+}
+
+impl EncoderFactory<BoolType> for BoolEncoderObject {
+    fn get_encoder(encoding: Encoding, _descr: &ColumnDescPtr) -> Result<Box<Self>> {
+        let encoder: Box<dyn BoolEncoder> = match encoding {
+            Encoding::PLAIN => Box::new(PlainEncoder::new()),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                return Err(general_err!(
+                    "Cannot initialize this encoding through this function"
+                ));
+            }
+            Encoding::RLE => Box::new(RleValueEncoder::new()),
+            Encoding::DELTA_BINARY_PACKED => Box::new(DeltaBitPackEncoder::new()),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => Box::new(DeltaLengthByteArrayEncoder::new()),
+            Encoding::DELTA_BYTE_ARRAY => Box::new(DeltaByteArrayEncoder::new()),
+            Encoding::BYTE_STREAM_SPLIT => Box::new(ByteStreamSplitEncoder::new()),
+            e => return Err(nyi_err!("Encoding {} is not supported", e)),
+        };
+        Ok(Box::new(Self(encoder)))
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -201,6 +661,19 @@ impl<T: DataType> Encoder<T> for PlainEncoder<T> {
     /// Return the estimated memory size of this encoder.
     fn estimated_memory_size(&self) -> usize {
         self.buffer.capacity() * std::mem::size_of::<u8>() + self.bit_writer.estimated_memory_size()
+    }
+}
+
+impl BoolEncoder for PlainEncoder<BoolType> {
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        if let Some((bytes, bit_offset, len)) = values.dense() {
+            self.bit_writer.put_bits(bytes, bit_offset, len);
+        } else {
+            values.put_indexed_packed(&mut self.bit_writer);
+        }
+        Ok(())
     }
 }
 
@@ -296,6 +769,22 @@ impl<T: DataType> Encoder<T> for RleValueEncoder<T> {
     }
 }
 
+impl BoolEncoder for RleValueEncoder<BoolType> {
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        let rle_encoder = self.encoder.get_or_insert_with(|| {
+            let mut buffer = Vec::with_capacity(DEFAULT_RLE_BUFFER_LEN);
+            // Reserve space for length
+            buffer.extend_from_slice(&[0; 4]);
+            RleEncoder::new_from_buf(1, buffer)
+        });
+
+        values.for_each(|b| rle_encoder.put(b as u64));
+        Ok(())
+    }
+}
+
 // ----------------------------------------------------------------------
 // DELTA_BINARY_PACKED encoding
 
@@ -347,30 +836,6 @@ impl<T: DataType> Default for DeltaBitPackEncoder<T> {
 }
 
 impl<T: DataType> DeltaBitPackEncoder<T> {
-    /// Append a single `i64` value to the delta stream.
-    ///
-    /// Used by the Arrow byte-array writer to encode delta-length offsets;
-    /// later commits route narrow-integer columns through it as well.
-    #[inline]
-    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
-    pub(crate) fn put_i64(&mut self, value: i64) -> Result<()> {
-        if self.total_values == 0 {
-            self.first_value = value;
-            self.current_value = value;
-            self.total_values = 1;
-            return Ok(());
-        }
-
-        self.total_values += 1;
-        self.deltas[self.values_in_block] = self.subtract(value, self.current_value);
-        self.current_value = value;
-        self.values_in_block += 1;
-        if self.values_in_block == self.block_size {
-            self.flush_block_values()?;
-        }
-        Ok(())
-    }
-
     /// Creates new delta bit packed encoder.
     pub fn new() -> Self {
         Self::assert_supported_type();
@@ -485,30 +950,44 @@ impl<T: DataType> DeltaBitPackEncoder<T> {
         );
         Ok(())
     }
-}
 
-// Implementation is shared between Int32Type and Int64Type,
-// see `DeltaBitPackEncoderConversion` below for specifics.
-impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
-    fn put(&mut self, values: &[T::T]) -> Result<()> {
-        if values.is_empty() {
+    #[inline]
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    pub(crate) fn put_i64(&mut self, value: i64) -> Result<()> {
+        if self.total_values == 0 {
+            self.first_value = value;
+            self.current_value = value;
+            self.total_values = 1;
             return Ok(());
         }
 
-        // Define values to encode, initialize state
+        self.total_values += 1;
+        self.deltas[self.values_in_block] = self.subtract(value, self.current_value);
+        self.current_value = value;
+        self.values_in_block += 1;
+        if self.values_in_block == self.block_size {
+            self.flush_block_values()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn put_i64_values(&mut self, len: usize, mut value_at: impl FnMut(usize) -> i64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
         let mut idx = if self.total_values == 0 {
-            self.first_value = self.as_i64(values, 0);
+            self.first_value = value_at(0);
             self.current_value = self.first_value;
             1
         } else {
             0
         };
-        // Add all values (including first value)
-        self.total_values += values.len();
+        self.total_values += len;
 
-        // Write block
-        while idx < values.len() {
-            let value = self.as_i64(values, idx);
+        while idx < len {
+            let value = value_at(idx);
             self.deltas[self.values_in_block] = self.subtract(value, self.current_value);
             self.current_value = value;
             idx += 1;
@@ -518,6 +997,16 @@ impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
             }
         }
         Ok(())
+    }
+}
+
+// Implementation is shared between Int32Type and Int64Type,
+// see `DeltaBitPackEncoderConversion` below for specifics.
+impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
+    fn put(&mut self, values: &[T::T]) -> Result<()> {
+        self.put_i64_values(values.len(), |idx| {
+            values[idx].as_i64().expect(DELTA_BIT_PACK_TYPE_ERROR)
+        })
     }
 
     // Performance Note:
@@ -562,12 +1051,12 @@ impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
     }
 }
 
+impl BoolEncoder for DeltaBitPackEncoder<BoolType> {}
+
 /// Helper trait to define specific conversions and subtractions when computing deltas
 trait DeltaBitPackEncoderConversion<T: DataType> {
     // Method should panic if type is not supported, otherwise no-op
     fn assert_supported_type();
-
-    fn as_i64(&self, values: &[T::T], index: usize) -> i64;
 
     fn subtract(&self, left: i64, right: i64) -> i64;
 
@@ -581,11 +1070,6 @@ impl<T: DataType> DeltaBitPackEncoderConversion<T> for DeltaBitPackEncoder<T> {
     #[inline]
     fn assert_supported_type() {
         ensure_phys_ty!(Type::INT32 | Type::INT64, "{}", DELTA_BIT_PACK_TYPE_ERROR);
-    }
-
-    #[inline]
-    fn as_i64(&self, values: &[T::T], index: usize) -> i64 {
-        values[index].as_i64().expect(DELTA_BIT_PACK_TYPE_ERROR)
     }
 
     #[inline]
@@ -702,6 +1186,8 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
     }
 }
 
+impl BoolEncoder for DeltaLengthByteArrayEncoder<BoolType> {}
+
 // ----------------------------------------------------------------------
 // DELTA_BYTE_ARRAY encoding
 
@@ -812,6 +1298,8 @@ impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
     }
 }
 
+impl BoolEncoder for DeltaByteArrayEncoder<BoolType> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,6 +1352,43 @@ mod tests {
         BoolType::test(Encoding::PLAIN, TEST_SET_SIZE, -1);
         BoolType::test(Encoding::PLAIN_DICTIONARY, TEST_SET_SIZE, -1);
         BoolType::test(Encoding::RLE, TEST_SET_SIZE, -1);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_plain_encoder_sparse_packed_bool() {
+        let input = [
+            0b1010_1101,
+            0b0111_0010,
+            0b1100_1001,
+            0b0011_1110,
+            0b0101_0101,
+            0b1000_1111,
+            0b1111_0000,
+            0b0001_1011,
+            0b1011_0110,
+            0b0100_1001,
+            0b1110_0011,
+            0b0010_1100,
+            0b1001_0111,
+            0b0110_1010,
+        ];
+        let indices: Vec<_> = (0..93).filter(|idx| idx % 3 != 1).collect();
+
+        let mut encoder = PlainEncoder::<BoolType>::new();
+        encoder
+            .put_packed_bool(PackedBoolValues::new_sparse(&input, 5, &indices))
+            .unwrap();
+        let encoded = encoder.flush_buffer().unwrap();
+
+        assert_eq!(encoded.len(), indices.len().div_ceil(8));
+        for (out_idx, &input_idx) in indices.iter().enumerate() {
+            assert_eq!(
+                bit_util::get_bit(&encoded, out_idx),
+                bit_util::get_bit(&input, 5 + input_idx),
+                "mismatch at output bit {out_idx}"
+            );
+        }
     }
 
     #[test]

@@ -28,7 +28,9 @@ use crate::data_type::{
     BoolType, ByteArrayType, DataType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type,
     Int64Type, Int96Type,
 };
-use crate::encodings::encoding::{DictEncoder, Encoder, EncoderFactory};
+#[cfg(feature = "arrow")]
+use crate::encodings::encoding::{BoolEncoder, PackedBoolValues};
+use crate::encodings::encoding::{BoolEncoderObject, DictEncoder, Encoder, EncoderFactory};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
@@ -178,7 +180,7 @@ pub trait ColumnEncoderType: Sized {
 }
 
 impl ColumnEncoderType for BoolType {
-    type Encoder = dyn Encoder<Self>;
+    type Encoder = BoolEncoderObject;
 }
 
 impl ColumnEncoderType for Int32Type {
@@ -259,6 +261,42 @@ impl<T: DataType, E: Encoder<T> + ?Sized> ColumnValueEncoderImpl<T, E> {
             Some(encoder) => encoder.put(slice),
             _ => self.encoder.put(slice),
         }
+    }
+}
+
+#[allow(dead_code)]
+impl ColumnValueEncoderImpl<BoolType, BoolEncoderObject> {
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        self.num_values += values.len();
+
+        if !values.is_empty() {
+            let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+                && self.descr.converted_type() != ConvertedType::INTERVAL;
+
+            if should_update_stats || self.bloom_filter.is_some() {
+                let true_count = values.true_count();
+
+                if should_update_stats {
+                    let min = true_count == values.len();
+                    let max = true_count > 0;
+                    update_min(&self.descr, &min, &mut self.min_value);
+                    update_max(&self.descr, &max, &mut self.max_value);
+                }
+
+                if let Some(bloom_filter) = &mut self.bloom_filter {
+                    if true_count < values.len() {
+                        bloom_filter.insert(&false);
+                    }
+                    if true_count > 0 {
+                        bloom_filter.insert(&true);
+                    }
+                }
+            }
+        }
+
+        debug_assert!(self.dict_encoder.is_none());
+        self.encoder.put_packed_bool(values)
     }
 }
 

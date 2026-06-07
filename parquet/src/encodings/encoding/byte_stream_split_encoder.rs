@@ -16,15 +16,15 @@
 // under the License.
 
 use crate::basic::{Encoding, Type};
-use crate::data_type::{AsBytes, DataType, SliceAsBytes};
+use crate::data_type::{AsBytes, BoolType, DataType, SliceAsBytes};
 
 use crate::errors::{ParquetError, Result};
 
+use super::BoolEncoder;
 use super::Encoder;
 
 use bytes::{BufMut, Bytes};
-use std::cmp;
-use std::marker::PhantomData;
+use std::{cmp, marker::PhantomData};
 
 pub struct ByteStreamSplitEncoder<T> {
     buffer: Vec<u8>,
@@ -111,6 +111,8 @@ impl<T: DataType> Encoder<T> for ByteStreamSplitEncoder<T> {
         self.buffer.capacity() * std::mem::size_of::<u8>()
     }
 }
+
+impl BoolEncoder for ByteStreamSplitEncoder<BoolType> {}
 
 pub struct VariableWidthByteStreamSplitEncoder<T> {
     buffer: Vec<u8>,
@@ -210,6 +212,7 @@ impl<T: DataType> Encoder<T> for VariableWidthByteStreamSplitEncoder<T> {
         };
         // split_streams_const() is faster up to type_width == 8
         match type_size {
+            0 => {}
             2 => split_streams_const::<2>(&self.buffer, &mut encoded),
             3 => split_streams_const::<3>(&self.buffer, &mut encoded),
             4 => split_streams_const::<4>(&self.buffer, &mut encoded),
