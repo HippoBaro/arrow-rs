@@ -16,12 +16,14 @@
 // under the License.
 
 use crate::basic::{Encoding, Type};
-use crate::data_type::{AsBytes, BoolType, DataType, SliceAsBytes};
+use crate::data_type::{AsBytes, BoolType, DataType, Int32Type, Int64Type, SliceAsBytes};
 
 use crate::errors::{ParquetError, Result};
 
-use super::BoolEncoder;
 use super::Encoder;
+use super::{BoolEncoder, Int32Encoder, Int64Encoder};
+#[cfg(feature = "arrow")]
+use super::{Int32Values, Int64Values};
 
 use bytes::{BufMut, Bytes};
 use std::{cmp, marker::PhantomData};
@@ -113,6 +115,22 @@ impl<T: DataType> Encoder<T> for ByteStreamSplitEncoder<T> {
 }
 
 impl BoolEncoder for ByteStreamSplitEncoder<BoolType> {}
+
+impl Int32Encoder for ByteStreamSplitEncoder<Int32Type> {
+    #[cfg(feature = "arrow")]
+    fn put_int32_values(&mut self, values: Int32Values<'_>) -> Result<()> {
+        values.for_each(|value| self.buffer.extend_from_slice(&value.to_le_bytes()));
+        Ok(())
+    }
+}
+
+impl Int64Encoder for ByteStreamSplitEncoder<Int64Type> {
+    #[cfg(feature = "arrow")]
+    fn put_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
+        values.for_each(|value| self.buffer.extend_from_slice(&value.to_le_bytes()));
+        Ok(())
+    }
+}
 
 pub struct VariableWidthByteStreamSplitEncoder<T> {
     buffer: Vec<u8>,

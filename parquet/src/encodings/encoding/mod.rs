@@ -30,9 +30,9 @@ use crate::util::bit_util::{BitWriter, num_required_bits};
 #[cfg(feature = "arrow")]
 use crate::util::bit_util::get_bit;
 #[cfg(feature = "arrow")]
-use arrow_buffer::ArrowNativeType;
-#[cfg(feature = "arrow")]
 use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
+#[cfg(feature = "arrow")]
+use arrow_buffer::{ArrowNativeType, i256};
 use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamSplitEncoder};
 use bytes::Bytes;
 pub use dict_encoder::DictEncoder;
@@ -422,6 +422,10 @@ impl<'a> ValueIndices<'a> {
         }
     }
 
+    pub(crate) fn is_sparse(self) -> bool {
+        matches!(self, Self::Sparse(_))
+    }
+
     pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
         match self {
             Self::Empty => {
@@ -484,6 +488,192 @@ impl<'a> ValueIndices<'a> {
     }
 }
 
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Int32Values<'a> {
+    I32(&'a [i32], ValueIndices<'a>),
+    I8(&'a [i8], ValueIndices<'a>),
+    I16(&'a [i16], ValueIndices<'a>),
+    U8(&'a [u8], ValueIndices<'a>),
+    U16(&'a [u16], ValueIndices<'a>),
+    Date64Days(&'a [i64], ValueIndices<'a>),
+    I64Cast(&'a [i64], ValueIndices<'a>),
+    I128Cast(&'a [i128], ValueIndices<'a>),
+    I256Cast(&'a [i256], ValueIndices<'a>),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> Int32Values<'a> {
+    pub(crate) fn i32(values: &'a [i32], indices: ValueIndices<'a>) -> Self {
+        Self::I32(values, indices)
+    }
+
+    pub(crate) fn i8(values: &'a [i8], indices: ValueIndices<'a>) -> Self {
+        Self::I8(values, indices)
+    }
+
+    pub(crate) fn i16(values: &'a [i16], indices: ValueIndices<'a>) -> Self {
+        Self::I16(values, indices)
+    }
+
+    pub(crate) fn u8(values: &'a [u8], indices: ValueIndices<'a>) -> Self {
+        Self::U8(values, indices)
+    }
+
+    pub(crate) fn u16(values: &'a [u16], indices: ValueIndices<'a>) -> Self {
+        Self::U16(values, indices)
+    }
+
+    pub(crate) fn date64_days(values: &'a [i64], indices: ValueIndices<'a>) -> Self {
+        Self::Date64Days(values, indices)
+    }
+
+    pub(crate) fn i64_cast(values: &'a [i64], indices: ValueIndices<'a>) -> Self {
+        Self::I64Cast(values, indices)
+    }
+
+    pub(crate) fn i128_cast(values: &'a [i128], indices: ValueIndices<'a>) -> Self {
+        Self::I128Cast(values, indices)
+    }
+
+    pub(crate) fn i256_cast(values: &'a [i256], indices: ValueIndices<'a>) -> Self {
+        Self::I256Cast(values, indices)
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::I32(_, indices)
+            | Self::I8(_, indices)
+            | Self::I16(_, indices)
+            | Self::U8(_, indices)
+            | Self::U16(_, indices)
+            | Self::Date64Days(_, indices)
+            | Self::I64Cast(_, indices)
+            | Self::I128Cast(_, indices) => indices.len(),
+            Self::I256Cast(_, indices) => indices.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn is_sparse(self) -> bool {
+        match self {
+            Self::I32(_, indices)
+            | Self::I8(_, indices)
+            | Self::I16(_, indices)
+            | Self::U8(_, indices)
+            | Self::U16(_, indices)
+            | Self::Date64Days(_, indices)
+            | Self::I64Cast(_, indices)
+            | Self::I128Cast(_, indices) => indices.is_sparse(),
+            Self::I256Cast(_, indices) => indices.is_sparse(),
+        }
+    }
+
+    pub(crate) fn materialize(self) -> Vec<i32> {
+        let mut values = Vec::with_capacity(self.len());
+        self.for_each(|value| values.push(value));
+        values
+    }
+
+    #[inline]
+    pub(crate) fn try_for_each<E>(self, mut f: impl FnMut(i32) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::I32(values, indices) => indices.try_for_each(|idx| f(values[idx])),
+            Self::I8(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::I16(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::U8(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::U16(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::Date64Days(values, indices) => {
+                indices.try_for_each(|idx| f((values[idx] / 86_400_000) as i32))
+            }
+            Self::I64Cast(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::I128Cast(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::I256Cast(values, indices) => {
+                indices.try_for_each(|idx| f(values[idx].as_i128() as i32))
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn for_each(self, mut f: impl FnMut(i32)) {
+        let _ = self.try_for_each(|v| -> Result<(), ()> {
+            f(v);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Int64Values<'a> {
+    I64(&'a [i64], ValueIndices<'a>),
+    I128Cast(&'a [i128], ValueIndices<'a>),
+    I256Cast(&'a [i256], ValueIndices<'a>),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> Int64Values<'a> {
+    pub(crate) fn i64(values: &'a [i64], indices: ValueIndices<'a>) -> Self {
+        Self::I64(values, indices)
+    }
+
+    pub(crate) fn i128_cast(values: &'a [i128], indices: ValueIndices<'a>) -> Self {
+        Self::I128Cast(values, indices)
+    }
+
+    pub(crate) fn i256_cast(values: &'a [i256], indices: ValueIndices<'a>) -> Self {
+        Self::I256Cast(values, indices)
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::I64(_, indices) => indices.len(),
+            Self::I128Cast(_, indices) => indices.len(),
+            Self::I256Cast(_, indices) => indices.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn is_sparse(self) -> bool {
+        match self {
+            Self::I64(_, indices) => indices.is_sparse(),
+            Self::I128Cast(_, indices) => indices.is_sparse(),
+            Self::I256Cast(_, indices) => indices.is_sparse(),
+        }
+    }
+
+    pub(crate) fn materialize(self) -> Vec<i64> {
+        let mut values = Vec::with_capacity(self.len());
+        self.for_each(|value| values.push(value));
+        values
+    }
+
+    #[inline]
+    pub(crate) fn try_for_each<E>(self, mut f: impl FnMut(i64) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::I64(values, indices) => indices.try_for_each(|idx| f(values[idx])),
+            Self::I128Cast(values, indices) => indices.try_for_each(|idx| f(values[idx] as i64)),
+            Self::I256Cast(values, indices) => {
+                indices.try_for_each(|idx| f(values[idx].as_i128() as i64))
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn for_each(self, mut f: impl FnMut(i64)) {
+        let _ = self.try_for_each(|v| -> Result<(), ()> {
+            f(v);
+            Ok(())
+        });
+    }
+}
+
 /// Encodes packed boolean values.
 ///
 /// This is a storage-shape fast path for Arrow boolean buffers.
@@ -494,6 +684,36 @@ pub(crate) trait BoolEncoder: Encoder<BoolType> {
         Err(general_err!(
             "Packed boolean values are not supported by this encoder"
         ))
+    }
+}
+
+/// Encodes selected values as physical INT32 values.
+#[doc(hidden)]
+pub(crate) trait Int32Encoder: Encoder<Int32Type> {
+    #[cfg(feature = "arrow")]
+    fn put_int32_values(&mut self, values: Int32Values<'_>) -> Result<()> {
+        match values {
+            Int32Values::I32(_, ValueIndices::Empty) => self.put(&[]),
+            Int32Values::I32(values, ValueIndices::Dense { offset, len }) => {
+                self.put(&values[offset..offset + len])
+            }
+            _ => self.put(&values.materialize()),
+        }
+    }
+}
+
+/// Encodes selected values as physical INT64 values.
+#[doc(hidden)]
+pub(crate) trait Int64Encoder: Encoder<Int64Type> {
+    #[cfg(feature = "arrow")]
+    fn put_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
+        match values {
+            Int64Values::I64(_, ValueIndices::Empty) => self.put(&[]),
+            Int64Values::I64(values, ValueIndices::Dense { offset, len }) => {
+                self.put(&values[offset..offset + len])
+            }
+            _ => self.put(&values.materialize()),
+        }
     }
 }
 
@@ -539,6 +759,12 @@ impl<T: DataType> EncoderFactory<T> for dyn Encoder<T> {
 #[doc(hidden)]
 pub struct BoolEncoderObject(Box<dyn BoolEncoder>);
 
+#[doc(hidden)]
+pub struct Int32EncoderObject(Box<dyn Int32Encoder>);
+
+#[doc(hidden)]
+pub struct Int64EncoderObject(Box<dyn Int64Encoder>);
+
 macro_rules! delegate_encoder {
     ($wrapper:ty, $ty:ty) => {
         impl Encoder<$ty> for $wrapper {
@@ -566,6 +792,8 @@ macro_rules! delegate_encoder {
 }
 
 delegate_encoder!(BoolEncoderObject, BoolType);
+delegate_encoder!(Int32EncoderObject, Int32Type);
+delegate_encoder!(Int64EncoderObject, Int64Type);
 
 impl BoolEncoder for BoolEncoderObject {
     #[cfg(feature = "arrow")]
@@ -574,9 +802,63 @@ impl BoolEncoder for BoolEncoderObject {
     }
 }
 
+impl Int32Encoder for Int32EncoderObject {
+    #[cfg(feature = "arrow")]
+    fn put_int32_values(&mut self, values: Int32Values<'_>) -> Result<()> {
+        self.0.put_int32_values(values)
+    }
+}
+
+impl Int64Encoder for Int64EncoderObject {
+    #[cfg(feature = "arrow")]
+    fn put_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
+        self.0.put_int64_values(values)
+    }
+}
+
 impl EncoderFactory<BoolType> for BoolEncoderObject {
     fn get_encoder(encoding: Encoding, _descr: &ColumnDescPtr) -> Result<Box<Self>> {
         let encoder: Box<dyn BoolEncoder> = match encoding {
+            Encoding::PLAIN => Box::new(PlainEncoder::new()),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                return Err(general_err!(
+                    "Cannot initialize this encoding through this function"
+                ));
+            }
+            Encoding::RLE => Box::new(RleValueEncoder::new()),
+            Encoding::DELTA_BINARY_PACKED => Box::new(DeltaBitPackEncoder::new()),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => Box::new(DeltaLengthByteArrayEncoder::new()),
+            Encoding::DELTA_BYTE_ARRAY => Box::new(DeltaByteArrayEncoder::new()),
+            Encoding::BYTE_STREAM_SPLIT => Box::new(ByteStreamSplitEncoder::new()),
+            e => return Err(nyi_err!("Encoding {} is not supported", e)),
+        };
+        Ok(Box::new(Self(encoder)))
+    }
+}
+
+impl EncoderFactory<Int32Type> for Int32EncoderObject {
+    fn get_encoder(encoding: Encoding, _descr: &ColumnDescPtr) -> Result<Box<Self>> {
+        let encoder: Box<dyn Int32Encoder> = match encoding {
+            Encoding::PLAIN => Box::new(PlainEncoder::new()),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                return Err(general_err!(
+                    "Cannot initialize this encoding through this function"
+                ));
+            }
+            Encoding::RLE => Box::new(RleValueEncoder::new()),
+            Encoding::DELTA_BINARY_PACKED => Box::new(DeltaBitPackEncoder::new()),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => Box::new(DeltaLengthByteArrayEncoder::new()),
+            Encoding::DELTA_BYTE_ARRAY => Box::new(DeltaByteArrayEncoder::new()),
+            Encoding::BYTE_STREAM_SPLIT => Box::new(ByteStreamSplitEncoder::new()),
+            e => return Err(nyi_err!("Encoding {} is not supported", e)),
+        };
+        Ok(Box::new(Self(encoder)))
+    }
+}
+
+impl EncoderFactory<Int64Type> for Int64EncoderObject {
+    fn get_encoder(encoding: Encoding, _descr: &ColumnDescPtr) -> Result<Box<Self>> {
+        let encoder: Box<dyn Int64Encoder> = match encoding {
             Encoding::PLAIN => Box::new(PlainEncoder::new()),
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
                 return Err(general_err!(
@@ -673,6 +955,24 @@ impl BoolEncoder for PlainEncoder<BoolType> {
         } else {
             values.put_indexed_packed(&mut self.bit_writer);
         }
+        Ok(())
+    }
+}
+
+impl Int32Encoder for PlainEncoder<Int32Type> {
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn put_int32_values(&mut self, values: Int32Values<'_>) -> Result<()> {
+        values.for_each(|value| self.buffer.extend_from_slice(&value.to_le_bytes()));
+        Ok(())
+    }
+}
+
+impl Int64Encoder for PlainEncoder<Int64Type> {
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn put_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
+        values.for_each(|value| self.buffer.extend_from_slice(&value.to_le_bytes()));
         Ok(())
     }
 }
@@ -784,6 +1084,9 @@ impl BoolEncoder for RleValueEncoder<BoolType> {
         Ok(())
     }
 }
+
+impl Int32Encoder for RleValueEncoder<Int32Type> {}
+impl Int64Encoder for RleValueEncoder<Int64Type> {}
 
 // ----------------------------------------------------------------------
 // DELTA_BINARY_PACKED encoding
@@ -1051,6 +1354,20 @@ impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
     }
 }
 
+impl Int32Encoder for DeltaBitPackEncoder<Int32Type> {
+    #[cfg(feature = "arrow")]
+    fn put_int32_values(&mut self, values: Int32Values<'_>) -> Result<()> {
+        values.try_for_each(|v| self.put_i64(v as i64))
+    }
+}
+
+impl Int64Encoder for DeltaBitPackEncoder<Int64Type> {
+    #[cfg(feature = "arrow")]
+    fn put_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
+        values.try_for_each(|v| self.put_i64(v))
+    }
+}
+
 impl BoolEncoder for DeltaBitPackEncoder<BoolType> {}
 
 /// Helper trait to define specific conversions and subtractions when computing deltas
@@ -1187,6 +1504,8 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
 }
 
 impl BoolEncoder for DeltaLengthByteArrayEncoder<BoolType> {}
+impl Int32Encoder for DeltaLengthByteArrayEncoder<Int32Type> {}
+impl Int64Encoder for DeltaLengthByteArrayEncoder<Int64Type> {}
 
 // ----------------------------------------------------------------------
 // DELTA_BYTE_ARRAY encoding
@@ -1299,6 +1618,8 @@ impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
 }
 
 impl BoolEncoder for DeltaByteArrayEncoder<BoolType> {}
+impl Int32Encoder for DeltaByteArrayEncoder<Int32Type> {}
+impl Int64Encoder for DeltaByteArrayEncoder<Int64Type> {}
 
 #[cfg(test)]
 mod tests {
@@ -1312,6 +1633,136 @@ mod tests {
     use crate::util::test_common::rand_gen::{RandGen, random_bytes};
 
     const TEST_SET_SIZE: usize = 1024;
+
+    #[cfg(feature = "arrow")]
+    #[derive(Default)]
+    struct PutOnlyInt32Encoder {
+        values: Vec<i32>,
+    }
+
+    #[cfg(feature = "arrow")]
+    impl Encoder<Int32Type> for PutOnlyInt32Encoder {
+        fn put(&mut self, values: &[i32]) -> Result<()> {
+            self.values.extend_from_slice(values);
+            Ok(())
+        }
+
+        fn encoding(&self) -> Encoding {
+            Encoding::PLAIN
+        }
+
+        fn estimated_data_encoded_size(&self) -> usize {
+            0
+        }
+
+        fn flush_buffer(&mut self) -> Result<Bytes> {
+            Ok(Bytes::new())
+        }
+
+        fn estimated_memory_size(&self) -> usize {
+            0
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    impl Int32Encoder for PutOnlyInt32Encoder {}
+
+    #[cfg(feature = "arrow")]
+    #[derive(Default)]
+    struct PutOnlyInt64Encoder {
+        values: Vec<i64>,
+    }
+
+    #[cfg(feature = "arrow")]
+    impl Encoder<Int64Type> for PutOnlyInt64Encoder {
+        fn put(&mut self, values: &[i64]) -> Result<()> {
+            self.values.extend_from_slice(values);
+            Ok(())
+        }
+
+        fn encoding(&self) -> Encoding {
+            Encoding::PLAIN
+        }
+
+        fn estimated_data_encoded_size(&self) -> usize {
+            0
+        }
+
+        fn flush_buffer(&mut self) -> Result<Bytes> {
+            Ok(Bytes::new())
+        }
+
+        fn estimated_memory_size(&self) -> usize {
+            0
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    impl Int64Encoder for PutOnlyInt64Encoder {}
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn selected_int32_default_encoder_uses_dense_put() {
+        let mut encoder = PutOnlyInt32Encoder::default();
+        let values = [1, 2, 3, 4];
+
+        encoder
+            .put_int32_values(Int32Values::i32(
+                &values,
+                ValueIndices::Dense { offset: 1, len: 2 },
+            ))
+            .unwrap();
+
+        assert_eq!(encoder.values, [2, 3]);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn selected_int32_default_encoder_materializes_converted_values() {
+        let mut encoder = PutOnlyInt32Encoder::default();
+        let values = [1i8, 2, 3, 4];
+
+        encoder
+            .put_int32_values(Int32Values::i8(
+                &values,
+                ValueIndices::Dense { offset: 1, len: 2 },
+            ))
+            .unwrap();
+
+        assert_eq!(encoder.values, [2, 3]);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn selected_int64_default_encoder_uses_dense_put() {
+        let mut encoder = PutOnlyInt64Encoder::default();
+        let values = [1, 2, 3, 4];
+
+        encoder
+            .put_int64_values(Int64Values::i64(
+                &values,
+                ValueIndices::Dense { offset: 1, len: 2 },
+            ))
+            .unwrap();
+
+        assert_eq!(encoder.values, [2, 3]);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn selected_int64_default_encoder_materializes_converted_values() {
+        let mut encoder = PutOnlyInt64Encoder::default();
+        let values = [1i128, 2, 3, 4];
+
+        encoder
+            .put_int64_values(Int64Values::i128_cast(
+                &values,
+                ValueIndices::Dense { offset: 1, len: 2 },
+            ))
+            .unwrap();
+
+        assert_eq!(encoder.values, [2, 3]);
+    }
 
     #[test]
     fn test_get_encoders() {

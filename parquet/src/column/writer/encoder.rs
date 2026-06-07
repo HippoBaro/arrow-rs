@@ -29,8 +29,12 @@ use crate::data_type::{
     Int64Type, Int96Type,
 };
 #[cfg(feature = "arrow")]
-use crate::encodings::encoding::{BoolEncoder, PackedBoolValues};
-use crate::encodings::encoding::{BoolEncoderObject, DictEncoder, Encoder, EncoderFactory};
+use crate::encodings::encoding::{
+    BoolEncoder, Int32Encoder, Int32Values, Int64Encoder, Int64Values, PackedBoolValues,
+};
+use crate::encodings::encoding::{
+    BoolEncoderObject, DictEncoder, Encoder, EncoderFactory, Int32EncoderObject, Int64EncoderObject,
+};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
@@ -184,11 +188,11 @@ impl ColumnEncoderType for BoolType {
 }
 
 impl ColumnEncoderType for Int32Type {
-    type Encoder = dyn Encoder<Self>;
+    type Encoder = Int32EncoderObject;
 }
 
 impl ColumnEncoderType for Int64Type {
-    type Encoder = dyn Encoder<Self>;
+    type Encoder = Int64EncoderObject;
 }
 
 impl ColumnEncoderType for FixedLenByteArrayType {
@@ -297,6 +301,70 @@ impl ColumnValueEncoderImpl<BoolType, BoolEncoderObject> {
 
         debug_assert!(self.dict_encoder.is_none());
         self.encoder.put_packed_bool(values)
+    }
+}
+
+#[allow(dead_code)]
+impl ColumnValueEncoderImpl<Int32Type, Int32EncoderObject> {
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_int32_values(&mut self, values: Int32Values<'_>) -> Result<()> {
+        if self.dict_encoder.is_some() || values.is_sparse() {
+            self.num_values += values.len();
+            let materialized = values.materialize();
+            return self.write_slice(&materialized);
+        }
+
+        self.num_values += values.len();
+
+        if !values.is_empty() {
+            let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+                && self.descr.converted_type() != ConvertedType::INTERVAL;
+
+            if should_update_stats {
+                if let Some((min, max)) = int32_min_max(&self.descr, values) {
+                    update_min(&self.descr, &min, &mut self.min_value);
+                    update_max(&self.descr, &max, &mut self.max_value);
+                }
+            }
+
+            if let Some(bloom_filter) = &mut self.bloom_filter {
+                values.for_each(|value| bloom_filter.insert(&value));
+            }
+        }
+
+        self.encoder.put_int32_values(values)
+    }
+}
+
+#[allow(dead_code)]
+impl ColumnValueEncoderImpl<Int64Type, Int64EncoderObject> {
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
+        if self.dict_encoder.is_some() || values.is_sparse() {
+            self.num_values += values.len();
+            let materialized = values.materialize();
+            return self.write_slice(&materialized);
+        }
+
+        self.num_values += values.len();
+
+        if !values.is_empty() {
+            let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+                && self.descr.converted_type() != ConvertedType::INTERVAL;
+
+            if should_update_stats {
+                if let Some((min, max)) = int64_min_max(&self.descr, values) {
+                    update_min(&self.descr, &min, &mut self.min_value);
+                    update_max(&self.descr, &max, &mut self.max_value);
+                }
+            }
+
+            if let Some(bloom_filter) = &mut self.bloom_filter {
+                values.for_each(|value| bloom_filter.insert(&value));
+            }
+        }
+
+        self.encoder.put_int64_values(values)
     }
 }
 
@@ -477,6 +545,40 @@ impl<T: DataType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>> {
         self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
     }
+}
+
+#[cfg(feature = "arrow")]
+fn int32_min_max(descr: &ColumnDescriptor, values: Int32Values<'_>) -> Option<(i32, i32)> {
+    let mut min = None;
+    let mut max = None;
+
+    values.for_each(|value| {
+        if min.is_none_or(|current| compare_greater(descr, &current, &value)) {
+            min = Some(value);
+        }
+        if max.is_none_or(|current| compare_greater(descr, &value, &current)) {
+            max = Some(value);
+        }
+    });
+
+    Some((min?, max?))
+}
+
+#[cfg(feature = "arrow")]
+fn int64_min_max(descr: &ColumnDescriptor, values: Int64Values<'_>) -> Option<(i64, i64)> {
+    let mut min = None;
+    let mut max = None;
+
+    values.for_each(|value| {
+        if min.is_none_or(|current| compare_greater(descr, &current, &value)) {
+            min = Some(value);
+        }
+        if max.is_none_or(|current| compare_greater(descr, &value, &current)) {
+            max = Some(value);
+        }
+    });
+
+    Some((min?, max?))
 }
 
 fn get_min_max<'a, T, I>(descr: &ColumnDescriptor, mut iter: I) -> Option<(T, T)>
