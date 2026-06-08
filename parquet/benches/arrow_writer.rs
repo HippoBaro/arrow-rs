@@ -32,7 +32,11 @@ use std::sync::Arc;
 use arrow::datatypes::*;
 use arrow::util::bench_util::{create_f16_array, create_f32_array, create_f64_array};
 use arrow::{record_batch::RecordBatch, util::data_gen::*};
-use arrow_array::{RecordBatchOptions, StringArray};
+use arrow_array::{
+    ArrayRef, Decimal128Array, DictionaryArray, FixedSizeBinaryArray, Float64Array, Int32Array,
+    Int64Array, RecordBatchOptions, StringArray,
+};
+use arrow_buffer::NullBuffer;
 use parquet::errors::Result;
 use parquet::file::properties::{CdcOptions, WriterProperties, WriterVersion};
 
@@ -79,6 +83,99 @@ fn create_primitive_bench_batch_non_null(
         size,
         null_density,
         true_density,
+    )?)
+}
+
+fn create_primitive_dictionary_bench_batch(
+    size: usize,
+    null_density: f32,
+    true_density: f32,
+) -> Result<RecordBatch> {
+    let fields = vec![Field::new(
+        "_1",
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
+        true,
+    )];
+    let schema = Schema::new(fields);
+    Ok(create_random_batch(
+        Arc::new(schema),
+        size,
+        null_density,
+        true_density,
+    )?)
+}
+
+fn create_primitive_dictionary_bench_batch_1pct_cardinality(
+    size: usize,
+    null_density: f32,
+) -> Result<RecordBatch> {
+    let cardinality = dictionary_cardinality_1pct(size);
+    let schema = dictionary_schema(DataType::Int32);
+    let keys = dictionary_keys(size, cardinality, null_density);
+    let values = Int32Array::from_iter_values((0..cardinality).map(|i| i as i32));
+    let array = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(array) as ArrayRef],
+    )?)
+}
+
+fn create_int64_dictionary_bench_batch(
+    size: usize,
+    null_density: f32,
+    true_density: f32,
+) -> Result<RecordBatch> {
+    Ok(create_random_batch(
+        dictionary_schema(DataType::Int64),
+        size,
+        null_density,
+        true_density,
+    )?)
+}
+
+fn create_int64_dictionary_bench_batch_1pct_cardinality(
+    size: usize,
+    null_density: f32,
+) -> Result<RecordBatch> {
+    let cardinality = dictionary_cardinality_1pct(size);
+    let schema = dictionary_schema(DataType::Int64);
+    let keys = dictionary_keys(size, cardinality, null_density);
+    let values = Int64Array::from_iter_values((0..cardinality).map(|i| i as i64));
+    let array = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(array) as ArrayRef],
+    )?)
+}
+
+fn create_float64_dictionary_bench_batch(
+    size: usize,
+    null_density: f32,
+    true_density: f32,
+) -> Result<RecordBatch> {
+    Ok(create_random_batch(
+        dictionary_schema(DataType::Float64),
+        size,
+        null_density,
+        true_density,
+    )?)
+}
+
+fn create_float64_dictionary_bench_batch_1pct_cardinality(
+    size: usize,
+    null_density: f32,
+) -> Result<RecordBatch> {
+    let cardinality = dictionary_cardinality_1pct(size);
+    let schema = dictionary_schema(DataType::Float64);
+    let keys = dictionary_keys(size, cardinality, null_density);
+    let values = Float64Array::from_iter_values((0..cardinality).map(|i| i as f64));
+    let array = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(array) as ArrayRef],
     )?)
 }
 
@@ -182,6 +279,54 @@ fn create_ree_bench_batch(
         null_density,
         true_density,
     )?)
+}
+
+fn create_string_dictionary_bench_batch_1pct_cardinality(
+    size: usize,
+    null_density: f32,
+) -> Result<RecordBatch> {
+    let cardinality = dictionary_cardinality_1pct(size);
+    let schema = dictionary_schema(DataType::Utf8);
+    let keys = dictionary_keys(size, cardinality, null_density);
+    let values = StringArray::from_iter_values((0..cardinality).map(|i| format!("value_{i:08}")));
+    let array = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(array) as ArrayRef],
+    )?)
+}
+
+fn dictionary_schema(value_type: DataType) -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "_1",
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type)),
+        true,
+    )]))
+}
+
+fn dictionary_cardinality_1pct(size: usize) -> usize {
+    (size / 100).max(1)
+}
+
+fn dictionary_keys(size: usize, cardinality: usize, null_density: f32) -> Int32Array {
+    let keys = (0..size)
+        .map(|i| (i % cardinality) as i32)
+        .collect::<Vec<_>>();
+    Int32Array::new(keys.into(), nulls_for_density(size, null_density))
+}
+
+fn nulls_for_density(size: usize, null_density: f32) -> Option<NullBuffer> {
+    if null_density == 0. {
+        return None;
+    }
+
+    let null_threshold = (null_density.clamp(0., 1.) * 10_000.) as usize;
+    Some(NullBuffer::from(
+        (0..size)
+            .map(|i| (i * 9973) % 10_000 >= null_threshold)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn create_string_bench_batch_non_null(
@@ -467,6 +612,66 @@ fn write_batch_with_option(
     Ok(())
 }
 
+/// High-null byte-array columns (Utf8 / LargeUtf8 / Utf8View / BinaryView).
+/// Isolates the sparse/nullable byte-array write path (`write_byte_values`),
+/// the analogue of `primitive_sparse_99pct_null` for byte arrays.
+fn create_byte_array_sparse_bench_batch(size: usize, null_density: f32) -> Result<RecordBatch> {
+    let fields = vec![
+        Field::new("_1", DataType::Utf8, true),
+        Field::new("_2", DataType::LargeUtf8, true),
+        Field::new("_3", DataType::Utf8View, true),
+        Field::new("_4", DataType::BinaryView, true),
+    ];
+    let schema = Schema::new(fields);
+    Ok(create_random_batch(
+        Arc::new(schema),
+        size,
+        null_density,
+        0.5,
+    )?)
+}
+
+/// FixedSizeBinary column → FIXED_LEN_BYTE_ARRAY. Exercises the raw FLBA path:
+/// dense (`null_density == 0`) hits the contiguous raw-byte fast path; sparse
+/// hits the selected per-value path.
+fn create_fixed_size_binary_bench_batch(
+    size: usize,
+    byte_width: i32,
+    null_density: f32,
+) -> Result<RecordBatch> {
+    let width = byte_width as usize;
+    let nulls = nulls_for_density(size, null_density);
+    let array = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        (0..size).map(|i| {
+            nulls.as_ref().is_none_or(|n| n.is_valid(i)).then(|| {
+                let mut v = vec![0u8; width];
+                let b = (i as u64).to_le_bytes();
+                let n = width.min(8);
+                v[..n].copy_from_slice(&b[..n]);
+                v
+            })
+        }),
+        byte_width,
+    )?;
+    Ok(RecordBatch::try_from_iter([(
+        "col",
+        Arc::new(array) as ArrayRef,
+    )])?)
+}
+
+/// Decimal128(38, 10) column → FIXED_LEN_BYTE_ARRAY(16) (precision 38 forces
+/// FLBA). Exercises the *converted* FLBA path (i128 → big-endian fixed bytes):
+/// dense hits the bulk conversion, sparse hits the per-value converted stream.
+fn create_decimal128_bench_batch(size: usize, null_density: f32) -> Result<RecordBatch> {
+    let values: Vec<i128> = (0..size).map(|i| i as i128).collect();
+    let nulls = nulls_for_density(size, null_density);
+    let array = Decimal128Array::new(values.into(), nulls).with_precision_and_scale(38, 10)?;
+    Ok(RecordBatch::try_from_iter([(
+        "col",
+        Arc::new(array) as ArrayRef,
+    )])?)
+}
+
 fn create_batches() -> Vec<(&'static str, RecordBatch)> {
     const BATCH_SIZE: usize = 1024 * 1024;
 
@@ -477,6 +682,24 @@ fn create_batches() -> Vec<(&'static str, RecordBatch)> {
 
     let batch = create_primitive_bench_batch_non_null(BATCH_SIZE, 0.25, 0.75).unwrap();
     batches.push(("primitive_non_null", batch));
+
+    let batch = create_primitive_dictionary_bench_batch(BATCH_SIZE, 0.25, 0.75).unwrap();
+    batches.push(("primitive_dictionary", batch));
+
+    let batch = create_primitive_dictionary_bench_batch_1pct_cardinality(BATCH_SIZE, 0.25).unwrap();
+    batches.push(("primitive_dictionary_1pct_cardinality", batch));
+
+    let batch = create_int64_dictionary_bench_batch(BATCH_SIZE, 0.25, 0.75).unwrap();
+    batches.push(("int64_dictionary", batch));
+
+    let batch = create_int64_dictionary_bench_batch_1pct_cardinality(BATCH_SIZE, 0.25).unwrap();
+    batches.push(("int64_dictionary_1pct_cardinality", batch));
+
+    let batch = create_float64_dictionary_bench_batch(BATCH_SIZE, 0.25, 0.75).unwrap();
+    batches.push(("float64_dictionary", batch));
+
+    let batch = create_float64_dictionary_bench_batch_1pct_cardinality(BATCH_SIZE, 0.25).unwrap();
+    batches.push(("float64_dictionary_1pct_cardinality", batch));
 
     let batch = create_bool_bench_batch(BATCH_SIZE, 0.25, 0.75).unwrap();
     batches.push(("bool", batch));
@@ -502,6 +725,9 @@ fn create_batches() -> Vec<(&'static str, RecordBatch)> {
 
     let batch = create_string_dictionary_bench_batch(BATCH_SIZE, 0.25, 0.75).unwrap();
     batches.push(("string_dictionary", batch));
+
+    let batch = create_string_dictionary_bench_batch_1pct_cardinality(BATCH_SIZE, 0.25).unwrap();
+    batches.push(("string_dictionary_1pct_cardinality", batch));
 
     let batch = create_string_bench_batch_non_null(BATCH_SIZE, 0.25, 0.75).unwrap();
     batches.push(("string_non_null", batch));
@@ -557,6 +783,21 @@ fn create_batches() -> Vec<(&'static str, RecordBatch)> {
 
     let batch = create_list_struct_with_list_batch(BATCH_SIZE, 0.25).unwrap();
     batches.push(("list_struct_with_list", batch));
+
+    let batch = create_byte_array_sparse_bench_batch(BATCH_SIZE, 0.99).unwrap();
+    batches.push(("byte_array_sparse_99pct_null", batch));
+
+    let batch = create_fixed_size_binary_bench_batch(BATCH_SIZE, 16, 0.0).unwrap();
+    batches.push(("fixed_size_binary_non_null", batch));
+
+    let batch = create_fixed_size_binary_bench_batch(BATCH_SIZE, 16, 0.25).unwrap();
+    batches.push(("fixed_size_binary_sparse", batch));
+
+    let batch = create_decimal128_bench_batch(BATCH_SIZE, 0.0).unwrap();
+    batches.push(("decimal128_non_null", batch));
+
+    let batch = create_decimal128_bench_batch(BATCH_SIZE, 0.25).unwrap();
+    batches.push(("decimal128_sparse", batch));
 
     batches
 }
