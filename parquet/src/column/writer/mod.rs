@@ -513,6 +513,16 @@ impl<'a, S> Selected<'a, S> {
     pub(crate) fn new(storage: S, selection: ValueSelectionRef<'a>) -> Self {
         Self { storage, selection }
     }
+
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    pub(crate) fn storage(self) -> S {
+        self.storage
+    }
+
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    pub(crate) fn selection(self) -> ValueSelectionRef<'a> {
+        self.selection
+    }
 }
 
 impl<'a, S: Copy> Selected<'a, S> {

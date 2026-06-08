@@ -122,6 +122,18 @@ impl<T: DataType> EncoderFactory<T> for dyn Encoder<T> {
     }
 }
 
+/// Borrowed view of which leaf values a writer should encode.
+///
+/// The Arrow writer derives this from the selected (non-null) positions of a
+/// leaf column. Later commits extend it with a dictionary-keyed variant.
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ValueIndices<'a> {
+    Empty,
+    Dense { offset: usize, len: usize },
+    Sparse(&'a [usize]),
+}
+
 // ----------------------------------------------------------------------
 // Plain encoding
 
@@ -335,6 +347,30 @@ impl<T: DataType> Default for DeltaBitPackEncoder<T> {
 }
 
 impl<T: DataType> DeltaBitPackEncoder<T> {
+    /// Append a single `i64` value to the delta stream.
+    ///
+    /// Used by the Arrow byte-array writer to encode delta-length offsets;
+    /// later commits route narrow-integer columns through it as well.
+    #[inline]
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
+    pub(crate) fn put_i64(&mut self, value: i64) -> Result<()> {
+        if self.total_values == 0 {
+            self.first_value = value;
+            self.current_value = value;
+            self.total_values = 1;
+            return Ok(());
+        }
+
+        self.total_values += 1;
+        self.deltas[self.values_in_block] = self.subtract(value, self.current_value);
+        self.current_value = value;
+        self.values_in_block += 1;
+        if self.values_in_block == self.block_size {
+            self.flush_block_values()?;
+        }
+        Ok(())
+    }
+
     /// Creates new delta bit packed encoder.
     pub fn new() -> Self {
         Self::assert_supported_type();

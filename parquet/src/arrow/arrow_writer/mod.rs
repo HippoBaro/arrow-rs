@@ -28,6 +28,7 @@ use std::vec::IntoIter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchWriter};
+use arrow_buffer::NullBuffer;
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field, IntervalUnit, SchemaRef, TimeUnit,
 };
@@ -35,7 +36,9 @@ use arrow_schema::{
 use super::schema::{add_encoded_arrow_schema_to_metadata, decimal_length_from_precision};
 
 use crate::arrow::ArrowSchemaConverter;
-use crate::arrow::arrow_writer::byte_array::ByteArrayEncoder;
+use crate::arrow::arrow_writer::byte_array::{
+    ByteArrayEncoder, ByteArraySource, ByteArraySourceStorage,
+};
 use crate::basic::PageType;
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
@@ -45,6 +48,7 @@ use crate::column::writer::{
     get_column_writer,
 };
 use crate::data_type::{ByteArray, FixedLenByteArray};
+use crate::encodings::encoding::ValueIndices;
 #[cfg(feature = "encryption")]
 use crate::encryption::encrypt::FileEncryptor;
 use crate::errors::{ParquetError, Result};
@@ -1173,21 +1177,11 @@ impl ArrowColumnWriter {
                 write_leaf(c, column, levels)?;
             }
             ArrowColumnWriterImpl::ByteArray(c) => {
-                // The byte-array encoder only implements the gather path. A
-                // sparse selection is already an explicit index slice, so it is
-                // used as-is (no copy); only a dense selection is expanded. This
-                // matches the pre-native behaviour exactly.
-                let dense_indices: Vec<usize>;
-                let selection = match levels.value_selection() {
-                    ValueSelectionRef::Sparse(idx) => ValueSelectionRef::Sparse(idx),
-                    ValueSelectionRef::Empty => ValueSelectionRef::Sparse(&[]),
-                    ValueSelectionRef::Dense { offset, len } => {
-                        dense_indices = (offset..offset + len).collect();
-                        ValueSelectionRef::Sparse(&dense_indices)
-                    }
-                };
                 c.write_batch_internal(
-                    Selected::new(levels.array(), selection),
+                    ByteArraySource::new(
+                        ByteArraySourceStorage::from_array(levels.array()),
+                        levels.value_selection(),
+                    ),
                     levels.def_level_data(),
                     levels.rep_level_data(),
                     None,
@@ -1861,6 +1855,35 @@ fn selection_indices(selection: ValueSelectionRef<'_>) -> Vec<usize> {
         ValueSelectionRef::Sparse(indices) => indices.to_vec(),
         #[cfg(feature = "arrow")]
         ValueSelectionRef::Empty => Vec::new(),
+    }
+}
+
+/// Converts a borrowed [`ValueSelectionRef`] into the encoder-facing
+/// [`ValueIndices`]. Used by the native byte-array writer.
+fn value_indices(selection: ValueSelectionRef<'_>) -> ValueIndices<'_> {
+    match selection {
+        #[cfg(feature = "arrow")]
+        ValueSelectionRef::Empty => ValueIndices::Empty,
+        ValueSelectionRef::Dense { offset, len } => ValueIndices::Dense { offset, len },
+        ValueSelectionRef::Sparse(indices) => ValueIndices::Sparse(indices),
+    }
+}
+
+/// Returns true if any of the selected leaf positions is null. The native
+/// byte-array writer uses this to decide whether null-to-default
+/// materialization is required.
+fn value_indices_include_nulls(nulls: Option<&NullBuffer>, indices: ValueIndices<'_>) -> bool {
+    let Some(nulls) = nulls else {
+        return false;
+    };
+    if nulls.null_count() == 0 {
+        return false;
+    }
+
+    match indices {
+        ValueIndices::Empty => false,
+        ValueIndices::Dense { offset, len } => nulls.slice(offset, len).null_count() > 0,
+        ValueIndices::Sparse(indices) => indices.iter().any(|&idx| nulls.is_null(idx)),
     }
 }
 

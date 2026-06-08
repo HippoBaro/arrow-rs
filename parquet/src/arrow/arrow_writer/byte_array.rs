@@ -20,6 +20,7 @@ use crate::bloom_filter::Sbbf;
 use crate::column::writer::encoder::{
     ColumnValueEncoder, DataPageValues, DictionaryPage, create_bloom_filter,
 };
+use crate::column::writer::{ColumnValueSource, Selected, ValueSelectionRef};
 use crate::data_type::{AsBytes, ByteArray, Int32Type};
 use crate::encodings::encoding::{DeltaBitPackEncoder, Encoder};
 use crate::encodings::rle::RleEncoder;
@@ -30,10 +31,13 @@ use crate::geospatial::statistics::GeospatialStatistics;
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::num_required_bits;
 use crate::util::interner::{Interner, Storage};
+
+use arrow_array::cast::AsArray;
 use arrow_array::types::ByteArrayType;
 use arrow_array::{
-    Array, ArrayAccessor, BinaryArray, BinaryViewArray, DictionaryArray, FixedSizeBinaryArray,
-    GenericByteArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Array, ArrayAccessor, ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray,
+    FixedSizeBinaryArray, GenericByteArray, LargeBinaryArray, LargeStringArray, StringArray,
+    StringViewArray,
 };
 use arrow_buffer::{ArrowNativeType, Buffer};
 use arrow_schema::DataType;
@@ -78,6 +82,9 @@ macro_rules! downcast_op {
             }
             DataType::LargeBinary => {
                 $op($array.as_any().downcast_ref::<LargeBinaryArray>().unwrap()$(, $arg)*)
+            }
+            DataType::FixedSizeBinary(_) => {
+                $op($array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap()$(, $arg)*)
             }
             DataType::BinaryView => {
                 $op($array.as_any().downcast_ref::<BinaryViewArray>().unwrap()$(, $arg)*)
@@ -187,7 +194,7 @@ impl FallbackEncoder {
                 for idx in indices {
                     let value = values.value(idx);
                     let value = value.as_ref();
-                    lengths.put(&[value.len() as i32]).unwrap();
+                    lengths.put_i64(value.len() as i64).unwrap();
                     buffer.extend_from_slice(value);
                     self.variable_length_bytes += value.len() as i64;
                 }
@@ -216,8 +223,66 @@ impl FallbackEncoder {
                     last_value.extend_from_slice(value);
 
                     buffer.extend_from_slice(&value[prefix_length..]);
-                    prefix_lengths.put(&[prefix_length as i32]).unwrap();
-                    suffix_lengths.put(&[suffix_length as i32]).unwrap();
+                    prefix_lengths.put_i64(prefix_length as i64).unwrap();
+                    suffix_lengths.put_i64(suffix_length as i64).unwrap();
+                    self.variable_length_bytes += value.len() as i64;
+                }
+            }
+        }
+    }
+
+    /// Encode a contiguous range from an offset-based byte array
+    fn encode_dense<T>(&mut self, values: &GenericByteArray<T>, offset: usize, len: usize)
+    where
+        T: ByteArrayType,
+    {
+        self.num_values += len;
+        let offsets = values.value_offsets();
+        let end = offset + len;
+        let total_bytes = offsets[end].as_usize() - offsets[offset].as_usize();
+
+        match &mut self.encoder {
+            FallbackEncoderImpl::Plain { buffer } => {
+                buffer.reserve(total_bytes.saturating_add(len.saturating_mul(4)));
+                for value in dense_byte_values(values, offset, len) {
+                    buffer.extend_from_slice((value.len() as u32).as_bytes());
+                    buffer.extend_from_slice(value);
+                    self.variable_length_bytes += value.len() as i64;
+                }
+            }
+            FallbackEncoderImpl::DeltaLength { buffer, lengths } => {
+                buffer.reserve(total_bytes);
+                for value in dense_byte_values(values, offset, len) {
+                    lengths.put_i64(value.len() as i64).unwrap();
+                    buffer.extend_from_slice(value);
+                    self.variable_length_bytes += value.len() as i64;
+                }
+            }
+            FallbackEncoderImpl::Delta {
+                buffer,
+                last_value,
+                prefix_lengths,
+                suffix_lengths,
+            } => {
+                buffer.reserve(total_bytes);
+                for value in dense_byte_values(values, offset, len) {
+                    let mut prefix_length = 0;
+
+                    while prefix_length < last_value.len()
+                        && prefix_length < value.len()
+                        && last_value[prefix_length] == value[prefix_length]
+                    {
+                        prefix_length += 1;
+                    }
+
+                    let suffix_length = value.len() - prefix_length;
+
+                    last_value.clear();
+                    last_value.extend_from_slice(value);
+
+                    buffer.extend_from_slice(&value[prefix_length..]);
+                    prefix_lengths.put_i64(prefix_length as i64).unwrap();
+                    suffix_lengths.put_i64(suffix_length as i64).unwrap();
                     self.variable_length_bytes += value.len() as i64;
                 }
             }
@@ -360,6 +425,20 @@ impl DictEncoder {
         }
     }
 
+    /// Encode a contiguous range from an offset-based byte array
+    fn encode_dense<T>(&mut self, values: &GenericByteArray<T>, offset: usize, len: usize)
+    where
+        T: ByteArrayType,
+    {
+        self.indices.reserve(len);
+
+        for value in dense_byte_values(values, offset, len) {
+            let interned = self.interner.intern(value);
+            self.indices.push(interned);
+            self.variable_length_bytes += value.len() as i64;
+        }
+    }
+
     fn bit_width(&self) -> u8 {
         let length = self.interner.storage().values.len();
         num_required_bits(length.saturating_sub(1) as u64)
@@ -468,8 +547,8 @@ impl ColumnValueEncoder for ByteArrayEncoder {
         })
     }
 
-    fn write(&mut self, _values: &Self::Values, _offset: usize, _len: usize) -> Result<()> {
-        unreachable!("should call write_gather instead")
+    fn write(&mut self, values: &Self::Values, offset: usize, len: usize) -> Result<()> {
+        write_dense(values, offset, len, self)
     }
 
     fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()> {
@@ -549,13 +628,9 @@ impl ColumnValueEncoder for ByteArrayEncoder {
             // chunk as fitting and stay on the batched path. (A per-value
             // walk through dict keys on every chunk also measured ~+30-80%
             // slower than `main`.)
-            DataType::Dictionary(_, _) => indices.len(),
-            // Every byte-array type `ByteArrayEncoder` is constructed for
-            // has an explicit arm above. A `Dictionary(value = FixedSizeBinary)`
-            // column hits the `Dictionary(_, _)` arm (its `values.data_type()`
-            // is `Dictionary`), and a bare `FixedSizeBinary` column is routed
-            // to the generic column writer, never this encoder — so no other
-            // type can reach here.
+            DataType::Dictionary(_, _) | DataType::FixedSizeBinary(_) => indices.len(),
+            // Every other byte-array type `ByteArrayEncoder` is constructed for
+            // has an explicit arm above, so nothing else can reach here.
             data_type => unreachable!("ByteArrayEncoder cannot be constructed for {data_type:?}"),
         };
         Some(count)
@@ -635,6 +710,93 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>> {
         self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
     }
+}
+
+pub(crate) type ByteArraySource<'a> = Selected<'a, ByteArraySourceStorage<'a>>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ByteArraySourceStorage<'a> {
+    values: &'a (dyn Array + 'static),
+}
+
+impl<'a> ByteArraySourceStorage<'a> {
+    pub(crate) fn from_array(values: &'a (dyn Array + 'static)) -> Self {
+        Self { values }
+    }
+}
+
+impl<'a> ColumnValueSource<ByteArrayEncoder> for Selected<'a, ByteArraySourceStorage<'a>> {
+    fn len(self) -> usize {
+        Selected::len(self)
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Selected::slice(self, offset, len)
+    }
+
+    fn write_to(self, encoder: &mut ByteArrayEncoder) -> Result<()> {
+        let values = self.storage().values;
+        let selection = self.selection();
+        if let Some(materialized) = materialize_dictionary_with_selected_nulls(values, selection)? {
+            return ByteArraySource::new(
+                ByteArraySourceStorage::from_array(materialized.as_ref()),
+                selection,
+            )
+            .write_to(encoder);
+        }
+
+        match selection {
+            ValueSelectionRef::Empty => Ok(()),
+            ValueSelectionRef::Dense { offset, len } => write_dense(values, offset, len, encoder),
+            ValueSelectionRef::Sparse(indices) => {
+                downcast_op!(
+                    values.data_type(),
+                    values,
+                    encode,
+                    indices.iter().copied(),
+                    encoder
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        let values = self.storage().values;
+        match self.selection() {
+            ValueSelectionRef::Empty => None,
+            // Mirror the dense/gather split in `write_to` so the byte-budget
+            // estimate matches the bytes actually written.
+            ValueSelectionRef::Dense { offset, len } => {
+                Some(count_dense_within_byte_budget(values, offset, len, budget))
+            }
+            ValueSelectionRef::Sparse(indices) => {
+                ByteArrayEncoder::count_values_within_byte_budget_gather(values, indices, budget)
+            }
+        }
+    }
+}
+
+fn materialize_dictionary_with_selected_nulls(
+    values: &dyn Array,
+    selection: ValueSelectionRef<'_>,
+) -> Result<Option<ArrayRef>> {
+    let DataType::Dictionary(_, _) = values.data_type() else {
+        return Ok(None);
+    };
+
+    let logical_nulls = values.logical_nulls();
+    if !super::value_indices_include_nulls(logical_nulls.as_ref(), super::value_indices(selection))
+    {
+        return Ok(None);
+    }
+
+    let dictionary = values.as_any_dictionary();
+    Ok(Some(arrow_select::take::take(
+        dictionary.values(),
+        dictionary.keys(),
+        None,
+    )?))
 }
 
 /// Encodes the provided `values` and `indices` to `encoder`
@@ -772,6 +934,241 @@ fn count_within_budget_offsets<T: ByteArrayType>(
     n
 }
 
+/// Number of leading values in the dense range `[offset, offset + len)` whose
+/// cumulative plain-encoded size fits `byte_budget` (boundary value included).
+///
+/// Dense counterpart of the gather dispatch in
+/// [`ByteArrayEncoder::count_values_within_byte_budget_gather`], used for the
+/// contiguous, all-valid selection produced for non-nullable byte columns.
+fn count_dense_within_byte_budget(
+    values: &dyn Array,
+    offset: usize,
+    len: usize,
+    byte_budget: usize,
+) -> usize {
+    match values.data_type() {
+        DataType::Utf8 => count_within_budget_offsets_dense(
+            values.as_any().downcast_ref::<StringArray>().unwrap(),
+            offset,
+            len,
+            byte_budget,
+        ),
+        DataType::LargeUtf8 => count_within_budget_offsets_dense(
+            values.as_any().downcast_ref::<LargeStringArray>().unwrap(),
+            offset,
+            len,
+            byte_budget,
+        ),
+        DataType::Binary => count_within_budget_offsets_dense(
+            values.as_any().downcast_ref::<BinaryArray>().unwrap(),
+            offset,
+            len,
+            byte_budget,
+        ),
+        DataType::LargeBinary => count_within_budget_offsets_dense(
+            values.as_any().downcast_ref::<LargeBinaryArray>().unwrap(),
+            offset,
+            len,
+            byte_budget,
+        ),
+        DataType::Utf8View => {
+            let array = values.as_any().downcast_ref::<StringViewArray>().unwrap();
+            count_within_budget_views_dense(
+                array.views(),
+                offset,
+                len,
+                byte_budget,
+                max_view_value_len(array.data_buffers()),
+            )
+        }
+        DataType::BinaryView => {
+            let array = values.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+            count_within_budget_views_dense(
+                array.views(),
+                offset,
+                len,
+                byte_budget,
+                max_view_value_len(array.data_buffers()),
+            )
+        }
+        // Dictionary values are already small and deduplicated, so there is
+        // nothing to bound — treat every chunk as fitting.
+        DataType::Dictionary(_, _) | DataType::FixedSizeBinary(_) => len,
+        data_type => unreachable!("ByteArrayEncoder cannot be constructed for {data_type:?}"),
+    }
+}
+
+/// Dense-range counterpart of [`count_within_budget_offsets`].
+fn count_within_budget_offsets_dense<T: ByteArrayType>(
+    values: &GenericByteArray<T>,
+    offset: usize,
+    len: usize,
+    byte_budget: usize,
+) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let offsets = values.value_offsets();
+    let prefix_overhead = std::mem::size_of::<u32>();
+    // Stage 1: O(1) span over the contiguous range.
+    let payload = (offsets[offset + len] - offsets[offset]).as_usize();
+    if payload + len * prefix_overhead <= byte_budget {
+        return len;
+    }
+    // Stage 2: per-value scan.
+    let mut cum: usize = 0;
+    for i in 0..len {
+        let value_len =
+            (offsets[offset + i + 1] - offsets[offset + i]).as_usize() + prefix_overhead;
+        cum = cum.saturating_add(value_len);
+        if cum > byte_budget {
+            return i + 1;
+        }
+    }
+    len
+}
+
+/// Dense-range counterpart of [`count_within_budget_views`].
+fn count_within_budget_views_dense(
+    views: &[u128],
+    offset: usize,
+    len: usize,
+    byte_budget: usize,
+    max_value_len: usize,
+) -> usize {
+    let per_value = max_value_len + std::mem::size_of::<u32>();
+    if len.saturating_mul(per_value) <= byte_budget {
+        return len;
+    }
+    let mut cum: usize = 0;
+    for i in 0..len {
+        let value_len = (views[offset + i] as u32) as usize;
+        cum = cum.saturating_add(value_len + std::mem::size_of::<u32>());
+        if cum > byte_budget {
+            return i + 1;
+        }
+    }
+    len
+}
+
+/// Dispatches a contiguous range write to `encode_dense` for offset-based byte
+/// arrays, falling back to `encode` for array types that don't expose a
+/// value_offsets/value_data layout (Dictionary, FixedSizeBinary, BinaryView,
+/// Utf8View).
+fn write_dense(
+    values: &dyn Array,
+    offset: usize,
+    len: usize,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()> {
+    match values.data_type() {
+        DataType::Utf8 => encode_dense(
+            values.as_any().downcast_ref::<StringArray>().unwrap(),
+            offset,
+            len,
+            encoder,
+        ),
+        DataType::LargeUtf8 => encode_dense(
+            values.as_any().downcast_ref::<LargeStringArray>().unwrap(),
+            offset,
+            len,
+            encoder,
+        ),
+        DataType::Binary => encode_dense(
+            values.as_any().downcast_ref::<BinaryArray>().unwrap(),
+            offset,
+            len,
+            encoder,
+        ),
+        DataType::LargeBinary => encode_dense(
+            values.as_any().downcast_ref::<LargeBinaryArray>().unwrap(),
+            offset,
+            len,
+            encoder,
+        ),
+        _ => {
+            downcast_op!(
+                values.data_type(),
+                values,
+                encode,
+                offset..offset + len,
+                encoder
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Encodes a contiguous range from an offset-based byte array
+fn encode_dense<T>(
+    values: &GenericByteArray<T>,
+    offset: usize,
+    len: usize,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()>
+where
+    T: ByteArrayType,
+{
+    if len == 0 {
+        return Ok(());
+    }
+
+    if encoder.statistics_enabled != EnabledStatistics::None {
+        if let Some(accumulator) = encoder.geo_stats_accumulator.as_mut() {
+            update_geo_stats_accumulator_values(
+                accumulator.as_mut(),
+                dense_byte_values(values, offset, len),
+            );
+        } else if let Some((min, max)) =
+            compute_min_max_values(dense_byte_values(values, offset, len))
+        {
+            if encoder.min_value.as_ref().is_none_or(|m| m > &min) {
+                encoder.min_value = Some(min);
+            }
+
+            if encoder.max_value.as_ref().is_none_or(|m| m < &max) {
+                encoder.max_value = Some(max);
+            }
+        }
+    }
+
+    if let Some(bloom_filter) = &mut encoder.bloom_filter {
+        for value in dense_byte_values(values, offset, len) {
+            bloom_filter.insert(value);
+        }
+    }
+
+    match &mut encoder.dict_encoder {
+        Some(dict_encoder) => dict_encoder.encode_dense(values, offset, len),
+        None => encoder.fallback.encode_dense(values, offset, len),
+    }
+
+    Ok(())
+}
+
+fn dense_byte_values<T>(
+    values: &GenericByteArray<T>,
+    offset: usize,
+    len: usize,
+) -> impl ExactSizeIterator<Item = &[u8]>
+where
+    T: ByteArrayType,
+{
+    // Walk the offsets buffer with `windows(2)`: each value's `[start, end]`
+    // pair is read from a fixed-length-2 sub-slice, so the per-value offset
+    // reads carry no bounds checks and the loop stays tight. Indexing
+    // `offsets[idx]` / `offsets[idx + 1]` separately each iteration (over a
+    // `Range`) defeats that elision and is measurably slower for small values.
+    let data = values.value_data();
+    values.value_offsets()[offset..offset + len + 1]
+        .windows(2)
+        .map(move |w| {
+            let start = w[0].as_usize();
+            let end = w[1].as_usize();
+            &data[start..end]
+        })
+}
+
 /// Computes the min and max for the provided array and indices
 ///
 /// This is a free function so it can be used with `downcast_op!`
@@ -796,6 +1193,20 @@ where
     Some((min.as_ref().to_vec().into(), max.as_ref().to_vec().into()))
 }
 
+fn compute_min_max_values<T>(mut values: impl Iterator<Item = T>) -> Option<(ByteArray, ByteArray)>
+where
+    T: Copy + Ord + AsRef<[u8]>,
+{
+    let first_val = values.next()?;
+    let mut min = first_val;
+    let mut max = first_val;
+    for val in values {
+        min = min.min(val);
+        max = max.max(val);
+    }
+    Some((min.as_ref().to_vec().into(), max.as_ref().to_vec().into()))
+}
+
 /// Updates geospatial statistics for the provided array and indices
 fn update_geo_stats_accumulator<T>(
     bounder: &mut dyn GeoStatsAccumulator,
@@ -809,6 +1220,19 @@ fn update_geo_stats_accumulator<T>(
         for idx in valid {
             let val = array.value(idx);
             bounder.update_wkb(val.as_ref());
+        }
+    }
+}
+
+fn update_geo_stats_accumulator_values<T>(
+    bounder: &mut dyn GeoStatsAccumulator,
+    values: impl Iterator<Item = T>,
+) where
+    T: AsRef<[u8]>,
+{
+    if bounder.is_valid() {
+        for value in values {
+            bounder.update_wkb(value.as_ref());
         }
     }
 }
