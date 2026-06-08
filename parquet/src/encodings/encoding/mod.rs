@@ -197,7 +197,7 @@ impl<'a> DictionaryValueIndices<'a> {
         Self::U64(keys, selection)
     }
 
-    fn len(self) -> usize {
+    pub(crate) fn len(self) -> usize {
         match self {
             Self::I8(_, selection)
             | Self::I16(_, selection)
@@ -238,7 +238,10 @@ impl<'a> DictionaryValueIndices<'a> {
     }
 
     #[inline]
-    fn try_for_each<E>(self, mut f: impl FnMut(usize) -> Result<(), E>) -> Result<(), E> {
+    pub(crate) fn try_for_each<E>(
+        self,
+        mut f: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
         match self {
             Self::I8(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
             Self::I16(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
@@ -548,6 +551,10 @@ impl<'a> ValueIndices<'a> {
         matches!(self, Self::Sparse(_))
     }
 
+    pub(crate) fn is_dictionary(self) -> bool {
+        matches!(self, Self::Dictionary(_))
+    }
+
     pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
         match self {
             Self::Empty => {
@@ -694,6 +701,20 @@ impl<'a> Int32Values<'a> {
         }
     }
 
+    pub(crate) fn is_dictionary(self) -> bool {
+        match self {
+            Self::I32(_, indices)
+            | Self::I8(_, indices)
+            | Self::I16(_, indices)
+            | Self::U8(_, indices)
+            | Self::U16(_, indices)
+            | Self::Date64Days(_, indices)
+            | Self::I64Cast(_, indices)
+            | Self::I128Cast(_, indices) => indices.is_dictionary(),
+            Self::I256Cast(_, indices) => indices.is_dictionary(),
+        }
+    }
+
     pub(crate) fn materialize(self) -> Vec<i32> {
         let mut values = Vec::with_capacity(self.len());
         self.for_each(|value| values.push(value));
@@ -770,6 +791,14 @@ impl<'a> Int64Values<'a> {
         }
     }
 
+    pub(crate) fn is_dictionary(self) -> bool {
+        match self {
+            Self::I64(_, indices) => indices.is_dictionary(),
+            Self::I128Cast(_, indices) => indices.is_dictionary(),
+            Self::I256Cast(_, indices) => indices.is_dictionary(),
+        }
+    }
+
     pub(crate) fn materialize(self) -> Vec<i64> {
         let mut values = Vec::with_capacity(self.len());
         self.for_each(|value| values.push(value));
@@ -835,6 +864,20 @@ pub(crate) trait Int32Encoder: Encoder<Int32Type> {
             _ => self.put(&values.materialize()),
         }
     }
+
+    /// As [`Self::put_int32_values`], but invokes `observe` on each logical
+    /// value in the same pass that encodes it, letting the caller fold
+    /// statistics into the encode walk rather than taking a second (possibly
+    /// gathered) pass. The default is a two-pass fallback.
+    #[cfg(feature = "arrow")]
+    fn put_int32_values_observed(
+        &mut self,
+        values: Int32Values<'_>,
+        observe: &mut dyn FnMut(i32),
+    ) -> Result<()> {
+        values.for_each(observe);
+        self.put_int32_values(values)
+    }
 }
 
 /// Encodes selected values as physical INT64 values.
@@ -849,6 +892,19 @@ pub(crate) trait Int64Encoder: Encoder<Int64Type> {
             }
             _ => self.put(&values.materialize()),
         }
+    }
+
+    /// As [`Self::put_int64_values`], but invokes `observe` on each logical
+    /// value in the same pass that encodes it. The default is a two-pass
+    /// fallback.
+    #[cfg(feature = "arrow")]
+    fn put_int64_values_observed(
+        &mut self,
+        values: Int64Values<'_>,
+        observe: &mut dyn FnMut(i64),
+    ) -> Result<()> {
+        values.for_each(observe);
+        self.put_int64_values(values)
     }
 }
 
@@ -953,12 +1009,30 @@ impl Int32Encoder for Int32EncoderObject {
     fn put_int32_values(&mut self, values: Int32Values<'_>) -> Result<()> {
         self.0.put_int32_values(values)
     }
+
+    #[cfg(feature = "arrow")]
+    fn put_int32_values_observed(
+        &mut self,
+        values: Int32Values<'_>,
+        observe: &mut dyn FnMut(i32),
+    ) -> Result<()> {
+        self.0.put_int32_values_observed(values, observe)
+    }
 }
 
 impl Int64Encoder for Int64EncoderObject {
     #[cfg(feature = "arrow")]
     fn put_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
         self.0.put_int64_values(values)
+    }
+
+    #[cfg(feature = "arrow")]
+    fn put_int64_values_observed(
+        &mut self,
+        values: Int64Values<'_>,
+        observe: &mut dyn FnMut(i64),
+    ) -> Result<()> {
+        self.0.put_int64_values_observed(values, observe)
     }
 }
 
@@ -1148,6 +1222,19 @@ impl Int32Encoder for PlainEncoder<Int32Type> {
         values.for_each(|value| self.buffer.extend_from_slice(&value.to_le_bytes()));
         Ok(())
     }
+
+    #[cfg(feature = "arrow")]
+    fn put_int32_values_observed(
+        &mut self,
+        values: Int32Values<'_>,
+        observe: &mut dyn FnMut(i32),
+    ) -> Result<()> {
+        values.for_each(|value| {
+            observe(value);
+            self.buffer.extend_from_slice(&value.to_le_bytes());
+        });
+        Ok(())
+    }
 }
 
 impl Int64Encoder for PlainEncoder<Int64Type> {
@@ -1155,6 +1242,19 @@ impl Int64Encoder for PlainEncoder<Int64Type> {
     #[inline]
     fn put_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
         values.for_each(|value| self.buffer.extend_from_slice(&value.to_le_bytes()));
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn put_int64_values_observed(
+        &mut self,
+        values: Int64Values<'_>,
+        observe: &mut dyn FnMut(i64),
+    ) -> Result<()> {
+        values.for_each(|value| {
+            observe(value);
+            self.buffer.extend_from_slice(&value.to_le_bytes());
+        });
         Ok(())
     }
 }

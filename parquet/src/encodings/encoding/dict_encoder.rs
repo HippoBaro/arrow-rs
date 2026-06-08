@@ -29,6 +29,10 @@ use crate::errors::Result;
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::num_required_bits;
 use crate::util::interner::{Interner, Storage};
+#[cfg(feature = "arrow")]
+use arrow_array::ArrayRef;
+#[cfg(feature = "arrow")]
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct KeyStorage<T: DataType> {
@@ -88,6 +92,25 @@ pub struct DictEncoder<T: DataType> {
 
     /// The buffered indices
     indices: Vec<u64>,
+
+    /// Tracks the Arrow zero-hash dictionary adopt fast path (see
+    /// [`Self::maybe_adopt_dictionary`]).
+    #[cfg(feature = "arrow")]
+    adopt: AdoptState,
+}
+
+/// State of the Arrow zero-hash dictionary adopt fast path.
+#[cfg(feature = "arrow")]
+enum AdoptState {
+    /// No values yet; the next Arrow dictionary can be adopted verbatim.
+    Fresh,
+    /// Built by adopting one Arrow dictionary verbatim. The `ArrayRef` is held
+    /// to keep that allocation alive, so `Arc::ptr_eq` identity checks against
+    /// later batches stay sound (a freed buffer could otherwise be reused at
+    /// the same address).
+    Adopted(ArrayRef),
+    /// Interning mode (dedup hash table active); never returns to adopting.
+    Legacy,
 }
 
 impl<T: DataType> DictEncoder<T> {
@@ -102,6 +125,8 @@ impl<T: DataType> DictEncoder<T> {
         Self {
             interner: Interner::new(storage),
             indices: vec![],
+            #[cfg(feature = "arrow")]
+            adopt: AdoptState::Fresh,
         }
     }
 
@@ -147,6 +172,63 @@ impl<T: DataType> DictEncoder<T> {
 
     fn put_one(&mut self, value: &T::T) {
         self.indices.push(self.interner.intern(value));
+    }
+
+    /// Try to adopt an Arrow dictionary's `values` (already deduplicated and in
+    /// key order) as the parquet dictionary page verbatim, so Arrow key `k`
+    /// maps to parquet index `k` with no hashing and a sequential copy.
+    ///
+    /// `identity` is the values array; its `Arc` identity recognises the same
+    /// dictionary across mini-batches (and is held to keep the allocation alive
+    /// so the comparison is sound).
+    ///
+    /// Returns `true` when the caller may append this dictionary's keys
+    /// directly: either it is the first dictionary (adopted now) or the very
+    /// same array adopted earlier. Returns `false` when a *different*
+    /// dictionary arrives — the caller must then call
+    /// [`Self::seed_dedup_from_storage`] and fall back to interning.
+    #[cfg(feature = "arrow")]
+    pub fn maybe_adopt_dictionary(&mut self, values: &[T::T], identity: &ArrayRef) -> bool {
+        match &self.adopt {
+            AdoptState::Legacy => return false,
+            AdoptState::Adopted(adopted) => return Arc::ptr_eq(adopted, identity),
+            AdoptState::Fresh => {}
+        }
+
+        // Adopt verbatim only when the encoder is empty. A prior plain
+        // (interned) write to the same column populates the dictionary while
+        // leaving the state `Fresh`; adopting then would map Arrow key `k` to
+        // the wrong parquet index. Switch to interning instead — its dedup
+        // table is already populated by that prior write.
+        if self.num_entries() != 0 {
+            self.adopt = AdoptState::Legacy;
+            return false;
+        }
+
+        for value in values {
+            self.interner.push_value(value);
+        }
+        self.adopt = AdoptState::Adopted(identity.clone());
+        true
+    }
+
+    /// Leave adopt mode: rebuild the dedup table from the values already in
+    /// storage so subsequent interning deduplicates against them instead of
+    /// duplicating them. Idempotent.
+    #[cfg(feature = "arrow")]
+    pub fn seed_dedup_from_storage(&mut self) {
+        if matches!(self.adopt, AdoptState::Legacy) {
+            return;
+        }
+        self.adopt = AdoptState::Legacy;
+        let num_entries = self.num_entries() as u64;
+        self.interner.seed_dedup(0..num_entries);
+    }
+
+    /// Append a pre-resolved dictionary index (an Arrow key) directly.
+    #[cfg(feature = "arrow")]
+    pub fn push_index(&mut self, index: u64) {
+        self.indices.push(index);
     }
 
     #[inline]

@@ -58,8 +58,34 @@ impl<S: Storage> Interner<S> {
         }
     }
 
-    /// Intern the value, returning the interned key, and if this was a new value
+    /// Append a value that is already known to be unique, bypassing the dedup
+    /// hash table. Only valid when the interner is used in "adopt" mode (no
+    /// `intern` calls), e.g. ingesting an Arrow dictionary's values verbatim.
+    #[cfg(feature = "arrow")]
     #[inline]
+    pub fn push_value(&mut self, value: &S::Value) -> S::Key {
+        self.storage.push(value)
+    }
+
+    /// Rebuild the dedup table from values already present in storage (provided
+    /// as their `keys`), so subsequent [`Self::intern`] calls deduplicate
+    /// against them rather than inserting duplicates. Used to leave "adopt"
+    /// mode, where values were appended via [`Self::push_value`] (which skips
+    /// the dedup table). Hashes once per entry; never per occurrence.
+    #[cfg(feature = "arrow")]
+    pub fn seed_dedup(&mut self, keys: impl IntoIterator<Item = S::Key>) {
+        for key in keys {
+            let hash = self.state.hash_one(self.storage.get(key).as_bytes());
+            self.dedup
+                .entry(
+                    hash,
+                    |probe| self.storage.get(*probe).as_bytes() == self.storage.get(key).as_bytes(),
+                    |probe| self.state.hash_one(self.storage.get(*probe).as_bytes()),
+                )
+                .or_insert(key);
+        }
+    }
+
     pub fn intern(&mut self, value: &S::Value) -> S::Key {
         let hash = self.state.hash_one(value.as_bytes());
 

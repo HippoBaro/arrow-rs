@@ -34,8 +34,8 @@ use crate::data_type::{
 };
 #[cfg(feature = "arrow")]
 use crate::encodings::encoding::{
-    BoolEncoder, FixedLenByteArrayEncoder, FixedLenByteArrayValues, Int32Encoder, Int32Values,
-    Int64Encoder, Int64Values, PackedBoolValues,
+    BoolEncoder, DictionaryValueIndices, FixedLenByteArrayEncoder, FixedLenByteArrayValues,
+    Int32Encoder, Int32Values, Int64Encoder, Int64Values, PackedBoolValues, ValueIndices,
 };
 use crate::encodings::encoding::{
     BoolEncoderObject, DictEncoder, Encoder, EncoderFactory, FixedLenByteArrayEncoderObject,
@@ -46,6 +46,8 @@ use crate::file::properties::{EnabledStatistics, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
 use crate::geospatial::statistics::GeospatialStatistics;
 use crate::schema::types::{ColumnDescPtr, ColumnDescriptor};
+#[cfg(feature = "arrow")]
+use arrow_array::ArrayRef;
 
 /// A collection of [`ParquetValueType`] encoded by a [`ColumnValueEncoder`]
 pub trait ColumnValues {
@@ -225,6 +227,10 @@ pub struct ColumnValueEncoderImpl<T: DataType, E: ?Sized = <T as ColumnEncoderTy
     encoder: Box<E>,
     dict_encoder: Option<DictEncoder<T>>,
     descr: ColumnDescPtr,
+    /// Per-column dictionary page-size limit (bytes). Used to decide up front
+    /// whether an Arrow dictionary is small enough to adopt, matching the
+    /// reactive fallback in `GenericColumnWriter::should_dict_fallback`.
+    dictionary_page_size_limit: usize,
     num_values: usize,
     statistics_enabled: EnabledStatistics,
     min_value: Option<T::T>,
@@ -244,6 +250,18 @@ impl<T: DataType, E: Encoder<T> + ?Sized> ColumnValueEncoderImpl<T, E> {
     }
 
     fn write_slice(&mut self, slice: &[T::T]) -> Result<()> {
+        self.fold_stats(slice);
+
+        match &mut self.dict_encoder {
+            Some(encoder) => encoder.put(slice),
+            _ => self.encoder.put(slice),
+        }
+    }
+
+    /// Fold a slice of values into the column statistics, variable-length byte
+    /// total, and bloom filter — everything [`Self::write_slice`] does except
+    /// the actual encoding.
+    fn fold_stats(&mut self, slice: &[T::T]) {
         if self.statistics_enabled != EnabledStatistics::None
             // INTERVAL, Geometry, and Geography have undefined sort order, so don't write min/max stats for them
             && self.descr.converted_type() != ConvertedType::INTERVAL
@@ -266,10 +284,120 @@ impl<T: DataType, E: Encoder<T> + ?Sized> ColumnValueEncoderImpl<T, E> {
                 bloom_filter.insert(value);
             }
         }
+    }
 
-        match &mut self.dict_encoder {
-            Some(encoder) => encoder.put(slice),
-            _ => self.encoder.put(slice),
+    /// Zero-hash Arrow dictionary adopt fast path, shared by the native
+    /// fixed-width physical types (INT32/INT64/FLOAT/DOUBLE).
+    ///
+    /// `dict_values` are the Arrow dictionary's entries (already deduplicated,
+    /// in key order, byte-identical to the parquet dictionary), `keys` the
+    /// per-row indices into them, `identity` the values array (its `Arc`
+    /// identity recognises the same dictionary across mini-batches), and
+    /// `plain_dict_page_size` the exact byte size this dictionary would occupy
+    /// as a PLAIN dictionary page (for fixed-width entries, `card * width`).
+    /// That size, compared to the column's dictionary-page size limit, is the
+    /// reactive dict-vs-PLAIN fallback decision (`should_dict_fallback`) made
+    /// upfront — the byte-array encoder applies the identical rule with the
+    /// variable-length page formula (`data_bytes + 4 * card`).
+    ///
+    /// Returns `Ok(true)` when the batch was fully handled: adopted verbatim
+    /// (first dictionary, sequential copy, no hashing) then keys appended, or
+    /// appended to an already-adopted dictionary.
+    ///
+    /// Returns `Ok(false)` when the caller must fall through to its normal
+    /// path — either the dictionary is too wide to stay dictionary-encoded (the
+    /// dictionary encoder has been dropped, so the fall-through builds a PLAIN
+    /// column with no interning), or a different dictionary arrived (the dedup
+    /// table has been seeded, so the fall-through interns and deduplicates
+    /// against the already-adopted entries).
+    #[cfg(feature = "arrow")]
+    pub(crate) fn maybe_adopt_native_dict(
+        &mut self,
+        dict_values: &[T::T],
+        keys: DictionaryValueIndices<'_>,
+        identity: &ArrayRef,
+        plain_dict_page_size: usize,
+    ) -> Result<bool> {
+        if self.dict_encoder.is_none() {
+            return Ok(false);
+        }
+
+        let fresh = self.dict_encoder.as_ref().unwrap().num_entries() == 0;
+        if fresh && plain_dict_page_size >= self.dictionary_page_size_limit {
+            // Too wide to ever pay off as a dictionary: drop the dictionary
+            // encoder now and let the caller build a PLAIN column, skipping all
+            // interning (matches the legacy fallback's dict-vs-PLAIN decision,
+            // but made up front instead of after wasted interning).
+            self.dict_encoder = None;
+            return Ok(false);
+        }
+
+        if self
+            .dict_encoder
+            .as_mut()
+            .unwrap()
+            .maybe_adopt_dictionary(dict_values, identity)
+        {
+            // The bloom filter is column-scoped, so insert each dictionary entry
+            // exactly once, on first adoption.
+            if fresh {
+                if let Some(bloom_filter) = self.bloom_filter.as_mut() {
+                    for value in dict_values {
+                        bloom_filter.insert(value);
+                    }
+                }
+            }
+
+            self.num_values += keys.len();
+
+            // Per-data-page min/max: fold the referenced value of each key into
+            // the running min/max, which `flush_data_page` resets at each page
+            // boundary. Folding per occurrence (rather than once over the whole
+            // dictionary) keeps page-level statistics tight when a dictionary
+            // spans multiple pages. The dictionary fits the page-size limit, so
+            // this keyed read stays cache-resident.
+            let update_stats = self.statistics_enabled != EnabledStatistics::None
+                && self.descr.converted_type() != ConvertedType::INTERVAL;
+            let descr = self.descr.as_ref();
+            let dict_enc = self.dict_encoder.as_mut().unwrap();
+            if update_stats {
+                let mut page_min: Option<&T::T> = None;
+                let mut page_max: Option<&T::T> = None;
+                keys.try_for_each(|key| -> Result<()> {
+                    let value = &dict_values[key];
+                    if !is_nan(descr, value) {
+                        if page_min.is_none_or(|current| compare_greater(descr, current, value)) {
+                            page_min = Some(value);
+                        }
+                        if page_max.is_none_or(|current| compare_greater(descr, value, current)) {
+                            page_max = Some(value);
+                        }
+                    }
+                    dict_enc.push_index(key as u64);
+                    Ok(())
+                })?;
+                if let Some(min) = page_min {
+                    update_min(descr, min, &mut self.min_value);
+                }
+                if let Some(max) = page_max {
+                    update_max(descr, max, &mut self.max_value);
+                }
+            } else {
+                keys.try_for_each(|key| -> Result<()> {
+                    dict_enc.push_index(key as u64);
+                    Ok(())
+                })?;
+            }
+            Ok(true)
+        } else {
+            // A different dictionary arrived: leave adopt mode and intern from
+            // here on. The caller's fall-through dedups against the adopted
+            // entries.
+            self.dict_encoder
+                .as_mut()
+                .unwrap()
+                .seed_dedup_from_storage();
+            Ok(false)
         }
     }
 }
@@ -404,7 +532,26 @@ fn raw_float16_stat_zero(value: &[u8], replacement: f16) -> [u8; 2] {
 #[allow(dead_code)]
 impl ColumnValueEncoderImpl<Int32Type, Int32EncoderObject> {
     #[cfg(feature = "arrow")]
-    pub(crate) fn write_int32_values(&mut self, values: Int32Values<'_>) -> Result<()> {
+    pub(crate) fn write_int32_values(
+        &mut self,
+        values: Int32Values<'_>,
+        dict_identity: Option<&ArrayRef>,
+    ) -> Result<()> {
+        // Zero-hash dictionary adopt fast path for i32-backed, dictionary-encoded
+        // input (see [`Self::maybe_adopt_native_dict`]). On `false`, fall through
+        // to the legacy path below — which builds a PLAIN column (dictionary too
+        // wide, encoder dropped) or interns and deduplicates against the adopted
+        // entries (a different dictionary arrived).
+        if let (Some(identity), Int32Values::I32(dict_values, ValueIndices::Dictionary(keys))) =
+            (dict_identity, values)
+        {
+            // PLAIN dict-page size = card * width (fixed-width entries).
+            let plain_dict_page_size = dict_values.len().saturating_mul(std::mem::size_of::<i32>());
+            if self.maybe_adopt_native_dict(dict_values, keys, identity, plain_dict_page_size)? {
+                return Ok(());
+            }
+        }
+
         if self.dict_encoder.is_some() || values.is_sparse() {
             self.num_values += values.len();
             let materialized = values.materialize();
@@ -413,19 +560,48 @@ impl ColumnValueEncoderImpl<Int32Type, Int32EncoderObject> {
 
         self.num_values += values.len();
 
-        if !values.is_empty() {
-            let should_update_stats = self.statistics_enabled != EnabledStatistics::None
-                && self.descr.converted_type() != ConvertedType::INTERVAL;
+        if values.is_empty() {
+            return self.encoder.put_int32_values(values);
+        }
 
-            if should_update_stats {
-                if let Some((min, max)) = int32_min_max(&self.descr, values) {
-                    update_min(&self.descr, &min, &mut self.min_value);
-                    update_max(&self.descr, &max, &mut self.max_value);
-                }
+        let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+            && self.descr.converted_type() != ConvertedType::INTERVAL;
+
+        if let Some(bloom_filter) = &mut self.bloom_filter {
+            values.for_each(|value| bloom_filter.insert(&value));
+        }
+
+        // Dictionary-backed values require a scattered keyed read. Fuse the
+        // min/max computation into the single encode pass so it rides in that
+        // gather's cache-miss shadow rather than taking a second keyed walk.
+        // (Dense values are contiguous; a sequential min/max scan is already
+        // cheap, so they stay on the separate path below.)
+        if should_update_stats && values.is_dictionary() {
+            let unsigned = int_is_unsigned(&self.descr);
+            let mut min: Option<i32> = None;
+            let mut max: Option<i32> = None;
+            self.encoder
+                .put_int32_values_observed(values, &mut |value| {
+                    if min.is_none_or(|current| int32_greater(unsigned, current, value)) {
+                        min = Some(value);
+                    }
+                    if max.is_none_or(|current| int32_greater(unsigned, value, current)) {
+                        max = Some(value);
+                    }
+                })?;
+            if let Some(min) = min {
+                update_min(&self.descr, &min, &mut self.min_value);
             }
+            if let Some(max) = max {
+                update_max(&self.descr, &max, &mut self.max_value);
+            }
+            return Ok(());
+        }
 
-            if let Some(bloom_filter) = &mut self.bloom_filter {
-                values.for_each(|value| bloom_filter.insert(&value));
+        if should_update_stats {
+            if let Some((min, max)) = int32_min_max(&self.descr, values) {
+                update_min(&self.descr, &min, &mut self.min_value);
+                update_max(&self.descr, &max, &mut self.max_value);
             }
         }
 
@@ -436,7 +612,24 @@ impl ColumnValueEncoderImpl<Int32Type, Int32EncoderObject> {
 #[allow(dead_code)]
 impl ColumnValueEncoderImpl<Int64Type, Int64EncoderObject> {
     #[cfg(feature = "arrow")]
-    pub(crate) fn write_int64_values(&mut self, values: Int64Values<'_>) -> Result<()> {
+    pub(crate) fn write_int64_values(
+        &mut self,
+        values: Int64Values<'_>,
+        dict_identity: Option<&ArrayRef>,
+    ) -> Result<()> {
+        // Zero-hash dictionary adopt fast path for i64-backed, dictionary-encoded
+        // input (see [`Self::maybe_adopt_native_dict`]). On `false`, fall through
+        // to the legacy path below.
+        if let (Some(identity), Int64Values::I64(dict_values, ValueIndices::Dictionary(keys))) =
+            (dict_identity, values)
+        {
+            // PLAIN dict-page size = card * width (fixed-width entries).
+            let plain_dict_page_size = dict_values.len().saturating_mul(std::mem::size_of::<i64>());
+            if self.maybe_adopt_native_dict(dict_values, keys, identity, plain_dict_page_size)? {
+                return Ok(());
+            }
+        }
+
         if self.dict_encoder.is_some() || values.is_sparse() {
             self.num_values += values.len();
             let materialized = values.materialize();
@@ -445,19 +638,48 @@ impl ColumnValueEncoderImpl<Int64Type, Int64EncoderObject> {
 
         self.num_values += values.len();
 
-        if !values.is_empty() {
-            let should_update_stats = self.statistics_enabled != EnabledStatistics::None
-                && self.descr.converted_type() != ConvertedType::INTERVAL;
+        if values.is_empty() {
+            return self.encoder.put_int64_values(values);
+        }
 
-            if should_update_stats {
-                if let Some((min, max)) = int64_min_max(&self.descr, values) {
-                    update_min(&self.descr, &min, &mut self.min_value);
-                    update_max(&self.descr, &max, &mut self.max_value);
-                }
+        let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+            && self.descr.converted_type() != ConvertedType::INTERVAL;
+
+        if let Some(bloom_filter) = &mut self.bloom_filter {
+            values.for_each(|value| bloom_filter.insert(&value));
+        }
+
+        // Dictionary-backed values require a scattered keyed read. Fuse the
+        // min/max computation into the single encode pass so it rides in that
+        // gather's cache-miss shadow rather than taking a second keyed walk.
+        // (Dense values are contiguous; a sequential min/max scan is already
+        // cheap, so they stay on the separate path below.)
+        if should_update_stats && values.is_dictionary() {
+            let unsigned = int_is_unsigned(&self.descr);
+            let mut min: Option<i64> = None;
+            let mut max: Option<i64> = None;
+            self.encoder
+                .put_int64_values_observed(values, &mut |value| {
+                    if min.is_none_or(|current| int64_greater(unsigned, current, value)) {
+                        min = Some(value);
+                    }
+                    if max.is_none_or(|current| int64_greater(unsigned, value, current)) {
+                        max = Some(value);
+                    }
+                })?;
+            if let Some(min) = min {
+                update_min(&self.descr, &min, &mut self.min_value);
             }
+            if let Some(max) = max {
+                update_max(&self.descr, &max, &mut self.max_value);
+            }
+            return Ok(());
+        }
 
-            if let Some(bloom_filter) = &mut self.bloom_filter {
-                values.for_each(|value| bloom_filter.insert(&value));
+        if should_update_stats {
+            if let Some((min, max)) = int64_min_max(&self.descr, values) {
+                update_min(&self.descr, &min, &mut self.min_value);
+                update_max(&self.descr, &max, &mut self.max_value);
             }
         }
 
@@ -482,6 +704,7 @@ impl<T: DataType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
         let dict_supported = props.dictionary_enabled(descr.path())
             && has_dictionary_support(T::get_physical_type(), props);
         let dict_encoder = dict_supported.then(|| DictEncoder::new(descr.clone()));
+        let dictionary_page_size_limit = props.column_dictionary_page_size_limit(descr.path());
 
         // Set either main encoder or fallback encoder.
         let encoder = E::get_encoder(
@@ -501,6 +724,7 @@ impl<T: DataType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
             encoder,
             dict_encoder,
             descr: descr.clone(),
+            dictionary_page_size_limit,
             num_values: 0,
             statistics_enabled,
             bloom_filter,
@@ -645,15 +869,53 @@ impl<T: DataType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
 }
 
 #[cfg(feature = "arrow")]
+#[inline]
+fn int_is_unsigned(descr: &ColumnDescriptor) -> bool {
+    if let Some(LogicalType::Integer(int)) = descr.logical_type_ref() {
+        if !int.is_signed {
+            return true;
+        }
+    }
+    matches!(
+        descr.converted_type(),
+        ConvertedType::UINT_8
+            | ConvertedType::UINT_16
+            | ConvertedType::UINT_32
+            | ConvertedType::UINT_64
+    )
+}
+
+#[cfg(feature = "arrow")]
+#[inline(always)]
+fn int32_greater(unsigned: bool, a: i32, b: i32) -> bool {
+    if unsigned {
+        (a as u32) > (b as u32)
+    } else {
+        a > b
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[inline(always)]
+fn int64_greater(unsigned: bool, a: i64, b: i64) -> bool {
+    if unsigned {
+        (a as u64) > (b as u64)
+    } else {
+        a > b
+    }
+}
+
+#[cfg(feature = "arrow")]
 fn int32_min_max(descr: &ColumnDescriptor, values: Int32Values<'_>) -> Option<(i32, i32)> {
+    let unsigned = int_is_unsigned(descr);
     let mut min = None;
     let mut max = None;
 
     values.for_each(|value| {
-        if min.is_none_or(|current| compare_greater(descr, &current, &value)) {
+        if min.is_none_or(|current| int32_greater(unsigned, current, value)) {
             min = Some(value);
         }
-        if max.is_none_or(|current| compare_greater(descr, &value, &current)) {
+        if max.is_none_or(|current| int32_greater(unsigned, value, current)) {
             max = Some(value);
         }
     });
@@ -663,14 +925,15 @@ fn int32_min_max(descr: &ColumnDescriptor, values: Int32Values<'_>) -> Option<(i
 
 #[cfg(feature = "arrow")]
 fn int64_min_max(descr: &ColumnDescriptor, values: Int64Values<'_>) -> Option<(i64, i64)> {
+    let unsigned = int_is_unsigned(descr);
     let mut min = None;
     let mut max = None;
 
     values.for_each(|value| {
-        if min.is_none_or(|current| compare_greater(descr, &current, &value)) {
+        if min.is_none_or(|current| int64_greater(unsigned, current, value)) {
             min = Some(value);
         }
-        if max.is_none_or(|current| compare_greater(descr, &value, &current)) {
+        if max.is_none_or(|current| int64_greater(unsigned, value, current)) {
             max = Some(value);
         }
     });

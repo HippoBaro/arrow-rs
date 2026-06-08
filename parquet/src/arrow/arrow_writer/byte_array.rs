@@ -31,13 +31,16 @@ use crate::geospatial::statistics::GeospatialStatistics;
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::num_required_bits;
 use crate::util::interner::{Interner, Storage};
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::ByteArrayType;
+use arrow_array::types::{
+    ArrowDictionaryKeyType, BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, Utf8Type,
+};
 use arrow_array::{
     Array, ArrayAccessor, ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray,
-    FixedSizeBinaryArray, GenericByteArray, LargeBinaryArray, LargeStringArray, StringArray,
-    StringViewArray,
+    FixedSizeBinaryArray, GenericByteArray, LargeBinaryArray, LargeStringArray, PrimitiveArray,
+    StringArray, StringViewArray,
 };
 use arrow_buffer::{ArrowNativeType, Buffer};
 use arrow_schema::DataType;
@@ -104,6 +107,51 @@ macro_rules! downcast_op {
                 d => unreachable!("cannot downcast {} dictionary value to byte array", d),
             },
             d => unreachable!("cannot downcast {} to byte array", d),
+        }
+    };
+}
+
+macro_rules! downcast_key_dictionary_impl {
+    ($array:ident, $key:ident, $value_type:ty, $selection:expr, $encoder:ident) => {
+        try_encode_generic_byte_dictionary::<arrow_array::types::$key, $value_type>(
+            $array
+                .as_any()
+                .downcast_ref::<DictionaryArray<arrow_array::types::$key>>()
+                .unwrap(),
+            $selection,
+            $encoder,
+        )
+    };
+}
+
+macro_rules! downcast_key_dictionary_op {
+    ($key_type:expr, $value_type:ty, $array:ident, $selection:expr, $encoder:ident) => {
+        match $key_type.as_ref() {
+            DataType::UInt8 => {
+                downcast_key_dictionary_impl!($array, UInt8Type, $value_type, $selection, $encoder)
+            }
+            DataType::UInt16 => {
+                downcast_key_dictionary_impl!($array, UInt16Type, $value_type, $selection, $encoder)
+            }
+            DataType::UInt32 => {
+                downcast_key_dictionary_impl!($array, UInt32Type, $value_type, $selection, $encoder)
+            }
+            DataType::UInt64 => {
+                downcast_key_dictionary_impl!($array, UInt64Type, $value_type, $selection, $encoder)
+            }
+            DataType::Int8 => {
+                downcast_key_dictionary_impl!($array, Int8Type, $value_type, $selection, $encoder)
+            }
+            DataType::Int16 => {
+                downcast_key_dictionary_impl!($array, Int16Type, $value_type, $selection, $encoder)
+            }
+            DataType::Int32 => {
+                downcast_key_dictionary_impl!($array, Int32Type, $value_type, $selection, $encoder)
+            }
+            DataType::Int64 => {
+                downcast_key_dictionary_impl!($array, Int64Type, $value_type, $selection, $encoder)
+            }
+            _ => Ok(false),
         }
     };
 }
@@ -406,6 +454,33 @@ struct DictEncoder {
     interner: Interner<ByteArrayStorage>,
     indices: Vec<u64>,
     variable_length_bytes: i64,
+    /// Monotonic data-page counter, bumped on each [`Self::flush_data_page`].
+    /// Used with [`ByteDictAdoptState::Adopted`]'s `stat_gen` to fold each
+    /// dictionary entry's value into min/max exactly once **per page** it
+    /// appears in.
+    page_gen: u32,
+    /// State of the zero-hash Arrow dictionary adopt fast path.
+    adopt: ByteDictAdoptState,
+}
+
+/// Tracks the zero-hash Arrow dictionary adopt fast path (mirrors the generic
+/// `DictEncoder`'s adopt machinery for the bespoke byte-array encoder).
+#[derive(Debug, Default)]
+enum ByteDictAdoptState {
+    /// No values yet; the next Arrow dictionary may be adopted verbatim.
+    #[default]
+    Fresh,
+    /// Built by adopting one Arrow dictionary verbatim. `identity` is that
+    /// dictionary's values array (held so `Arc::ptr_eq` stays sound across
+    /// batches); `stat_gen[i]` is the `page_gen` at which entry `i` was last
+    /// folded into the page min/max (`u32::MAX` = never), making per-page
+    /// statistics exact without a per-occurrence value read.
+    Adopted {
+        identity: ArrayRef,
+        stat_gen: Vec<u32>,
+    },
+    /// Interning mode (dedup hash table active); never returns to adopting.
+    Legacy,
 }
 
 impl DictEncoder {
@@ -445,7 +520,16 @@ impl DictEncoder {
     }
 
     fn estimated_memory_size(&self) -> usize {
-        self.interner.estimated_memory_size() + self.indices.capacity() * std::mem::size_of::<u64>()
+        let stat_gen_size = match &self.adopt {
+            ByteDictAdoptState::Adopted { stat_gen, .. } => {
+                stat_gen.capacity() * std::mem::size_of::<u32>()
+            }
+            _ => 0,
+        };
+
+        self.interner.estimated_memory_size()
+            + self.indices.capacity() * std::mem::size_of::<u64>()
+            + stat_gen_size
     }
 
     fn estimated_data_page_size(&self) -> usize {
@@ -484,6 +568,10 @@ impl DictEncoder {
 
         self.indices.clear();
 
+        // Start a new page generation so per-page min/max re-folds each entry
+        // referenced in the next page (see `ByteDictAdoptState::Adopted`).
+        self.page_gen = self.page_gen.wrapping_add(1);
+
         // Capture value of variable_length_bytes and reset for next page
         let variable_length_bytes = Some(self.variable_length_bytes);
         self.variable_length_bytes = 0;
@@ -508,6 +596,11 @@ pub struct ByteArrayEncoder {
     bloom_filter: Option<Sbbf>,
     bloom_filter_target_fpp: f64,
     geo_stats_accumulator: Option<Box<dyn GeoStatsAccumulator>>,
+    /// The column's dictionary-page size limit. An incoming Arrow dictionary
+    /// whose PLAIN-encoded page would meet or exceed this is too wide to adopt
+    /// (it would fall back to PLAIN anyway), so the encoder drops dictionary
+    /// encoding upfront rather than building a dictionary it will discard.
+    dictionary_page_size_limit: usize,
 }
 
 impl ColumnValueEncoder for ByteArrayEncoder {
@@ -535,6 +628,8 @@ impl ColumnValueEncoder for ByteArrayEncoder {
 
         let geo_stats_accumulator = try_new_geo_stats_accumulator(descr);
 
+        let dictionary_page_size_limit = props.column_dictionary_page_size_limit(descr.path());
+
         Ok(Self {
             fallback,
             statistics_enabled,
@@ -544,14 +639,23 @@ impl ColumnValueEncoder for ByteArrayEncoder {
             min_value: None,
             max_value: None,
             geo_stats_accumulator,
+            dictionary_page_size_limit,
         })
     }
 
     fn write(&mut self, values: &Self::Values, offset: usize, len: usize) -> Result<()> {
+        if try_encode_dictionary(values, ValueSelectionRef::Dense { offset, len }, self)? {
+            return Ok(());
+        }
+
         write_dense(values, offset, len, self)
     }
 
     fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()> {
+        if try_encode_dictionary(values, ValueSelectionRef::Sparse(indices), self)? {
+            return Ok(());
+        }
+
         downcast_op!(
             values.data_type(),
             values,
@@ -745,6 +849,10 @@ impl<'a> ColumnValueSource<ByteArrayEncoder> for Selected<'a, ByteArraySourceSto
             .write_to(encoder);
         }
 
+        if try_encode_dictionary(values, selection, encoder)? {
+            return Ok(());
+        }
+
         match selection {
             ValueSelectionRef::Empty => Ok(()),
             ValueSelectionRef::Dense { offset, len } => write_dense(values, offset, len, encoder),
@@ -797,6 +905,297 @@ fn materialize_dictionary_with_selected_nulls(
         dictionary.keys(),
         None,
     )?))
+}
+
+fn dense_byte_value<'a, T>(offsets: &[T::Offset], data: &'a [u8], idx: usize) -> &'a [u8]
+where
+    T: ByteArrayType,
+{
+    let start = offsets[idx].as_usize();
+    let end = offsets[idx + 1].as_usize();
+    &data[start..end]
+}
+
+fn try_encode_dictionary(
+    values: &dyn Array,
+    selection: ValueSelectionRef<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<bool> {
+    if encoder.dict_encoder.is_none() {
+        return Ok(false);
+    }
+
+    let DataType::Dictionary(key_type, value_type) = values.data_type() else {
+        return Ok(false);
+    };
+
+    if selection.len() == 0 {
+        return Ok(true);
+    }
+
+    // A sparse selection is built from the leaf's valid (non-null) positions
+    // (see `levels::write_leaf`), so it can never reference a null key slot;
+    // skip the O(n) walk. Only a dense selection (e.g. a required field whose
+    // dictionary still carries null key slots) needs the guard, and there it is
+    // a cheap popcount over the range.
+    let key_selection = super::value_indices(selection);
+    if !key_selection.is_sparse()
+        && super::value_indices_include_nulls(values.nulls(), key_selection)
+    {
+        return Ok(false);
+    }
+
+    match value_type.as_ref() {
+        DataType::Utf8 => {
+            downcast_key_dictionary_op!(key_type, Utf8Type, values, selection, encoder)
+        }
+        DataType::LargeUtf8 => {
+            downcast_key_dictionary_op!(key_type, LargeUtf8Type, values, selection, encoder)
+        }
+        DataType::Binary => {
+            downcast_key_dictionary_op!(key_type, BinaryType, values, selection, encoder)
+        }
+        DataType::LargeBinary => {
+            downcast_key_dictionary_op!(key_type, LargeBinaryType, values, selection, encoder)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn try_encode_generic_byte_dictionary<K, T>(
+    dictionary: &DictionaryArray<K>,
+    selection: ValueSelectionRef<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<bool>
+where
+    K: ArrowDictionaryKeyType,
+    T: ByteArrayType,
+{
+    let Some(values) = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<GenericByteArray<T>>()
+    else {
+        return Ok(false);
+    };
+
+    // A dictionary that carries null value slots cannot be adopted verbatim
+    // (PLAIN dictionary pages hold no nulls); fall back to interning.
+    if values.null_count() != 0 {
+        return Ok(false);
+    }
+
+    Ok(encode_dictionary(
+        encoder,
+        dictionary.values(),
+        dictionary.keys(),
+        values,
+        selection,
+    ))
+}
+
+fn for_each_selected(selection: ValueSelectionRef<'_>, mut f: impl FnMut(usize)) {
+    match selection {
+        ValueSelectionRef::Empty => {}
+        ValueSelectionRef::Dense { offset, len } => {
+            for idx in offset..offset + len {
+                f(idx);
+            }
+        }
+        ValueSelectionRef::Sparse(indices) => {
+            for &idx in indices {
+                f(idx);
+            }
+        }
+    }
+}
+
+/// Zero-hash adopt fast path for an Arrow byte-array dictionary.
+///
+/// On the first dictionary seen by an empty encoder, its values are transcoded
+/// verbatim into the PLAIN dictionary page (Arrow key `k` → parquet index `k`, a
+/// straight sequential copy with no hashing) and the keys are pushed as indices
+/// directly. Per-data-page min/max is folded exactly via a per-page generation
+/// stamp — each entry contributes to every page it appears in, read once per
+/// page rather than once per occurrence. This mirrors the generic numeric adopt
+/// path, but keeps the per-page gen stamp (rather than folding per occurrence)
+/// because byte comparisons are far more expensive than integer ones.
+///
+/// Returns `false` (caller falls back to per-occurrence interning) when adopting
+/// is unsafe or unprofitable:
+/// * a geometry column (needs per-row WKB accumulation),
+/// * a dictionary whose PLAIN page would reach the column's dictionary-page size
+///   limit — too wide to stay dictionary-encoded, so the encoder is dropped and
+///   the column goes straight to PLAIN (the same cardinality bypass as ints),
+/// * a prior plain/interned write already populated the encoder, or
+/// * a *different* dictionary arrives — its entries seed the dedup table first
+///   so the interner can continue without inserting duplicates.
+fn encode_dictionary<T, K>(
+    encoder: &mut ByteArrayEncoder,
+    dictionary_values: &ArrayRef,
+    keys: &PrimitiveArray<K>,
+    values: &GenericByteArray<T>,
+    selection: ValueSelectionRef<'_>,
+) -> bool
+where
+    T: ByteArrayType,
+    K: ArrowDictionaryKeyType,
+{
+    // Geometry columns accumulate per-row WKB statistics; they cannot adopt.
+    if encoder.geo_stats_accumulator.is_some() {
+        return false;
+    }
+
+    let offsets = values.value_offsets();
+    let data = values.value_data();
+
+    // Exact byte size this dictionary would occupy as a PLAIN dictionary page:
+    // the referenced value bytes plus a 4-byte length prefix per entry (the
+    // variable-length analogue of the fixed-width encoder's `card * width`; see
+    // `ColumnValueEncoderImpl::maybe_adopt_native_dict`). The referenced span is
+    // taken from the offsets (not `data.len()`) so a sliced dictionary array is
+    // measured exactly rather than over-counted.
+    let referenced_bytes = offsets[values.len()].as_usize() - offsets[0].as_usize();
+    let plain_dict_page_size = referenced_bytes + 4 * values.len();
+
+    enum Step {
+        /// Empty encoder, dictionary fits: transcode its values verbatim.
+        Adopt,
+        /// The already-adopted dictionary again: just push keys.
+        Append,
+        /// A different dictionary: seed dedup from adopted entries, then intern.
+        SeedFallback,
+        /// A prior intern/legacy write populated the encoder: intern.
+        LegacyFallback,
+        /// Empty but too wide to adopt: drop dictionary encoding (go PLAIN).
+        DropToPlain,
+    }
+
+    let step = {
+        let dict_encoder = encoder.dict_encoder.as_ref().unwrap();
+        match &dict_encoder.adopt {
+            ByteDictAdoptState::Legacy => Step::LegacyFallback,
+            ByteDictAdoptState::Adopted { identity, .. } => {
+                if Arc::ptr_eq(identity, dictionary_values) {
+                    Step::Append
+                } else {
+                    Step::SeedFallback
+                }
+            }
+            ByteDictAdoptState::Fresh => {
+                if !dict_encoder.interner.storage().values.is_empty() {
+                    // A plain/interned write already populated the encoder; its
+                    // dedup table is live, so keep interning.
+                    Step::LegacyFallback
+                } else if plain_dict_page_size >= encoder.dictionary_page_size_limit {
+                    Step::DropToPlain
+                } else {
+                    Step::Adopt
+                }
+            }
+        }
+    };
+
+    let fresh_adopt = matches!(step, Step::Adopt);
+
+    match step {
+        Step::LegacyFallback => {
+            encoder.dict_encoder.as_mut().unwrap().adopt = ByteDictAdoptState::Legacy;
+            return false;
+        }
+        Step::DropToPlain => {
+            // Too wide to stay dictionary-encoded: drop the encoder so the column
+            // is written as PLAIN with no interning attempted (the int bypass).
+            encoder.dict_encoder = None;
+            return false;
+        }
+        Step::SeedFallback => {
+            let dict_encoder = encoder.dict_encoder.as_mut().unwrap();
+            let entries = dict_encoder.interner.storage().values.len() as u64;
+            dict_encoder.interner.seed_dedup(0..entries);
+            dict_encoder.adopt = ByteDictAdoptState::Legacy;
+            return false;
+        }
+        Step::Adopt => {
+            let dict_encoder = encoder.dict_encoder.as_mut().unwrap();
+            for i in 0..values.len() {
+                dict_encoder
+                    .interner
+                    .push_value(dense_byte_value::<T>(offsets, data, i));
+            }
+            dict_encoder.adopt = ByteDictAdoptState::Adopted {
+                identity: dictionary_values.clone(),
+                stat_gen: vec![u32::MAX; values.len()],
+            };
+        }
+        Step::Append => {}
+    }
+
+    // On a fresh adoption fold every entry into the bloom filter (a borrow of
+    // `encoder` disjoint from the dict encoder mutated above).
+    if fresh_adopt {
+        if let Some(bloom_filter) = encoder.bloom_filter.as_mut() {
+            for i in 0..values.len() {
+                bloom_filter.insert(dense_byte_value::<T>(offsets, data, i));
+            }
+        }
+    }
+
+    // Push the selected keys as parquet indices (key == index for an adopted
+    // dictionary) and fold exact per-page min/max.
+    let collect_min_max = encoder.statistics_enabled != EnabledStatistics::None;
+    let page_gen = encoder.dict_encoder.as_ref().unwrap().page_gen;
+    let mut batch_min: Option<&[u8]> = None;
+    let mut batch_max: Option<&[u8]> = None;
+    {
+        let DictEncoder {
+            indices,
+            variable_length_bytes,
+            adopt,
+            ..
+        } = encoder.dict_encoder.as_mut().unwrap();
+        let ByteDictAdoptState::Adopted { stat_gen, .. } = adopt else {
+            unreachable!("Adopt/Append leaves the encoder in the Adopted state");
+        };
+
+        indices.reserve(selection.len());
+        for_each_selected(selection, |idx| {
+            let key = keys.value(idx).as_usize();
+            // Fold this entry into the page min/max once per page it appears in
+            // (not once globally): an entry referenced across several data pages
+            // must contribute to each page's stats, else later pages prune
+            // unsoundly.
+            if collect_min_max && stat_gen[key] != page_gen {
+                stat_gen[key] = page_gen;
+                let value = dense_byte_value::<T>(offsets, data, key);
+                if batch_min.is_none_or(|min| min > value) {
+                    batch_min = Some(value);
+                }
+                if batch_max.is_none_or(|max| max < value) {
+                    batch_max = Some(value);
+                }
+            }
+            indices.push(key as u64);
+            // Per-occurrence logical byte length, from the (small) offsets buffer.
+            *variable_length_bytes +=
+                (offsets[key + 1].as_usize() - offsets[key].as_usize()) as i64;
+        });
+    }
+
+    if let Some(min) = batch_min {
+        let min = ByteArray::from(min.to_vec());
+        if encoder.min_value.as_ref().is_none_or(|m| m > &min) {
+            encoder.min_value = Some(min);
+        }
+    }
+    if let Some(max) = batch_max {
+        let max = ByteArray::from(max.to_vec());
+        if encoder.max_value.as_ref().is_none_or(|m| m < &max) {
+            encoder.max_value = Some(max);
+        }
+    }
+
+    true
 }
 
 /// Encodes the provided `values` and `indices` to `encoder`
