@@ -149,6 +149,16 @@ impl<T: DataType> DictEncoder<T> {
         self.indices.push(self.interner.intern(value));
     }
 
+    /// Intern a value by its raw bytes, constructing the owned `T::T` (via `make`)
+    /// only on a dictionary miss. Used by the fixed-length-byte-array path so an
+    /// owned `FixedLenByteArray` is allocated once per *unique* value rather than
+    /// per occurrence.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    pub(crate) fn put_value_bytes(&mut self, bytes: &[u8], make: impl FnOnce() -> T::T) {
+        self.indices.push(self.interner.intern_bytes(bytes, make));
+    }
+
     #[inline]
     fn bit_width(&self) -> u8 {
         num_required_bits(self.num_entries().saturating_sub(1) as u64)

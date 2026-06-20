@@ -24,19 +24,23 @@ use crate::column::writer::{ColumnWriter, ColumnWriterImpl};
 use crate::column::writer::{
     compare_greater, fallback_encoding, has_dictionary_support, is_nan, update_max, update_min,
 };
+#[cfg(feature = "arrow")]
+use crate::column::writer::{compare_greater_byte_array, is_nan_byte_array};
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::{
     BoolType, ByteArrayType, DataType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type,
     Int64Type, Int96Type,
 };
 #[cfg(feature = "arrow")]
+use crate::data_type::{ByteArray, FixedLenByteArray};
+#[cfg(feature = "arrow")]
 use crate::encodings::encoding::{
-    BoolEncoder, ChunkSink, DoubleValues, FloatValues, Int32Values, Int64Values, PackedBoolValues,
-    ValueStream,
+    BoolEncoder, ChunkSink, DoubleValues, FixedLenByteArrayEncoder, FixedLenByteArrayValues,
+    FloatValues, Int32Values, Int64Values, PackedBoolValues, ValueIndices, ValueStream,
 };
 use crate::encodings::encoding::{
     BoolEncoderObject, DictEncoder, DoubleEncoderObject, Encoder, EncoderFactory,
-    FloatEncoderObject, Int32EncoderObject, Int64EncoderObject,
+    FixedLenByteArrayEncoderObject, FloatEncoderObject, Int32EncoderObject, Int64EncoderObject,
 };
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
@@ -239,7 +243,7 @@ make_encoder_type!(Int64Type, Int64ColumnWriter, Int64EncoderObject);
 make_encoder_type!(
     FixedLenByteArrayType,
     FixedLenByteArrayColumnWriter,
-    dyn Encoder<Self>
+    FixedLenByteArrayEncoderObject
 );
 make_encoder_type!(Int96Type, Int96ColumnWriter, dyn Encoder<Self>);
 make_encoder_type!(FloatType, FloatColumnWriter, FloatEncoderObject);
@@ -414,6 +418,204 @@ impl<'a> ChunkSink<PackedBoolValues<'a>> for BoolSink<'_> {
             }
         }
         self.encoder.put_packed_bool(values)
+    }
+}
+
+impl ColumnValueEncoderImpl<FixedLenByteArrayType, FixedLenByteArrayEncoderObject> {
+    /// Open the [`FlbaSink`] used by fixed-length byte-array writes. Dense
+    /// `FixedSizeBinary` values may be handed over as one packed byte run;
+    /// computed values stream one at a time through [`FlbaSink::consume_value`].
+    #[cfg(feature = "arrow")]
+    pub(crate) fn fixed_len_sink(&mut self, len: usize) -> FlbaSink<'_> {
+        self.num_values += len;
+        let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+            && self.descr.converted_type() != ConvertedType::INTERVAL;
+        // The bulk handoff hands the whole packed run to the encoder untouched, so it
+        // is available only when no value needs to be seen individually — i.e. no
+        // dictionary to intern into and no geo accumulator to feed.
+        let bulk_ok = self.dict_encoder.is_none() && self.geo_stats_accumulator.is_none();
+        FlbaSink {
+            descr: self.descr.as_ref(),
+            should_update_stats,
+            min: Vec::new(),
+            max: Vec::new(),
+            has_min: false,
+            has_max: false,
+            bloom: self.bloom_filter.as_mut(),
+            dict: self.dict_encoder.as_mut(),
+            encoder: &mut self.encoder,
+            min_value: &mut self.min_value,
+            max_value: &mut self.max_value,
+            len,
+            reserved: false,
+            bulk_ok,
+        }
+    }
+}
+
+/// Consumes fixed-length byte-array values while folding stats and bloom state.
+///
+/// Dense `FixedSizeBinary` inputs can arrive as one packed `[u8]` run. Sparse
+/// and computed inputs arrive as individual `&[u8]` values.
+#[cfg(feature = "arrow")]
+pub(crate) struct FlbaSink<'a> {
+    descr: &'a ColumnDescriptor,
+    should_update_stats: bool,
+    min: Vec<u8>,
+    max: Vec<u8>,
+    has_min: bool,
+    has_max: bool,
+    bloom: Option<&'a mut Sbbf>,
+    dict: Option<&'a mut DictEncoder<FixedLenByteArrayType>>,
+    encoder: &'a mut FixedLenByteArrayEncoderObject,
+    min_value: &'a mut Option<FixedLenByteArray>,
+    max_value: &'a mut Option<FixedLenByteArray>,
+    len: usize,
+    reserved: bool,
+    bulk_ok: bool,
+}
+
+#[cfg(feature = "arrow")]
+impl FlbaSink<'_> {
+    /// Whether a dense `FixedSizeBinary` run can be handed over as packed bytes.
+    #[inline]
+    pub(crate) fn supports_bulk(&self) -> bool {
+        self.bulk_ok
+    }
+
+    /// Fold one value into page stats and bloom state, then intern or append it.
+    #[inline]
+    pub(crate) fn consume_value(&mut self, value: &[u8]) -> Result<()> {
+        if !self.reserved {
+            // Size the (append-encoder) page buffer once from the known value count
+            // and observed width, so the per-value appends never reallocate. No-op
+            // for the dictionary and non-buffering encoders.
+            self.reserved = true;
+            if self.dict.is_none() {
+                self.encoder
+                    .reserve_fixed_len(value.len().saturating_mul(self.len));
+            }
+        }
+        if self.should_update_stats && !is_nan_byte_array(self.descr, value) {
+            if !self.has_min || compare_greater_byte_array(self.descr, &self.min, value) {
+                self.min.clear();
+                self.min.extend_from_slice(value);
+                self.has_min = true;
+            }
+            if !self.has_max || compare_greater_byte_array(self.descr, value, &self.max) {
+                self.max.clear();
+                self.max.extend_from_slice(value);
+                self.has_max = true;
+            }
+        }
+        if let Some(bloom) = self.bloom.as_deref_mut() {
+            bloom.insert(value);
+        }
+        match self.dict.as_deref_mut() {
+            Some(dict) => {
+                dict.put_value_bytes(value, || {
+                    FixedLenByteArray::from(ByteArray::from(value.to_vec()))
+                });
+                Ok(())
+            }
+            None => self.encoder.append_fixed_len_value(value),
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        if self.has_min && self.has_max {
+            let (min, max) = raw_fixed_len_min_max_values(self.descr, &self.min, &self.max);
+            update_min(self.descr, &min, self.min_value);
+            update_max(self.descr, &max, self.max_value);
+        }
+    }
+}
+
+/// Bulk handoff for a dense `FixedSizeBinary` run.
+#[cfg(feature = "arrow")]
+impl ChunkSink<[u8]> for FlbaSink<'_> {
+    #[inline(never)]
+    fn consume(&mut self, run: &[u8]) -> Result<()> {
+        debug_assert!(self.dict.is_none());
+        // `write_into` skips the empty run, so `self.len` (the run's value count) is
+        // non-zero here; `type_length` is the run split evenly across it.
+        let type_length = run.len() / self.len;
+        let values = FixedLenByteArrayValues::new_selected(
+            run,
+            type_length,
+            ValueIndices::Dense {
+                offset: 0,
+                len: self.len,
+            },
+        );
+        if self.should_update_stats {
+            let mut min: Option<&[u8]> = None;
+            let mut max: Option<&[u8]> = None;
+            for value in values.iter() {
+                if is_nan_byte_array(self.descr, value) {
+                    continue;
+                }
+                if min.is_none_or(|c| compare_greater_byte_array(self.descr, c, value)) {
+                    min = Some(value);
+                }
+                if max.is_none_or(|c| compare_greater_byte_array(self.descr, value, c)) {
+                    max = Some(value);
+                }
+            }
+            if let Some(min) = min {
+                self.min.clear();
+                self.min.extend_from_slice(min);
+                self.has_min = true;
+            }
+            if let Some(max) = max {
+                self.max.clear();
+                self.max.extend_from_slice(max);
+                self.has_max = true;
+            }
+        }
+        if let Some(bloom) = self.bloom.as_deref_mut() {
+            for value in values.iter() {
+                bloom.insert(value);
+            }
+        }
+        self.encoder.put_fixed_len_byte_array(values)
+    }
+}
+
+/// Tiled handoff for gathered fixed-length byte-array values.
+#[cfg(feature = "arrow")]
+impl<'t> ChunkSink<[&'t [u8]]> for FlbaSink<'_> {
+    #[inline(never)]
+    fn consume(&mut self, tile: &[&'t [u8]]) -> Result<()> {
+        for &value in tile {
+            self.consume_value(value)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "arrow")]
+fn raw_fixed_len_min_max_values(
+    descr: &ColumnDescriptor,
+    min: &[u8],
+    max: &[u8],
+) -> (FixedLenByteArray, FixedLenByteArray) {
+    if descr.logical_type_ref() == Some(&LogicalType::Float16) {
+        let min = raw_float16_stat_zero(min, f16::NEG_ZERO);
+        let max = raw_float16_stat_zero(max, f16::ZERO);
+        return (min.to_vec().into(), max.to_vec().into());
+    }
+
+    (min.to_vec().into(), max.to_vec().into())
+}
+
+#[cfg(feature = "arrow")]
+fn raw_float16_stat_zero(value: &[u8], replacement: f16) -> [u8; 2] {
+    let value: [u8; 2] = value.try_into().unwrap();
+    if f16::from_le_bytes(value) == f16::ZERO {
+        replacement.to_le_bytes()
+    } else {
+        value
     }
 }
 

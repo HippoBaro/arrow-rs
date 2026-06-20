@@ -74,6 +74,31 @@ impl<S: Storage> Interner<S> {
             .get()
     }
 
+    /// Like [`Self::intern`], but keyed by the value's raw bytes — the owned
+    /// `S::Value` is built (via `make`) **only on a dedup miss**. Lets callers
+    /// whose owned value is expensive to construct (e.g. a heap-backed
+    /// `FixedLenByteArray`) pay that cost once per *unique* value instead of once
+    /// per occurrence; on a hit nothing is allocated, only the bytes are hashed
+    /// and compared.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    pub fn intern_bytes(&mut self, bytes: &[u8], make: impl FnOnce() -> S::Value) -> S::Key
+    where
+        S::Value: Sized,
+    {
+        let hash = self.state.hash_one(bytes);
+
+        *self
+            .dedup
+            .entry(
+                hash,
+                |index| bytes == self.storage.get(*index).as_bytes(),
+                |key| self.state.hash_one(self.storage.get(*key).as_bytes()),
+            )
+            .or_insert_with(|| self.storage.push(&make()))
+            .get()
+    }
+
     /// Return estimate of the memory used, in bytes
     #[allow(dead_code)] // not used in parquet_derive, so is dead there
     pub fn estimated_memory_size(&self) -> usize {

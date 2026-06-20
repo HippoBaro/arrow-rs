@@ -246,6 +246,16 @@ impl<'a> ValueIndices<'a> {
         }
     }
 
+    #[inline(always)]
+    pub(crate) fn index_at(self, idx: usize) -> usize {
+        debug_assert!(idx < self.len());
+        match self {
+            Self::Empty => unreachable!("empty indices have no values"),
+            Self::Dense { offset, .. } => offset + idx,
+            Self::Sparse(indices) => indices[idx],
+        }
+    }
+
     #[inline]
     pub(crate) fn try_for_each<E>(
         self,
@@ -563,6 +573,148 @@ impl<'a> ValueStream<'a, f64> for DoubleValues<'a> {
     }
 }
 
+/// Borrowed fixed-length byte-array values.
+#[derive(Debug, Clone, Copy)]
+#[cfg(feature = "arrow")]
+pub(crate) struct FixedLenByteArrayValues<'a> {
+    bytes: &'a [u8],
+    type_length: usize,
+    indices: ValueIndices<'a>,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> FixedLenByteArrayValues<'a> {
+    pub(crate) fn new(bytes: &'a [u8], type_length: usize, len: usize) -> Self {
+        assert_eq!(
+            bytes.len(),
+            type_length
+                .checked_mul(len)
+                .expect("fixed-length byte-array values length overflow")
+        );
+        Self {
+            bytes,
+            type_length,
+            indices: ValueIndices::Dense { offset: 0, len },
+        }
+    }
+
+    pub(crate) fn new_selected(
+        bytes: &'a [u8],
+        type_length: usize,
+        indices: ValueIndices<'a>,
+    ) -> Self {
+        if type_length == 0 {
+            assert!(
+                bytes.is_empty(),
+                "zero-width fixed-length byte-array values must not have data bytes"
+            );
+        } else {
+            assert_eq!(
+                bytes.len() % type_length,
+                0,
+                "fixed-length byte-array values length must be a multiple of type length"
+            );
+        }
+
+        Self {
+            bytes,
+            type_length,
+            indices,
+        }
+    }
+
+    pub(crate) fn dense_bytes(self) -> Option<&'a [u8]> {
+        match self.indices {
+            ValueIndices::Dense { offset, len } => {
+                let start = offset * self.type_length;
+                let end = start + len * self.type_length;
+                Some(&self.bytes[start..end])
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn type_length(self) -> usize {
+        self.type_length
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    pub(crate) fn iter(self) -> FixedLenByteArrayValueIter<'a> {
+        FixedLenByteArrayValueIter {
+            bytes: self.bytes,
+            type_length: self.type_length,
+            indices: self.indices,
+            offset: 0,
+        }
+    }
+}
+
+/// Dense fixed-length byte-array values are already packed in PLAIN wire
+/// layout, so [`Self::Bulk`] is the raw byte run. Sparse selections still yield
+/// gathered `&[u8]` values.
+#[cfg(feature = "arrow")]
+impl<'a> ValueStream<'a, &'a [u8]> for FixedLenByteArrayValues<'a> {
+    type Bulk = [u8];
+
+    #[inline]
+    fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [u8]> {
+        self.dense_bytes()
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, f: impl FnMut(&'a [u8]) -> Result<(), E>) -> Result<(), E> {
+        self.iter().try_for_each(f)
+    }
+}
+
+#[derive(Debug, Clone)]
+#[cfg(feature = "arrow")]
+pub(crate) struct FixedLenByteArrayValueIter<'a> {
+    bytes: &'a [u8],
+    type_length: usize,
+    indices: ValueIndices<'a>,
+    offset: usize,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> Iterator for FixedLenByteArrayValueIter<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.indices.len() {
+            return None;
+        }
+
+        let idx = self.indices.index_at(self.offset);
+        self.offset += 1;
+
+        if self.type_length == 0 {
+            return Some(&self.bytes[..0]);
+        }
+
+        let start = idx * self.type_length;
+        let end = start + self.type_length;
+        Some(&self.bytes[start..end])
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.indices.len() - self.offset;
+        (remaining, Some(remaining))
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl ExactSizeIterator for FixedLenByteArrayValueIter<'_> {}
+
 /// Encodes packed boolean values.
 ///
 /// This is a storage-shape fast path for Arrow boolean buffers.
@@ -573,6 +725,46 @@ pub(crate) trait BoolEncoder: Encoder<BoolType> {
         Err(general_err!(
             "Packed boolean values are not supported by this encoder"
         ))
+    }
+}
+
+/// Encodes raw fixed-length byte-array values.
+///
+/// This is a storage-shape fast path for Arrow fixed-width buffers.
+#[doc(hidden)]
+#[cfg(feature = "arrow")]
+pub(crate) trait FixedLenByteArrayEncoder: Encoder<FixedLenByteArrayType> {
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        // Generic fallback for encoders without a raw fast path — e.g.
+        // DELTA_BYTE_ARRAY / DELTA_LENGTH_BYTE_ARRAY, selected for FLBA under
+        // PARQUET_2_0 — by materializing each value and routing through the
+        // standard `Encoder::put`. The `supports_raw_fixed_len_byte_array` gate
+        // in the Arrow writer keeps the bulk fast path (PLAIN / BYTE_STREAM_SPLIT,
+        // which override this method) off this route, so this only carries the
+        // per-value stream path for the remaining encodings.
+        for value in values.iter() {
+            let value = FixedLenByteArray::from(ByteArray::from(value.to_vec()));
+            self.put(std::slice::from_ref(&value))?;
+        }
+        Ok(())
+    }
+
+    /// Reserve room for `additional_bytes` of appended fixed-length values. No-op
+    /// unless the encoder buffers raw bytes contiguously (PLAIN, BYTE_STREAM_SPLIT),
+    /// letting the streaming write size its buffer exactly once from the known value
+    /// count.
+    #[cfg(feature = "arrow")]
+    fn reserve_fixed_len(&mut self, _additional_bytes: usize) {}
+
+    /// Append a single fixed-length value's bytes into the encoder's own state, in
+    /// the single streaming pass that drives sparse / computed FLBA columns. Each
+    /// encoder folds the value into its native representation directly (PLAIN/BSS
+    /// append to their byte buffer; DELTA front-codes / records the length), so no
+    /// contiguous column buffer is materialized. The default is a correct fallback
+    /// for encodings not used on the FLBA value path.
+    #[cfg(feature = "arrow")]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.put_fixed_len_byte_array(FixedLenByteArrayValues::new(value, value.len(), 1))
     }
 }
 
@@ -700,6 +892,11 @@ encoder_object!(
     BoolType,
     ByteStreamSplitEncoder<BoolType>
 );
+encoder_object!(
+    FixedLenByteArrayEncoderObject,
+    FixedLenByteArrayType,
+    VariableWidthByteStreamSplitEncoder<FixedLenByteArrayType>
+);
 
 /// Numeric encoder-object enum, generic over the physical type `T`.
 #[doc(hidden)]
@@ -791,6 +988,44 @@ impl BoolEncoder for BoolEncoderObject {
     }
 }
 
+#[cfg(feature = "arrow")]
+impl FixedLenByteArrayEncoder for FixedLenByteArrayEncoderObject {
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        match self {
+            Self::Plain(e) => e.put_fixed_len_byte_array(values),
+            Self::Rle(e) => e.put_fixed_len_byte_array(values),
+            Self::DeltaBinaryPacked(e) => e.put_fixed_len_byte_array(values),
+            Self::DeltaLengthByteArray(e) => e.put_fixed_len_byte_array(values),
+            Self::DeltaByteArray(e) => e.put_fixed_len_byte_array(values),
+            Self::ByteStreamSplit(e) => e.put_fixed_len_byte_array(values),
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    fn reserve_fixed_len(&mut self, additional_bytes: usize) {
+        match self {
+            Self::Plain(e) => e.reserve_fixed_len(additional_bytes),
+            Self::Rle(e) => e.reserve_fixed_len(additional_bytes),
+            Self::DeltaBinaryPacked(e) => e.reserve_fixed_len(additional_bytes),
+            Self::DeltaLengthByteArray(e) => e.reserve_fixed_len(additional_bytes),
+            Self::DeltaByteArray(e) => e.reserve_fixed_len(additional_bytes),
+            Self::ByteStreamSplit(e) => e.reserve_fixed_len(additional_bytes),
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        match self {
+            Self::Plain(e) => e.append_fixed_len_value(value),
+            Self::Rle(e) => e.append_fixed_len_value(value),
+            Self::DeltaBinaryPacked(e) => e.append_fixed_len_value(value),
+            Self::DeltaLengthByteArray(e) => e.append_fixed_len_value(value),
+            Self::DeltaByteArray(e) => e.append_fixed_len_value(value),
+            Self::ByteStreamSplit(e) => e.append_fixed_len_value(value),
+        }
+    }
+}
+
 /// The encoding -> concrete-variant selection shared by every encoder-object
 /// enum's `EncoderFactory` impl (`BoolEncoderObject`,
 /// `FixedLenByteArrayEncoderObject`, `NumericEncoderObject<T>`). It mirrors
@@ -825,6 +1060,17 @@ impl EncoderFactory<BoolType> for BoolEncoderObject {
         Ok(Box::new(encoder_object_from_encoding!(
             encoding,
             Self::ByteStreamSplit(ByteStreamSplitEncoder::new())
+        )))
+    }
+}
+
+impl EncoderFactory<FixedLenByteArrayType> for FixedLenByteArrayEncoderObject {
+    fn get_encoder(encoding: Encoding, descr: &ColumnDescPtr) -> Result<Box<Self>> {
+        Ok(Box::new(encoder_object_from_encoding!(
+            encoding,
+            Self::ByteStreamSplit(VariableWidthByteStreamSplitEncoder::new(
+                descr.type_length()
+            ))
         )))
     }
 }
@@ -917,6 +1163,35 @@ impl BoolEncoder for PlainEncoder<BoolType> {
         } else {
             values.put_indexed_packed(&mut self.bit_writer);
         }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl FixedLenByteArrayEncoder for PlainEncoder<FixedLenByteArrayType> {
+    #[inline]
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        match values.dense_bytes() {
+            Some(bytes) => self.buffer.extend_from_slice(bytes),
+            None => values
+                .iter()
+                .for_each(|value| self.buffer.extend_from_slice(value)),
+        }
+        Ok(())
+    }
+
+    /// PLAIN stores fixed-length values back-to-back, so each streamed value is
+    /// appended straight into the page buffer — one copy, no intermediate buffer.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn reserve_fixed_len(&mut self, additional_bytes: usize) {
+        self.buffer.reserve(additional_bytes);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(value);
         Ok(())
     }
 }
@@ -1028,6 +1303,9 @@ impl BoolEncoder for RleValueEncoder<BoolType> {
         Ok(())
     }
 }
+
+#[cfg(feature = "arrow")]
+impl FixedLenByteArrayEncoder for RleValueEncoder<FixedLenByteArrayType> {}
 
 // ----------------------------------------------------------------------
 // DELTA_BINARY_PACKED encoding
@@ -1273,6 +1551,8 @@ impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
 
 #[cfg(feature = "arrow")]
 impl BoolEncoder for DeltaBitPackEncoder<BoolType> {}
+#[cfg(feature = "arrow")]
+impl FixedLenByteArrayEncoder for DeltaBitPackEncoder<FixedLenByteArrayType> {}
 
 /// Helper trait to define specific conversions and subtractions when computing deltas
 trait DeltaBitPackEncoderConversion<T: DataType> {
@@ -1330,8 +1610,9 @@ impl<T: DataType> DeltaBitPackEncoderConversion<T> for DeltaBitPackEncoder<T> {
 pub struct DeltaLengthByteArrayEncoder<T: DataType> {
     // length encoder
     len_encoder: DeltaBitPackEncoder<Int32Type>,
-    // byte array data
-    data: Vec<ByteArray>,
+    // concatenated value bytes, appended directly (no per-value `ByteArray`
+    // allocation); the lengths in `len_encoder` delimit them.
+    data: Vec<u8>,
     // data size in bytes of encoded values
     encoded_size: usize,
     _phantom: PhantomData<T>,
@@ -1353,6 +1634,21 @@ impl<T: DataType> DeltaLengthByteArrayEncoder<T> {
             _phantom: PhantomData,
         }
     }
+
+    /// Append a batch of byte slices already borrowed from a source buffer:
+    /// feed their lengths to the length encoder, then copy the bytes into the
+    /// contiguous data buffer — with no per-value `ByteArray` allocation. Used
+    /// by the fixed-width DELTA_BYTE_ARRAY suffix path.
+    #[cfg(feature = "arrow")]
+    fn put_byte_slices(&mut self, slices: &[&[u8]]) -> Result<()> {
+        let lengths: Vec<i32> = slices.iter().map(|s| s.len() as i32).collect();
+        self.len_encoder.put(&lengths)?;
+        for s in slices {
+            self.encoded_size += s.len();
+            self.data.extend_from_slice(s);
+        }
+        Ok(())
+    }
 }
 
 impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
@@ -1372,7 +1668,7 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
         self.len_encoder.put(&lengths)?;
         for byte_array in val_it() {
             self.encoded_size += byte_array.len();
-            self.data.push(byte_array.clone());
+            self.data.extend_from_slice(byte_array.data());
         }
 
         Ok(())
@@ -1399,9 +1695,7 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
         let mut total_bytes = vec![];
         let lengths = self.len_encoder.flush_buffer()?;
         total_bytes.extend_from_slice(&lengths);
-        self.data.iter().for_each(|byte_array| {
-            total_bytes.extend_from_slice(byte_array.data());
-        });
+        total_bytes.extend_from_slice(&self.data);
         self.data.clear();
         self.encoded_size = 0;
 
@@ -1416,6 +1710,31 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
 
 #[cfg(feature = "arrow")]
 impl BoolEncoder for DeltaLengthByteArrayEncoder<BoolType> {}
+#[cfg(feature = "arrow")]
+impl FixedLenByteArrayEncoder for DeltaLengthByteArrayEncoder<FixedLenByteArrayType> {
+    /// Native bulk DELTA_LENGTH_BYTE_ARRAY for fixed-width values: collect all
+    /// lengths and feed the length encoder once, then append each value's bytes
+    /// straight from the Arrow buffer — no per-value `Encoder::put` round-trip.
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        let lengths: Vec<i32> = values.iter().map(|v| v.len() as i32).collect();
+        self.len_encoder.put(&lengths)?;
+        for value in values.iter() {
+            self.encoded_size += value.len();
+            self.data.extend_from_slice(value);
+        }
+        Ok(())
+    }
+
+    /// Record one value's length and append its bytes.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.len_encoder.put(&[value.len() as i32])?;
+        self.encoded_size += value.len();
+        self.data.extend_from_slice(value);
+        Ok(())
+    }
+}
 
 // ----------------------------------------------------------------------
 // DELTA_BYTE_ARRAY encoding
@@ -1447,6 +1766,18 @@ impl<T: DataType> DeltaByteArrayEncoder<T> {
     }
 }
 
+/// Length of the byte prefix shared by `previous` and `current` — the
+/// DELTA_BYTE_ARRAY front-coding match length.
+#[inline]
+fn common_prefix_len(previous: &[u8], current: &[u8]) -> usize {
+    let max = cmp::min(previous.len(), current.len());
+    let mut n = 0;
+    while n < max && previous[n] == current[n] {
+        n += 1;
+    }
+    n
+}
+
 impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
     fn put(&mut self, values: &[T::T]) -> Result<()> {
         let mut prefix_lengths: Vec<i32> = vec![];
@@ -1465,13 +1796,7 @@ impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
 
         for byte_array in values {
             let current = byte_array.data();
-            // Maximum prefix length that is shared between previous value and current
-            // value
-            let prefix_len = cmp::min(self.previous.len(), current.len());
-            let mut match_len = 0;
-            while match_len < prefix_len && self.previous[match_len] == current[match_len] {
-                match_len += 1;
-            }
+            let match_len = common_prefix_len(&self.previous, current);
             prefix_lengths.push(match_len as i32);
             suffixes.push(byte_array.slice(match_len, byte_array.len() - match_len));
             // Update previous for the next prefix
@@ -1529,6 +1854,39 @@ impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
 
 #[cfg(feature = "arrow")]
 impl BoolEncoder for DeltaByteArrayEncoder<BoolType> {}
+#[cfg(feature = "arrow")]
+impl FixedLenByteArrayEncoder for DeltaByteArrayEncoder<FixedLenByteArrayType> {
+    /// Front-code a dense fixed-width run directly from the Arrow buffer.
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        let mut prefix_lengths: Vec<i32> = Vec::with_capacity(values.len());
+        // Suffixes are borrowed directly from the Arrow buffer — no per-value
+        // `ByteArray`/`to_vec` materialization; `put_byte_slices` copies them
+        // once into the suffix writer's contiguous buffer.
+        let mut suffixes: Vec<&[u8]> = Vec::with_capacity(values.len());
+        for current in values.iter() {
+            let match_len = common_prefix_len(&self.previous, current);
+            prefix_lengths.push(match_len as i32);
+            suffixes.push(&current[match_len..]);
+            self.previous.clear();
+            self.previous.extend_from_slice(current);
+        }
+        self.prefix_len_encoder.put(&prefix_lengths)?;
+        self.suffix_writer.put_byte_slices(&suffixes)?;
+        Ok(())
+    }
+
+    /// Front-code one streamed fixed-width value.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        let match_len = common_prefix_len(&self.previous, value);
+        self.prefix_len_encoder.put(&[match_len as i32])?;
+        self.suffix_writer.put_byte_slices(&[&value[match_len..]])?;
+        self.previous.clear();
+        self.previous.extend_from_slice(value);
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

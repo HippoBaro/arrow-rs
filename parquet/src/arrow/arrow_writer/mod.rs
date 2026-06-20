@@ -45,12 +45,12 @@ use crate::column::writer::{
     ValueSelection, get_column_writer,
 };
 use crate::data_type::{
-    BoolType, DoubleType as ParquetDoubleType, FloatType as ParquetFloatType,
-    Int32Type as ParquetInt32Type, Int64Type as ParquetInt64Type,
+    BoolType, DoubleType as ParquetDoubleType, FixedLenByteArrayType,
+    FloatType as ParquetFloatType, Int32Type as ParquetInt32Type, Int64Type as ParquetInt64Type,
 };
-use crate::data_type::{ByteArray, FixedLenByteArray};
 use crate::encodings::encoding::{
-    DoubleValues, FloatValues, Int32Values, Int64Values, PackedBoolValues, ValueIndices,
+    DoubleValues, FixedLenByteArrayValues, FloatValues, Int32Values, Int64Values, PackedBoolValues,
+    ValueIndices, ValueStream,
 };
 #[cfg(feature = "encryption")]
 use crate::encryption::encrypt::FileEncryptor;
@@ -1892,6 +1892,206 @@ fn write_bool_column(
     )
 }
 
+type FixedLenByteArraySource<'a> = Selected<'a, FixedLenByteArrayStorage<'a>>;
+
+#[derive(Clone, Copy)]
+struct FixedLenByteArrayStorage<'a> {
+    column: &'a dyn arrow_array::Array,
+}
+
+impl<'a> FixedLenByteArrayStorage<'a> {
+    fn from_column(column: &'a dyn arrow_array::Array) -> Self {
+        Self { column }
+    }
+}
+
+impl<'a> ColumnValueSource<ColumnValueEncoderImpl<FixedLenByteArrayType>>
+    for Selected<'a, FixedLenByteArrayStorage<'a>>
+{
+    fn len(self) -> usize {
+        Selected::len(self)
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Selected::slice(self, offset, len)
+    }
+
+    fn write_to(self, encoder: &mut ColumnValueEncoderImpl<FixedLenByteArrayType>) -> Result<()> {
+        write_fixed_len_byte_array_column(encoder, self.storage().column, self.selection())
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        let len = Selected::len(self);
+        if len == 0 {
+            return Some(0);
+        }
+        // Fixed-len values encode to a constant width with no length prefix, so
+        // the per-value byte cost is the column's FIXED_LEN_BYTE_ARRAY width.
+        // Include the boundary value that crosses the budget so the caller's
+        // page-size check sees the overshoot in this mini-batch. The width must
+        // match the one `arrow_to_parquet_type` assigns (see `arrow::schema`);
+        // otherwise the byte-budget page split is lost and `data_page_size_limit`
+        // is silently overshot. `ByteBudgetChunker::static_always_fits` only
+        // short-circuits this when `width * base_batch_size <= page_byte_limit`,
+        // which a lowered `data_page_size_limit` defeats — so every fixed-len
+        // type needs a real estimate, not just `FixedSizeBinary`.
+        let per = match self.storage().column.data_type() {
+            ArrowDataType::FixedSizeBinary(width) => (*width).max(1) as usize,
+            ArrowDataType::Float16 => 2,
+            ArrowDataType::Interval(_) => 12,
+            // Decimals only reach this fixed-len source when their precision
+            // routes them to FIXED_LEN_BYTE_ARRAY (precision > 18); the width is
+            // then `decimal_length_from_precision`, matching the schema converter.
+            ArrowDataType::Decimal32(precision, _)
+            | ArrowDataType::Decimal64(precision, _)
+            | ArrowDataType::Decimal128(precision, _)
+            | ArrowDataType::Decimal256(precision, _) => decimal_length_from_precision(*precision),
+            // Genuinely unknown fixed width: no estimate.
+            _ => return None,
+        };
+        Some(((budget / per.max(1)) + 1).min(len))
+    }
+}
+
+fn write_fixed_len_byte_array_column(
+    encoder: &mut ColumnValueEncoderImpl<FixedLenByteArrayType>,
+    column: &dyn arrow_array::Array,
+    selection: ValueSelection<'_>,
+) -> Result<()> {
+    write_fixed_len_byte_array_column_indices(encoder, column, value_indices(selection))
+}
+
+fn write_fixed_len_byte_array_column_indices(
+    encoder: &mut ColumnValueEncoderImpl<FixedLenByteArrayType>,
+    column: &dyn arrow_array::Array,
+    indices: ValueIndices<'_>,
+) -> Result<()> {
+    let mut sink = encoder.fixed_len_sink(indices.len());
+
+    // Dense FixedSizeBinary values are already packed in PLAIN wire layout and
+    // can be handed over as one byte run when no per-value observer is active.
+    if let ArrowDataType::FixedSizeBinary(_) = column.data_type() {
+        if sink.supports_bulk() && matches!(indices, ValueIndices::Dense { .. }) {
+            let array = column.as_fixed_size_binary();
+            FixedLenByteArrayValues::new_selected(array.value_data(), array.value_size(), indices)
+                .write_into(&mut sink)?;
+            sink.finish();
+            return Ok(());
+        }
+    }
+
+    // Sparse and computed fixed-length values stream one value at a time through
+    // the same sink.
+    fixed_len_for_each_value(column, FlbaSelection::Plain(indices), |value| {
+        sink.consume_value(value)
+    })?;
+    sink.finish();
+    Ok(())
+}
+
+/// Selection backing [`fixed_len_for_each_value`]: a plain selection (every row
+/// valid, yields `usize`).
+#[derive(Clone, Copy)]
+enum FlbaSelection<'a> {
+    Plain(ValueIndices<'a>),
+}
+
+impl<'a> FlbaSelection<'a> {
+    /// Walk the selection, yielding `Some(src_idx)` for a present value. Fallible
+    /// so a downstream encode error (e.g. from the append path) propagates out of
+    /// the per-value walk.
+    #[inline]
+    fn try_for_each(self, mut f: impl FnMut(Option<usize>) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Plain(indices) => indices.try_for_each(|idx| f(Some(idx))),
+        }
+    }
+}
+
+/// Walk `selection`, producing each row's fixed `W` bytes and handing them to
+/// `dest`. Returns `W`.
+fn fixed_len_for_each_value<F: FnMut(&[u8]) -> Result<()>>(
+    column: &dyn arrow_array::Array,
+    selection: FlbaSelection<'_>,
+    mut dest: F,
+) -> Result<usize> {
+    macro_rules! each {
+        ($width:expr, |$i:ident| $bytes:expr) => {{
+            let width: usize = $width;
+            selection.try_for_each(|opt| match opt {
+                Some($i) => dest($bytes),
+                None => unreachable!("plain FLBA selection yields only present rows"),
+            })?;
+            return Ok(width);
+        }};
+    }
+    match column.data_type() {
+        ArrowDataType::Interval(IntervalUnit::YearMonth) => {
+            let array = column.as_primitive::<IntervalYearMonthType>();
+            let mut tmp = [0u8; 12];
+            selection.try_for_each(|opt| {
+                match opt {
+                    Some(i) => tmp[..4].copy_from_slice(&array.value(i).to_le_bytes()),
+                    None => tmp[..4].fill(0),
+                }
+                dest(&tmp)
+            })?;
+            Ok(12)
+        }
+        ArrowDataType::Interval(IntervalUnit::DayTime) => {
+            let array = column.as_primitive::<IntervalDayTimeType>();
+            let mut tmp = [0u8; 12];
+            selection.try_for_each(|opt| {
+                match opt {
+                    Some(i) => {
+                        let value = array.value(i);
+                        tmp[4..8].copy_from_slice(&value.days.to_le_bytes());
+                        tmp[8..12].copy_from_slice(&value.milliseconds.to_le_bytes());
+                    }
+                    None => tmp[4..].fill(0),
+                }
+                dest(&tmp)
+            })?;
+            Ok(12)
+        }
+        ArrowDataType::Decimal32(_, _) => {
+            let array = column.as_primitive::<Decimal32Type>();
+            let size = decimal_length_from_precision(array.precision());
+            each!(size, |i| &array.value(i).to_be_bytes()[(4 - size)..]);
+        }
+        ArrowDataType::Decimal64(_, _) => {
+            let array = column.as_primitive::<Decimal64Type>();
+            let size = decimal_length_from_precision(array.precision());
+            each!(size, |i| &array.value(i).to_be_bytes()[(8 - size)..]);
+        }
+        ArrowDataType::Decimal128(_, _) => {
+            let array = column.as_primitive::<Decimal128Type>();
+            let size = decimal_length_from_precision(array.precision());
+            each!(size, |i| &array.value(i).to_be_bytes()[(16 - size)..]);
+        }
+        ArrowDataType::Decimal256(_, _) => {
+            let array = column.as_primitive::<Decimal256Type>();
+            let size = decimal_length_from_precision(array.precision());
+            each!(size, |i| &array.value(i).to_be_bytes()[(32 - size)..]);
+        }
+        ArrowDataType::Float16 => {
+            let array = column.as_primitive::<Float16Type>();
+            each!(2, |i| &array.value(i).to_le_bytes());
+        }
+        ArrowDataType::FixedSizeBinary(width) => {
+            let array = column.as_fixed_size_binary();
+            each!((*width).max(0) as usize, |i| array.value(i));
+        }
+        ArrowDataType::Interval(interval_unit) => Err(ParquetError::NYI(format!(
+            "Attempting to write an Arrow interval type {interval_unit:?} to parquet that is not yet implemented"
+        ))),
+        _ => Err(ParquetError::NYI(
+            "Attempting to write an Arrow type to FixedLenByteArray that is not yet implemented"
+                .to_string(),
+        )),
+    }
+}
+
 macro_rules! primitive_float_bridge {
     (
         $native:ty,
@@ -2019,189 +2219,15 @@ fn write_leaf(
         ColumnWriter::ByteArrayColumnWriter(_) => {
             unreachable!("should use ByteArrayWriter")
         }
-        ColumnWriter::FixedLenByteArrayColumnWriter(typed) => {
-            let indices = selection_indices(levels.value_selection());
-            let bytes = match column.data_type() {
-                ArrowDataType::Interval(interval_unit) => match interval_unit {
-                    IntervalUnit::YearMonth => {
-                        let array = column.as_primitive::<IntervalYearMonthType>();
-                        get_interval_ym_array_slice(array, indices.iter().copied())
-                    }
-                    IntervalUnit::DayTime => {
-                        let array = column.as_primitive::<IntervalDayTimeType>();
-                        get_interval_dt_array_slice(array, indices.iter().copied())
-                    }
-                    _ => {
-                        return Err(ParquetError::NYI(format!(
-                            "Attempting to write an Arrow interval type {interval_unit:?} to parquet that is not yet implemented"
-                        )));
-                    }
-                },
-                ArrowDataType::FixedSizeBinary(_) => {
-                    let array = column.as_fixed_size_binary();
-                    get_fsb_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Decimal32(_, _) => {
-                    let array = column.as_primitive::<Decimal32Type>();
-                    get_decimal_32_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Decimal64(_, _) => {
-                    let array = column.as_primitive::<Decimal64Type>();
-                    get_decimal_64_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Decimal128(_, _) => {
-                    let array = column.as_primitive::<Decimal128Type>();
-                    get_decimal_128_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Decimal256(_, _) => {
-                    let array = column.as_primitive::<Decimal256Type>();
-                    get_decimal_256_array_slice(array, indices.iter().copied())
-                }
-                ArrowDataType::Float16 => {
-                    let array = column.as_primitive::<Float16Type>();
-                    get_float_16_array_slice(array, indices.iter().copied())
-                }
-                _ => {
-                    return Err(ParquetError::NYI(
-                        "Attempting to write an Arrow type that is not yet implemented".to_string(),
-                    ));
-                }
-            };
-            let len = bytes.len();
-            typed.write_batch_internal(
-                Selected::new(bytes.as_slice(), ValueSelection::Dense { offset: 0, len }),
-                levels.def_level_data(),
-                levels.rep_level_data(),
-                None,
-                None,
-                None,
-            )
-        }
+        ColumnWriter::FixedLenByteArrayColumnWriter(typed) => typed.write_batch_internal(
+            FixedLenByteArraySource::new(FixedLenByteArrayStorage::from_column(column), selection),
+            levels.def_level_data(),
+            levels.rep_level_data(),
+            None,
+            None,
+            None,
+        ),
     }
-}
-
-/// Materializes the selected leaf indices for writers that still consume an
-/// explicit index list (the fixed-length byte-array coercions).
-fn selection_indices(selection: ValueSelection<'_>) -> Vec<usize> {
-    match selection {
-        ValueSelection::Dense { offset, len } => (offset..offset + len).collect(),
-        ValueSelection::Sparse(indices) => indices.to_vec(),
-        #[cfg(feature = "arrow")]
-        ValueSelection::Empty => Vec::new(),
-    }
-}
-
-/// Returns 12-byte values representing 3 values of months, days and milliseconds (4-bytes each).
-/// An Arrow YearMonth interval only stores months, thus only the first 4 bytes are populated.
-fn get_interval_ym_array_slice(
-    array: &arrow_array::IntervalYearMonthArray,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
-        let mut value = array.value(i).to_le_bytes().to_vec();
-        let mut suffix = vec![0; 8];
-        value.append(&mut suffix);
-        values.push(FixedLenByteArray::from(ByteArray::from(value)))
-    }
-    values
-}
-
-/// Returns 12-byte values representing 3 values of months, days and milliseconds (4-bytes each).
-/// An Arrow DayTime interval only stores days and millis, thus the first 4 bytes are not populated.
-fn get_interval_dt_array_slice(
-    array: &arrow_array::IntervalDayTimeArray,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
-        let mut out = [0; 12];
-        let value = array.value(i);
-        out[4..8].copy_from_slice(&value.days.to_le_bytes());
-        out[8..12].copy_from_slice(&value.milliseconds.to_le_bytes());
-        values.push(FixedLenByteArray::from(ByteArray::from(out.to_vec())));
-    }
-    values
-}
-
-fn get_decimal_32_array_slice(
-    array: &arrow_array::Decimal32Array,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    let size = decimal_length_from_precision(array.precision());
-    for i in indices {
-        let as_be_bytes = array.value(i).to_be_bytes();
-        let resized_value = as_be_bytes[(4 - size)..].to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
-    }
-    values
-}
-
-fn get_decimal_64_array_slice(
-    array: &arrow_array::Decimal64Array,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    let size = decimal_length_from_precision(array.precision());
-    for i in indices {
-        let as_be_bytes = array.value(i).to_be_bytes();
-        let resized_value = as_be_bytes[(8 - size)..].to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
-    }
-    values
-}
-
-fn get_decimal_128_array_slice(
-    array: &arrow_array::Decimal128Array,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    let size = decimal_length_from_precision(array.precision());
-    for i in indices {
-        let as_be_bytes = array.value(i).to_be_bytes();
-        let resized_value = as_be_bytes[(16 - size)..].to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
-    }
-    values
-}
-
-fn get_decimal_256_array_slice(
-    array: &arrow_array::Decimal256Array,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    let size = decimal_length_from_precision(array.precision());
-    for i in indices {
-        let as_be_bytes = array.value(i).to_be_bytes();
-        let resized_value = as_be_bytes[(32 - size)..].to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(resized_value)));
-    }
-    values
-}
-
-fn get_float_16_array_slice(
-    array: &arrow_array::Float16Array,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
-        let value = array.value(i).to_le_bytes().to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(value)));
-    }
-    values
-}
-
-fn get_fsb_array_slice(
-    array: &arrow_array::FixedSizeBinaryArray,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<FixedLenByteArray> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
-        let value = array.value(i).to_vec();
-        values.push(FixedLenByteArray::from(ByteArray::from(value)))
-    }
-    values
 }
 
 #[cfg(test)]
@@ -3248,6 +3274,62 @@ mod tests {
             page_locations.len(),
             10,
             "Expected 10 pages but got {page_locations:#?}"
+        );
+    }
+
+    #[test]
+    fn arrow_writer_caps_page_size_for_fixed_len_decimal() {
+        // Regression (C1): the native fixed-len-byte-array write path must keep
+        // the byte-budget page split for *all* FIXED_LEN_BYTE_ARRAY arrow types,
+        // not just `FixedSizeBinary`. A `Decimal128(precision = 30)` column
+        // encodes to a 13-byte FLBA; with a small `data_page_size_limit` and a
+        // large `write_batch_size` (so `ByteBudgetChunker::static_always_fits`
+        // does not short-circuit), the writer must emit many small pages honoring
+        // the byte budget rather than one oversized page.
+        const ROWS: usize = 4000;
+        let precision = 30u8;
+        // The width this regression hinges on (FixedSizeBinary exposes it
+        // directly; decimals must derive it the same way the schema does).
+        assert_eq!(decimal_length_from_precision(precision), 13);
+
+        let array = Decimal128Array::from((0..ROWS as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(precision, 2)
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            array.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+
+        let data_page_size_limit = 4096;
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_data_page_size_limit(data_page_size_limit)
+            // Large row/batch limits so only the *byte* budget can split pages.
+            .set_data_page_row_count_limit(ROWS + 1)
+            .set_write_batch_size(ROWS)
+            .build();
+
+        let file = tempfile::tempfile().unwrap();
+        let mut writer =
+            ArrowWriter::try_new(file.try_clone().unwrap(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(file, options).unwrap();
+        let offset_index = reader.metadata().offset_index().expect("offset index");
+        let page_locations = &offset_index[0][0].page_locations;
+
+        // Without the byte budget this is a single ~52 KB page (~13x the limit);
+        // with it honored we expect ~ROWS / (limit / 13) ≈ 13 pages. The defect
+        // produced exactly one page, so any split proves the fix.
+        assert!(
+            page_locations.len() > 1,
+            "expected the {data_page_size_limit}-byte page budget to split the \
+             13-byte FLBA decimal column into multiple pages, got {} page(s)",
+            page_locations.len()
         );
     }
 

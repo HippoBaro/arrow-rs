@@ -16,15 +16,17 @@
 // under the License.
 
 use crate::basic::{Encoding, Type};
-#[cfg(feature = "arrow")]
-use crate::data_type::BoolType;
 use crate::data_type::{AsBytes, DataType, SliceAsBytes};
+#[cfg(feature = "arrow")]
+use crate::data_type::{BoolType, FixedLenByteArrayType};
 
 use crate::errors::{ParquetError, Result};
 
-#[cfg(feature = "arrow")]
-use super::BoolEncoder;
 use super::Encoder;
+#[cfg(feature = "arrow")]
+use super::FixedLenByteArrayValues;
+#[cfg(feature = "arrow")]
+use super::{BoolEncoder, FixedLenByteArrayEncoder};
 
 use bytes::{BufMut, Bytes};
 use std::cmp;
@@ -217,6 +219,7 @@ impl<T: DataType> Encoder<T> for VariableWidthByteStreamSplitEncoder<T> {
         };
         // split_streams_const() is faster up to type_width == 8
         match type_size {
+            0 => {}
             2 => split_streams_const::<2>(&self.buffer, &mut encoded),
             3 => split_streams_const::<3>(&self.buffer, &mut encoded),
             4 => split_streams_const::<4>(&self.buffer, &mut encoded),
@@ -234,5 +237,42 @@ impl<T: DataType> Encoder<T> for VariableWidthByteStreamSplitEncoder<T> {
     /// return the estimated memory size of this encoder.
     fn estimated_memory_size(&self) -> usize {
         self.buffer.capacity() * std::mem::size_of::<u8>()
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl FixedLenByteArrayEncoder for VariableWidthByteStreamSplitEncoder<FixedLenByteArrayType> {
+    fn put_fixed_len_byte_array(&mut self, values: FixedLenByteArrayValues<'_>) -> Result<()> {
+        if values.type_length() != self.type_width {
+            return Err(general_err!(
+                "Mismatched FixedLenByteArray sizes: {} != {}",
+                values.type_length(),
+                self.type_width
+            ));
+        }
+
+        match values.dense_bytes() {
+            Some(bytes) => self.buffer.extend_from_slice(bytes),
+            None => values
+                .iter()
+                .for_each(|value| self.buffer.extend_from_slice(value)),
+        }
+        Ok(())
+    }
+
+    /// BYTE_STREAM_SPLIT accumulates the raw value bytes contiguously and transposes
+    /// them into byte-streams at `flush_buffer`, so a streamed value is simply
+    /// appended — no intermediate buffer.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn reserve_fixed_len(&mut self, additional_bytes: usize) {
+        self.buffer.reserve(additional_bytes);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(value);
+        Ok(())
     }
 }
