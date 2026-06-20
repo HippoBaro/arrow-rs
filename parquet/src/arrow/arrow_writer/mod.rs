@@ -1163,9 +1163,7 @@ impl ArrowColumnWriter {
 
         let should_materialize = matches!(
             &self.writer,
-            ArrowColumnWriterImpl::Column(
-                ColumnWriter::BoolColumnWriter(_) | ColumnWriter::FixedLenByteArrayColumnWriter(_)
-            )
+            ArrowColumnWriterImpl::Column(ColumnWriter::BoolColumnWriter(_))
         );
         if !should_materialize {
             return Ok(None);
@@ -1862,17 +1860,12 @@ impl<'a> ColumnValueSource<ColumnValueEncoderImpl<FixedLenByteArrayType>>
         if len == 0 {
             return Some(0);
         }
-        // Fixed-len values encode to a constant width with no length prefix, so
-        // the per-value byte cost is the column's FIXED_LEN_BYTE_ARRAY width.
-        // Include the boundary value that crosses the budget so the caller's
-        // page-size check sees the overshoot in this mini-batch. The width must
-        // match the one `arrow_to_parquet_type` assigns (see `arrow::schema`);
-        // otherwise the byte-budget page split is lost and `data_page_size_limit`
-        // is silently overshot. `ByteBudgetChunker::static_always_fits` only
-        // short-circuits this when `width * base_batch_size <= page_byte_limit`,
-        // which a lowered `data_page_size_limit` defeats — so every fixed-len
-        // type needs a real estimate, not just `FixedSizeBinary`.
-        let per = match self.storage().column.data_type() {
+
+        let data_type = match self.storage().column.data_type() {
+            ArrowDataType::Dictionary(_, value_type) => value_type.as_ref(),
+            data_type => data_type,
+        };
+        let per = match data_type {
             ArrowDataType::FixedSizeBinary(width) => (*width).max(1) as usize,
             ArrowDataType::Float16 => 2,
             ArrowDataType::Interval(_) => 12,
@@ -1895,7 +1888,15 @@ fn write_fixed_len_byte_array_column(
     column: &dyn arrow_array::Array,
     selection: ValueSelection<'_>,
 ) -> Result<()> {
-    write_fixed_len_byte_array_column_indices(encoder, column, value_indices(selection))
+    match dispatch_dictionary_input(column, selection)? {
+        DictionaryInput::Direct { values, indices }
+        | DictionaryInput::NonDictionary { values, indices } => {
+            write_fixed_len_byte_array_column_indices(encoder, values, indices)
+        }
+        DictionaryInput::Defaulted { values, indices } => {
+            write_fixed_len_byte_array_column_defaulted(encoder, values, indices)
+        }
+    }
 }
 
 fn write_fixed_len_byte_array_column_indices(
@@ -1917,8 +1918,8 @@ fn write_fixed_len_byte_array_column_indices(
         }
     }
 
-    // Sparse and computed fixed-length values stream one value at a time through
-    // the same sink.
+    // Sparse, dictionary, and computed fixed-length values stream one value at
+    // a time through the same sink.
     fixed_len_for_each_value(column, FlbaSelection::Plain(indices), |value| {
         sink.consume_value(value)
     })?;
@@ -1927,26 +1928,41 @@ fn write_fixed_len_byte_array_column_indices(
 }
 
 /// Selection backing [`fixed_len_for_each_value`]: a plain selection (every row
-/// valid, yields `usize`).
+/// valid, yields `usize`) or a defaulted dictionary selection (a null key
+/// substitutes the column default — a zero-filled value — yields `Option<usize>`).
 #[derive(Clone, Copy)]
 enum FlbaSelection<'a> {
     Plain(ValueIndices<'a>),
+    Defaulted(DefaultedDictionaryValueIndices<'a>),
 }
 
 impl<'a> FlbaSelection<'a> {
-    /// Walk the selection, yielding `Some(src_idx)` for a present value. Fallible
-    /// so a downstream encode error (e.g. from the append path) propagates out of
-    /// the per-value walk.
+    /// Walk the selection, yielding `Some(src_idx)` for a present value and
+    /// `None` for a defaulted (null-key) row. Fallible so a downstream encode error
+    /// (e.g. from the append path) propagates out of the per-value walk.
     #[inline]
     fn try_for_each(self, mut f: impl FnMut(Option<usize>) -> Result<()>) -> Result<()> {
         match self {
             Self::Plain(indices) => indices.try_for_each(|idx| f(Some(idx))),
+            Self::Defaulted(indices) => indices.try_for_each(f),
         }
     }
 }
 
+/// Hands `width` zero bytes — a defaulted (null-key) row — to `dest`.
+#[inline]
+fn emit_fixed_len_default(width: usize, dest: &mut impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    const ZEROS: [u8; 32] = [0u8; 32];
+    if width <= ZEROS.len() {
+        dest(&ZEROS[..width])
+    } else {
+        dest(&vec![0u8; width])
+    }
+}
+
 /// Walk `selection`, producing each row's fixed `W` bytes and handing them to
-/// `dest`. Returns `W`.
+/// `dest`. A defaulted (`None`) row yields the zero-filled column default.
+/// Returns `W`.
 fn fixed_len_for_each_value<F: FnMut(&[u8]) -> Result<()>>(
     column: &dyn arrow_array::Array,
     selection: FlbaSelection<'_>,
@@ -1957,7 +1973,7 @@ fn fixed_len_for_each_value<F: FnMut(&[u8]) -> Result<()>>(
             let width: usize = $width;
             selection.try_for_each(|opt| match opt {
                 Some($i) => dest($bytes),
-                None => unreachable!("plain FLBA selection yields only present rows"),
+                None => emit_fixed_len_default(width, &mut dest),
             })?;
             return Ok(width);
         }};
@@ -2027,6 +2043,25 @@ fn fixed_len_for_each_value<F: FnMut(&[u8]) -> Result<()>>(
                 .to_string(),
         )),
     }
+}
+
+/// Defaulted dictionary FLBA: a null key contributes the column default, a
+/// zero-filled width-`W` value, produced inline by [`fixed_len_for_each_value`].
+/// Routes through the same single [`fixed_len_for_each_value`] path as every other
+/// FLBA write.
+fn write_fixed_len_byte_array_column_defaulted(
+    encoder: &mut ColumnValueEncoderImpl<FixedLenByteArrayType>,
+    column: &dyn arrow_array::Array,
+    indices: DefaultedDictionaryValueIndices<'_>,
+) -> Result<()> {
+    // A defaulted dictionary substitutes a zero-filled value per null key, produced
+    // inline — transient, so it streams per value into the sink (never bulk).
+    let mut sink = encoder.fixed_len_sink(indices.len());
+    fixed_len_for_each_value(column, FlbaSelection::Defaulted(indices), |value| {
+        sink.consume_value(value)
+    })?;
+    sink.finish();
+    Ok(())
 }
 
 type Int32Source<'a> = Selected<'a, Int32Storage<'a>>;
@@ -2648,7 +2683,7 @@ mod tests {
     use crate::data_type::AsBytes;
     use crate::file::metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader};
     use crate::file::properties::{
-        BloomFilterPosition, EnabledStatistics, ReaderProperties, WriterVersion,
+        BloomFilterPosition, CdcOptions, EnabledStatistics, ReaderProperties, WriterVersion,
     };
     use crate::file::serialized_reader::ReadOptionsBuilder;
     use crate::file::{
@@ -3751,6 +3786,62 @@ mod tests {
             page_locations.len() > 1,
             "expected the {data_page_size_limit}-byte page budget to split the \
              13-byte FLBA decimal column into multiple pages, got {} page(s)",
+            page_locations.len()
+        );
+    }
+
+    #[test]
+    fn arrow_writer_caps_page_size_for_fixed_len_decimal_dictionary() {
+        const ROWS: usize = 4000;
+        let precision = 30u8;
+        assert_eq!(decimal_length_from_precision(precision), 13);
+
+        // Dictionary<Int32, Decimal128(30, 2)> written to a flat Decimal128
+        // column (the leaf reads back as the decoded decimal array).
+        let values = Decimal128Array::from((0..ROWS as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(precision, 2)
+            .unwrap();
+        let keys = Int32Array::from((0..ROWS as i32).collect::<Vec<_>>());
+        let dict = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Decimal128(precision, 2),
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Decimal128(precision, 2)),
+            ),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(dict)]).unwrap();
+
+        let data_page_size_limit = 4096;
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_data_page_size_limit(data_page_size_limit)
+            // Large row/batch limits so only the *byte* budget can split pages.
+            .set_data_page_row_count_limit(ROWS + 1)
+            .set_write_batch_size(ROWS)
+            .build();
+
+        let file = tempfile::tempfile().unwrap();
+        let mut writer =
+            ArrowWriter::try_new(file.try_clone().unwrap(), writer_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(file, options).unwrap();
+        let offset_index = reader.metadata().offset_index().expect("offset index");
+        let page_locations = &offset_index[0][0].page_locations;
+
+        assert!(
+            page_locations.len() > 1,
+            "expected the {data_page_size_limit}-byte page budget to split the \
+             13-byte FLBA *dictionary* decimal column into multiple pages, got {} page(s)",
             page_locations.len()
         );
     }
@@ -5043,6 +5134,504 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    // -------------------------------------------------------------------------
+    // Added coverage for input-shape specialization branches introduced by this
+    // series (native value sources, dictionary fast paths, null defaulting).
+    // -------------------------------------------------------------------------
+
+    /// A `Dictionary` whose values are `Utf8View`/`BinaryView` must round-trip
+    /// without panicking. `get_arrow_column_writer` routes
+    /// `Dictionary(_, Utf8View | BinaryView)` to the byte-array encoder, where
+    /// `write_selection`'s `Dictionary` arm interns the view values; it
+    /// previously lacked view cases and hit `unreachable!("cannot downcast {d}
+    /// dictionary value to byte array")` on valid input.
+    #[test]
+    fn arrow_writer_dictionary_of_view_roundtrip() {
+        // Write a `Dictionary(Int32, flat_type)` batch to a column declared with
+        // the flat `flat_type` (so the column reads back as the decoded leaf
+        // array) and assert the resolved rows.
+        fn check(flat_type: DataType, nullable: bool, dict: ArrayRef, expected: ArrayRef) {
+            let writer_schema = Arc::new(Schema::new(vec![Field::new(
+                "d",
+                flat_type.clone(),
+                nullable,
+            )]));
+            let batch_schema = Arc::new(Schema::new(vec![Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(flat_type)),
+                nullable,
+            )]));
+            let batch = RecordBatch::try_new(batch_schema, vec![dict]).unwrap();
+
+            let mut file = vec![];
+            let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+            let actual = reader.next().unwrap().unwrap();
+            let expected = RecordBatch::try_new(writer_schema, vec![expected]).unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        // A value longer than 12 bytes forces the view array's out-of-line buffer.
+        let long = "a longer payload that exceeds twelve bytes";
+
+        // Required Utf8View dictionary, repeated keys -> Dense selection.
+        check(
+            DataType::Utf8View,
+            false,
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![0, 1, 0, 2, 1]),
+                Arc::new(StringViewArray::from(vec!["alpha", long, "beta"])),
+            )),
+            Arc::new(StringViewArray::from(vec![
+                "alpha", long, "alpha", "beta", long,
+            ])),
+        );
+
+        // Required BinaryView dictionary (a referenced key > 0 resolving to the
+        // out-of-line value).
+        check(
+            DataType::BinaryView,
+            false,
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::from(vec![1, 0, 1]),
+                Arc::new(BinaryViewArray::from_iter_values(vec![
+                    b"x".as_slice(),
+                    long.as_bytes(),
+                ])),
+            )),
+            Arc::new(BinaryViewArray::from_iter_values(vec![
+                long.as_bytes(),
+                b"x".as_slice(),
+                long.as_bytes(),
+            ])),
+        );
+
+        // Nullable Utf8View dictionary with a null key: the leaf selection is
+        // sparse (non-null rows only), so the value behind the null slot
+        // ("unused") is never emitted and the defensive `keys.is_null` branch in
+        // the new view helper is exercised.
+        check(
+            DataType::Utf8View,
+            true,
+            Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::new(
+                    vec![0, 1, 2, 0].into(),
+                    Some(NullBuffer::from(vec![true, false, true, true])),
+                ),
+                Arc::new(StringViewArray::from(vec!["x", "unused", long])),
+            )),
+            Arc::new(StringViewArray::from(vec![
+                Some("x"),
+                None,
+                Some(long),
+                Some("x"),
+            ])),
+        );
+    }
+
+    /// Round-trips a `Dictionary(Int32, value_type)` whose values contain a null
+    /// to a *required* (non-nullable) column, asserting null slots stream as
+    /// the type's physical default.
+    fn check_required_dict_null_value(values: ArrayRef, expected: ArrayRef) {
+        let value_type = values.data_type().clone();
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            value_type.clone(),
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type)),
+            true,
+        )]));
+        let keys = Int32Array::from(vec![0, 1, 2]);
+        let array = DictionaryArray::<Int32Type>::new(keys, values);
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let expected = RecordBatch::try_new(writer_schema, vec![expected]).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn arrow_writer_required_dictionary_with_null_value_types() {
+        // Integers.
+        check_required_dict_null_value(
+            Arc::new(Int8Array::from(vec![Some(10), None, Some(20)])),
+            Arc::new(Int8Array::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(Int16Array::from(vec![Some(10), None, Some(20)])),
+            Arc::new(Int16Array::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(Int64Array::from(vec![Some(10), None, Some(20)])),
+            Arc::new(Int64Array::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(UInt8Array::from(vec![Some(10), None, Some(20)])),
+            Arc::new(UInt8Array::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(UInt16Array::from(vec![Some(10), None, Some(20)])),
+            Arc::new(UInt16Array::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(UInt32Array::from(vec![Some(10), None, Some(20)])),
+            Arc::new(UInt32Array::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(UInt64Array::from(vec![Some(10), None, Some(20)])),
+            Arc::new(UInt64Array::from(vec![10, 0, 20])),
+        );
+        // Floats.
+        check_required_dict_null_value(
+            Arc::new(Float32Array::from(vec![Some(1.5), None, Some(2.5)])),
+            Arc::new(Float32Array::from(vec![1.5, 0.0, 2.5])),
+        );
+        check_required_dict_null_value(
+            Arc::new(Float64Array::from(vec![Some(1.5), None, Some(2.5)])),
+            Arc::new(Float64Array::from(vec![1.5, 0.0, 2.5])),
+        );
+        // Temporal.
+        check_required_dict_null_value(
+            Arc::new(Date32Array::from(vec![Some(10), None, Some(20)])),
+            Arc::new(Date32Array::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(TimestampMicrosecondArray::from(vec![10i64, 0, 20])),
+        );
+        // Decimals (all four widths -> FixedLenByteArray / int storage).
+        check_required_dict_null_value(
+            Arc::new(
+                Decimal32Array::from(vec![Some(10), None, Some(20)])
+                    .with_precision_and_scale(9, 2)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal32Array::from(vec![10, 0, 20])
+                    .with_precision_and_scale(9, 2)
+                    .unwrap(),
+            ),
+        );
+        check_required_dict_null_value(
+            Arc::new(
+                Decimal64Array::from(vec![Some(10i64), None, Some(20)])
+                    .with_precision_and_scale(12, 2)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal64Array::from(vec![10i64, 0, 20])
+                    .with_precision_and_scale(12, 2)
+                    .unwrap(),
+            ),
+        );
+        check_required_dict_null_value(
+            Arc::new(
+                Decimal128Array::from(vec![Some(10i128), None, Some(20)])
+                    .with_precision_and_scale(20, 2)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal128Array::from(vec![10i128, 0, 20])
+                    .with_precision_and_scale(20, 2)
+                    .unwrap(),
+            ),
+        );
+        let d256 = |v: i128| arrow_buffer::i256::from_i128(v);
+        check_required_dict_null_value(
+            Arc::new(
+                Decimal256Array::from(vec![Some(d256(10)), None, Some(d256(20))])
+                    .with_precision_and_scale(40, 2)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal256Array::from(vec![d256(10), d256(0), d256(20)])
+                    .with_precision_and_scale(40, 2)
+                    .unwrap(),
+            ),
+        );
+    }
+
+    /// Remaining defaulted dictionary coverage: Float16 + the temporal types.
+    #[test]
+    fn arrow_writer_required_dictionary_with_null_value_temporal_types() {
+        check_required_dict_null_value(
+            Arc::new(Float16Array::from(vec![
+                Some(half::f16::from_f32(1.5)),
+                None,
+                Some(half::f16::from_f32(2.5)),
+            ])),
+            Arc::new(Float16Array::from(vec![
+                half::f16::from_f32(1.5),
+                half::f16::from_f32(0.0),
+                half::f16::from_f32(2.5),
+            ])),
+        );
+        check_required_dict_null_value(
+            Arc::new(Date64Array::from(vec![
+                Some(86_400_000i64),
+                None,
+                Some(172_800_000),
+            ])),
+            Arc::new(Date64Array::from(vec![86_400_000, 0, 172_800_000])),
+        );
+        check_required_dict_null_value(
+            Arc::new(Time32SecondArray::from(vec![Some(10), None, Some(20)])),
+            Arc::new(Time32SecondArray::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(Time32MillisecondArray::from(vec![Some(10), None, Some(20)])),
+            Arc::new(Time32MillisecondArray::from(vec![10, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(Time64MicrosecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(Time64MicrosecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(Time64NanosecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(Time64NanosecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(TimestampSecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(TimestampSecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(TimestampMillisecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(TimestampNanosecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(TimestampNanosecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(DurationSecondArray::from(vec![Some(10i64), None, Some(20)])),
+            Arc::new(DurationSecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(DurationMillisecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(DurationMillisecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(DurationMicrosecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(DurationMicrosecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(DurationNanosecondArray::from(vec![
+                Some(10i64),
+                None,
+                Some(20),
+            ])),
+            Arc::new(DurationNanosecondArray::from(vec![10i64, 0, 20])),
+        );
+        check_required_dict_null_value(
+            Arc::new(IntervalYearMonthArray::from(vec![Some(10), None, Some(20)])),
+            Arc::new(IntervalYearMonthArray::from(vec![10, 0, 20])),
+        );
+    }
+
+    /// Native primitive dictionary across all 8 key types -> exercises the
+    /// `dictionary_value_indices` / `DictionaryValueIndices` key-type arms.
+    #[test]
+    fn arrow_writer_native_primitive_dictionary_key_types() {
+        fn inner<K>()
+        where
+            K: ArrowDictionaryKeyType,
+            K::Native: TryFrom<u8>,
+            <<K as arrow_array::ArrowPrimitiveType>::Native as TryFrom<u8>>::Error: std::fmt::Debug,
+        {
+            let keys = PrimitiveArray::<K>::from_iter_values(
+                [0u8, 0, 1, 2, 1]
+                    .into_iter()
+                    .map(|i| K::Native::try_from(i).unwrap()),
+            );
+            let values = Int32Array::from(vec![10, 20, 30]);
+            let array = DictionaryArray::<K>::new(keys, Arc::new(values));
+            one_column_roundtrip(Arc::new(array), true);
+        }
+        inner::<UInt8Type>();
+        inner::<UInt16Type>();
+        inner::<UInt32Type>();
+        inner::<UInt64Type>();
+        inner::<Int8Type>();
+        inner::<Int16Type>();
+        inner::<Int32Type>();
+        inner::<Int64Type>();
+    }
+
+    /// Plain (non-dictionary) `Decimal32` / `Decimal64` columns. (These
+    /// precisions map to INT32 / INT64 storage, not FixedLenByteArray.)
+    #[test]
+    fn arrow_writer_decimal32_decimal64_plain_column() {
+        let d32 = Decimal32Array::from(vec![Some(12345), Some(56789), Some(34567)])
+            .with_precision_and_scale(9, 2)
+            .unwrap();
+        one_column_roundtrip(Arc::new(d32), false);
+        let d32n = Decimal32Array::from(vec![Some(12345), None, Some(34567)])
+            .with_precision_and_scale(9, 2)
+            .unwrap();
+        one_column_roundtrip(Arc::new(d32n), true);
+        let d64 = Decimal64Array::from(vec![Some(12345i64), Some(56789), Some(34567)])
+            .with_precision_and_scale(12, 2)
+            .unwrap();
+        one_column_roundtrip(Arc::new(d64), false);
+        let d64n = Decimal64Array::from(vec![Some(12345i64), None, Some(34567)])
+            .with_precision_and_scale(12, 2)
+            .unwrap();
+        one_column_roundtrip(Arc::new(d64n), true);
+    }
+
+    #[test]
+    fn arrow_writer_non_byte_dictionary_physical_types() {
+        fn roundtrip_with_native_schema(
+            values: ArrayRef,
+            native_type: DataType,
+            expected: ArrayRef,
+        ) {
+            let writer_schema = Arc::new(Schema::new(vec![Field::new("col", native_type, true)]));
+            let batch_schema = Arc::new(Schema::new(vec![Field::new(
+                "col",
+                values.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(batch_schema, vec![values]).unwrap();
+
+            let mut file = vec![];
+            let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+            let actual = reader.next().unwrap().unwrap();
+            let expected = RecordBatch::try_new(writer_schema, vec![expected]).unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        let keys = UInt8Array::from(vec![Some(0), Some(1), None, Some(0), Some(1)]);
+
+        let float_values = Float32Array::from(vec![1.25, -2.5]);
+        let array = DictionaryArray::new(keys.clone(), Arc::new(float_values));
+        roundtrip_with_native_schema(
+            Arc::new(array),
+            DataType::Float32,
+            Arc::new(Float32Array::from(vec![
+                Some(1.25),
+                Some(-2.5),
+                None,
+                Some(1.25),
+                Some(-2.5),
+            ])),
+        );
+
+        let double_values = Float64Array::from(vec![1.25, -2.5]);
+        let array = DictionaryArray::new(keys.clone(), Arc::new(double_values));
+        roundtrip_with_native_schema(
+            Arc::new(array),
+            DataType::Float64,
+            Arc::new(Float64Array::from(vec![
+                Some(1.25),
+                Some(-2.5),
+                None,
+                Some(1.25),
+                Some(-2.5),
+            ])),
+        );
+
+        let int64_values = Int64Array::from(vec![1234567890123, -987654321098]);
+        let array = DictionaryArray::new(keys, Arc::new(int64_values));
+        roundtrip_with_native_schema(
+            Arc::new(array),
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![
+                Some(1234567890123),
+                Some(-987654321098),
+                None,
+                Some(1234567890123),
+                Some(-987654321098),
+            ])),
+        );
+    }
+
+    #[test]
+    fn arrow_writer_primitive_dictionary_with_cdc() {
+        #[allow(deprecated)]
+        let schema = Arc::new(Schema::new(vec![Field::new_dict(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::UInt32)),
+            true,
+            42,
+            true,
+        )]));
+
+        let keys = UInt8Array::from(
+            (0..1024)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        None
+                    } else {
+                        Some((i % 4) as u8)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let values = UInt32Array::from(vec![12345678, 22345678, 32345678, 42345678]);
+        let array = Arc::new(DictionaryArray::new(keys, Arc::new(values)));
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_write_batch_size(64)
+            .set_content_defined_chunking(Some(CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 256,
+                norm_level: 0,
+            }))
+            .build();
+
+        roundtrip_opts(&batch, props);
     }
 
     #[test]

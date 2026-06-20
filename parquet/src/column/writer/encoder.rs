@@ -398,6 +398,9 @@ impl ColumnValueEncoderImpl<FixedLenByteArrayType, FixedLenByteArrayEncoderObjec
     #[cfg(feature = "arrow")]
     pub(crate) fn fixed_len_sink(&mut self, len: usize) -> FlbaSink<'_> {
         self.num_values += len;
+        if let Some(dict_encoder) = self.dict_encoder.as_mut() {
+            dict_encoder.reserve(len);
+        }
         let should_update_stats = self.statistics_enabled != EnabledStatistics::None
             && self.descr.converted_type() != ConvertedType::INTERVAL;
         // The bulk handoff hands the whole packed run to the encoder untouched, so it
