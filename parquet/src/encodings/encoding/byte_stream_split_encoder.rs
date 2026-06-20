@@ -16,10 +16,14 @@
 // under the License.
 
 use crate::basic::{Encoding, Type};
+#[cfg(feature = "arrow")]
+use crate::data_type::BoolType;
 use crate::data_type::{AsBytes, DataType, SliceAsBytes};
 
 use crate::errors::{ParquetError, Result};
 
+#[cfg(feature = "arrow")]
+use super::BoolEncoder;
 use super::Encoder;
 
 use bytes::{BufMut, Bytes};
@@ -111,6 +115,9 @@ impl<T: DataType> Encoder<T> for ByteStreamSplitEncoder<T> {
         self.buffer.capacity() * std::mem::size_of::<u8>()
     }
 }
+
+#[cfg(feature = "arrow")]
+impl BoolEncoder for ByteStreamSplitEncoder<BoolType> {}
 
 pub struct VariableWidthByteStreamSplitEncoder<T> {
     buffer: Vec<u8>,

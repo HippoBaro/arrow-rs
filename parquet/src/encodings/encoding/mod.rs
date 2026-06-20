@@ -28,6 +28,10 @@ use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{BitWriter, num_required_bits};
 
 #[cfg(feature = "arrow")]
+use crate::util::bit_util::get_bit;
+#[cfg(feature = "arrow")]
+use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
+#[cfg(feature = "arrow")]
 use arrow_buffer::i256;
 use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamSplitEncoder};
 use bytes::Bytes;
@@ -78,6 +82,132 @@ pub trait Encoder<T: DataType>: Send {
     /// Flushes the underlying byte buffer that's being processed by this encoder, and
     /// return the immutable copy of it. This will also reset the internal state.
     fn flush_buffer(&mut self) -> Result<Bytes>;
+}
+
+/// Borrowed packed boolean values.
+///
+/// Bits are addressed in the same least-significant-bit-first order used by
+/// Arrow boolean buffers and Parquet boolean encodings.
+#[derive(Debug, Clone, Copy)]
+#[cfg(feature = "arrow")]
+pub(crate) struct PackedBoolValues<'a> {
+    bytes: &'a [u8],
+    selection: PackedBoolSelection<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg(feature = "arrow")]
+enum PackedBoolSelection<'a> {
+    Dense {
+        bit_offset: usize,
+        len: usize,
+    },
+    Sparse {
+        bit_offset: usize,
+        indices: &'a [usize],
+    },
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> PackedBoolValues<'a> {
+    pub(crate) fn new(bytes: &'a [u8], bit_offset: usize, len: usize) -> Self {
+        Self {
+            bytes,
+            selection: PackedBoolSelection::Dense { bit_offset, len },
+        }
+    }
+
+    pub(crate) fn new_sparse(bytes: &'a [u8], bit_offset: usize, indices: &'a [usize]) -> Self {
+        Self {
+            bytes,
+            selection: PackedBoolSelection::Sparse {
+                bit_offset,
+                indices,
+            },
+        }
+    }
+
+    pub(crate) fn dense(self) -> Option<(&'a [u8], usize, usize)> {
+        match self.selection {
+            PackedBoolSelection::Dense { bit_offset, len } => Some((self.bytes, bit_offset, len)),
+            PackedBoolSelection::Sparse { .. } => None,
+        }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self.selection {
+            PackedBoolSelection::Dense { len, .. } => len,
+            PackedBoolSelection::Sparse { indices, .. } => indices.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Push the packed boolean run directly to a sink. Empty runs are preserved
+    /// because all-null pages still need to reach the boolean encoder.
+    #[inline]
+    pub(crate) fn write_into<S: ChunkSink<PackedBoolValues<'a>>>(self, sink: &mut S) -> Result<()> {
+        sink.consume(&self)
+    }
+
+    /// Resolve the selection once, then yield each selected bit.
+    #[inline]
+    fn for_each(self, mut f: impl FnMut(bool)) {
+        let bytes = self.bytes;
+        match self.selection {
+            PackedBoolSelection::Dense { bit_offset, len } => {
+                for i in 0..len {
+                    f(get_bit(bytes, bit_offset + i));
+                }
+            }
+            PackedBoolSelection::Sparse {
+                bit_offset,
+                indices,
+            } => {
+                for &idx in indices {
+                    f(get_bit(bytes, bit_offset + idx));
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn put_indexed_packed(self, bit_writer: &mut BitWriter) {
+        // Stream the selected bits once, packing them LSB-first into words.
+        let mut word: u64 = 0;
+        let mut bits: usize = 0;
+        self.for_each(|b| {
+            word |= (b as u64) << bits;
+            bits += 1;
+            if bits == 64 {
+                bit_writer.put_value(word, 64);
+                word = 0;
+                bits = 0;
+            }
+        });
+        if bits > 0 {
+            bit_writer.put_value(word, bits);
+        }
+    }
+
+    pub(crate) fn true_count(self) -> usize {
+        match self.selection {
+            // Dense: count set bits in the contiguous range in bulk (popcount)
+            // instead of testing each bit individually.
+            PackedBoolSelection::Dense { bit_offset, len } => {
+                UnalignedBitChunk::new(self.bytes, bit_offset, len).count_ones()
+            }
+            // Sparse: selected bits are non-contiguous, so resolve the
+            // selection once and count via `for_each` (no popcount).
+            PackedBoolSelection::Sparse { .. } => {
+                let mut count = 0;
+                self.for_each(|b| count += b as usize);
+                count
+            }
+        }
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -433,6 +563,19 @@ impl<'a> ValueStream<'a, f64> for DoubleValues<'a> {
     }
 }
 
+/// Encodes packed boolean values.
+///
+/// This is a storage-shape fast path for Arrow boolean buffers.
+#[doc(hidden)]
+#[cfg(feature = "arrow")]
+pub(crate) trait BoolEncoder: Encoder<BoolType> {
+    fn put_packed_bool(&mut self, _values: PackedBoolValues<'_>) -> Result<()> {
+        Err(general_err!(
+            "Packed boolean values are not supported by this encoder"
+        ))
+    }
+}
+
 /// Gets a encoder for the particular data type `T` and encoding `encoding`. Memory usage
 /// for the encoder instance is tracked by `mem_tracker`.
 pub fn get_encoder<T: DataType>(
@@ -476,6 +619,87 @@ impl<T: DataType> EncoderFactory<T> for dyn Encoder<T> {
         get_encoder::<T>(encoding, descr)
     }
 }
+
+/// Builds a fixed-set encoder-object enum for one physical type plus its
+/// object-safe [`Encoder`] forwarding.
+macro_rules! encoder_object {
+    ($name:ident, $ty:ty, $bss:ty) => {
+        #[doc(hidden)]
+        pub enum $name {
+            Plain(PlainEncoder<$ty>),
+            Rle(RleValueEncoder<$ty>),
+            // The DELTA family wraps one or more (large) `DeltaBitPackEncoder`s;
+            // box them so the enum stays small. These are cold fallback paths.
+            DeltaBinaryPacked(Box<DeltaBitPackEncoder<$ty>>),
+            DeltaLengthByteArray(Box<DeltaLengthByteArrayEncoder<$ty>>),
+            DeltaByteArray(Box<DeltaByteArrayEncoder<$ty>>),
+            ByteStreamSplit($bss),
+        }
+
+        impl Encoder<$ty> for $name {
+            fn put(&mut self, values: &[<$ty as DataType>::T]) -> Result<()> {
+                match self {
+                    Self::Plain(e) => e.put(values),
+                    Self::Rle(e) => e.put(values),
+                    Self::DeltaBinaryPacked(e) => e.put(values),
+                    Self::DeltaLengthByteArray(e) => e.put(values),
+                    Self::DeltaByteArray(e) => e.put(values),
+                    Self::ByteStreamSplit(e) => e.put(values),
+                }
+            }
+
+            fn encoding(&self) -> Encoding {
+                match self {
+                    Self::Plain(e) => e.encoding(),
+                    Self::Rle(e) => e.encoding(),
+                    Self::DeltaBinaryPacked(e) => e.encoding(),
+                    Self::DeltaLengthByteArray(e) => e.encoding(),
+                    Self::DeltaByteArray(e) => e.encoding(),
+                    Self::ByteStreamSplit(e) => e.encoding(),
+                }
+            }
+
+            fn estimated_data_encoded_size(&self) -> usize {
+                match self {
+                    Self::Plain(e) => e.estimated_data_encoded_size(),
+                    Self::Rle(e) => e.estimated_data_encoded_size(),
+                    Self::DeltaBinaryPacked(e) => e.estimated_data_encoded_size(),
+                    Self::DeltaLengthByteArray(e) => e.estimated_data_encoded_size(),
+                    Self::DeltaByteArray(e) => e.estimated_data_encoded_size(),
+                    Self::ByteStreamSplit(e) => e.estimated_data_encoded_size(),
+                }
+            }
+
+            fn estimated_memory_size(&self) -> usize {
+                match self {
+                    Self::Plain(e) => e.estimated_memory_size(),
+                    Self::Rle(e) => e.estimated_memory_size(),
+                    Self::DeltaBinaryPacked(e) => e.estimated_memory_size(),
+                    Self::DeltaLengthByteArray(e) => e.estimated_memory_size(),
+                    Self::DeltaByteArray(e) => e.estimated_memory_size(),
+                    Self::ByteStreamSplit(e) => e.estimated_memory_size(),
+                }
+            }
+
+            fn flush_buffer(&mut self) -> Result<Bytes> {
+                match self {
+                    Self::Plain(e) => e.flush_buffer(),
+                    Self::Rle(e) => e.flush_buffer(),
+                    Self::DeltaBinaryPacked(e) => e.flush_buffer(),
+                    Self::DeltaLengthByteArray(e) => e.flush_buffer(),
+                    Self::DeltaByteArray(e) => e.flush_buffer(),
+                    Self::ByteStreamSplit(e) => e.flush_buffer(),
+                }
+            }
+        }
+    };
+}
+
+encoder_object!(
+    BoolEncoderObject,
+    BoolType,
+    ByteStreamSplitEncoder<BoolType>
+);
 
 /// Numeric encoder-object enum, generic over the physical type `T`.
 #[doc(hidden)]
@@ -553,6 +777,20 @@ pub type Int64EncoderObject = NumericEncoderObject<Int64Type>;
 pub type FloatEncoderObject = NumericEncoderObject<FloatType>;
 pub type DoubleEncoderObject = NumericEncoderObject<DoubleType>;
 
+#[cfg(feature = "arrow")]
+impl BoolEncoder for BoolEncoderObject {
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        match self {
+            Self::Plain(e) => e.put_packed_bool(values),
+            Self::Rle(e) => e.put_packed_bool(values),
+            Self::DeltaBinaryPacked(e) => e.put_packed_bool(values),
+            Self::DeltaLengthByteArray(e) => e.put_packed_bool(values),
+            Self::DeltaByteArray(e) => e.put_packed_bool(values),
+            Self::ByteStreamSplit(e) => e.put_packed_bool(values),
+        }
+    }
+}
+
 /// The encoding -> concrete-variant selection shared by every encoder-object
 /// enum's `EncoderFactory` impl (`BoolEncoderObject`,
 /// `FixedLenByteArrayEncoderObject`, `NumericEncoderObject<T>`). It mirrors
@@ -580,6 +818,15 @@ macro_rules! encoder_object_from_encoding {
             e => return Err(nyi_err!("Encoding {} is not supported", e)),
         }
     };
+}
+
+impl EncoderFactory<BoolType> for BoolEncoderObject {
+    fn get_encoder(encoding: Encoding, _descr: &ColumnDescPtr) -> Result<Box<Self>> {
+        Ok(Box::new(encoder_object_from_encoding!(
+            encoding,
+            Self::ByteStreamSplit(ByteStreamSplitEncoder::new())
+        )))
+    }
 }
 
 impl<T: DataType> EncoderFactory<T> for NumericEncoderObject<T> {
@@ -658,6 +905,19 @@ impl<T: DataType> Encoder<T> for PlainEncoder<T> {
     /// Return the estimated memory size of this encoder.
     fn estimated_memory_size(&self) -> usize {
         self.buffer.capacity() * std::mem::size_of::<u8>() + self.bit_writer.estimated_memory_size()
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl BoolEncoder for PlainEncoder<BoolType> {
+    #[inline]
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        if let Some((bytes, bit_offset, len)) = values.dense() {
+            self.bit_writer.put_bits(bytes, bit_offset, len);
+        } else {
+            values.put_indexed_packed(&mut self.bit_writer);
+        }
+        Ok(())
     }
 }
 
@@ -750,6 +1010,22 @@ impl<T: DataType> Encoder<T> for RleValueEncoder<T> {
         self.encoder
             .as_ref()
             .map_or(0, |enc| enc.estimated_memory_size())
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl BoolEncoder for RleValueEncoder<BoolType> {
+    #[inline]
+    fn put_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        let rle_encoder = self.encoder.get_or_insert_with(|| {
+            let mut buffer = Vec::with_capacity(DEFAULT_RLE_BUFFER_LEN);
+            // Reserve space for length
+            buffer.extend_from_slice(&[0; 4]);
+            RleEncoder::new_from_buf(1, buffer)
+        });
+
+        values.for_each(|b| rle_encoder.put(b as u64));
+        Ok(())
     }
 }
 
@@ -995,6 +1271,9 @@ impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
     }
 }
 
+#[cfg(feature = "arrow")]
+impl BoolEncoder for DeltaBitPackEncoder<BoolType> {}
+
 /// Helper trait to define specific conversions and subtractions when computing deltas
 trait DeltaBitPackEncoderConversion<T: DataType> {
     // Method should panic if type is not supported, otherwise no-op
@@ -1135,6 +1414,9 @@ impl<T: DataType> Encoder<T> for DeltaLengthByteArrayEncoder<T> {
     }
 }
 
+#[cfg(feature = "arrow")]
+impl BoolEncoder for DeltaLengthByteArrayEncoder<BoolType> {}
+
 // ----------------------------------------------------------------------
 // DELTA_BYTE_ARRAY encoding
 
@@ -1245,6 +1527,9 @@ impl<T: DataType> Encoder<T> for DeltaByteArrayEncoder<T> {
     }
 }
 
+#[cfg(feature = "arrow")]
+impl BoolEncoder for DeltaByteArrayEncoder<BoolType> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,6 +1582,43 @@ mod tests {
         BoolType::test(Encoding::PLAIN, TEST_SET_SIZE, -1);
         BoolType::test(Encoding::PLAIN_DICTIONARY, TEST_SET_SIZE, -1);
         BoolType::test(Encoding::RLE, TEST_SET_SIZE, -1);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_plain_encoder_sparse_packed_bool() {
+        let input = [
+            0b1010_1101,
+            0b0111_0010,
+            0b1100_1001,
+            0b0011_1110,
+            0b0101_0101,
+            0b1000_1111,
+            0b1111_0000,
+            0b0001_1011,
+            0b1011_0110,
+            0b0100_1001,
+            0b1110_0011,
+            0b0010_1100,
+            0b1001_0111,
+            0b0110_1010,
+        ];
+        let indices: Vec<_> = (0..93).filter(|idx| idx % 3 != 1).collect();
+
+        let mut encoder = PlainEncoder::<BoolType>::new();
+        encoder
+            .put_packed_bool(PackedBoolValues::new_sparse(&input, 5, &indices))
+            .unwrap();
+        let encoded = encoder.flush_buffer().unwrap();
+
+        assert_eq!(encoded.len(), indices.len().div_ceil(8));
+        for (out_idx, &input_idx) in indices.iter().enumerate() {
+            assert_eq!(
+                bit_util::get_bit(&encoded, out_idx),
+                bit_util::get_bit(&input, 5 + input_idx),
+                "mismatch at output bit {out_idx}"
+            );
+        }
     }
 
     #[test]

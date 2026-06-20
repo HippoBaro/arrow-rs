@@ -31,11 +31,12 @@ use crate::data_type::{
 };
 #[cfg(feature = "arrow")]
 use crate::encodings::encoding::{
-    ChunkSink, DoubleValues, FloatValues, Int32Values, Int64Values, ValueStream,
+    BoolEncoder, ChunkSink, DoubleValues, FloatValues, Int32Values, Int64Values, PackedBoolValues,
+    ValueStream,
 };
 use crate::encodings::encoding::{
-    DictEncoder, DoubleEncoderObject, Encoder, EncoderFactory, FloatEncoderObject,
-    Int32EncoderObject, Int64EncoderObject,
+    BoolEncoderObject, DictEncoder, DoubleEncoderObject, Encoder, EncoderFactory,
+    FloatEncoderObject, Int32EncoderObject, Int64EncoderObject,
 };
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
@@ -232,7 +233,7 @@ macro_rules! make_encoder_type {
     };
 }
 
-make_encoder_type!(BoolType, BoolColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(BoolType, BoolColumnWriter, BoolEncoderObject);
 make_encoder_type!(Int32Type, Int32ColumnWriter, Int32EncoderObject);
 make_encoder_type!(Int64Type, Int64ColumnWriter, Int64EncoderObject);
 make_encoder_type!(
@@ -350,6 +351,69 @@ where
             update_max_normalized(&self.descr, &max, &mut self.max_value);
         }
         Ok(())
+    }
+}
+
+impl ColumnValueEncoderImpl<BoolType, BoolEncoderObject> {
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_packed_bool(&mut self, values: PackedBoolValues<'_>) -> Result<()> {
+        self.num_values += values.len();
+        let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+            && self.descr.converted_type() != ConvertedType::INTERVAL;
+        debug_assert!(self.dict_encoder.is_none());
+
+        // Bool rides the same `write_into`/[`ChunkSink`] path as every other family,
+        // but its natural chunk is the whole packed run, not `&[bool]`: it pushes one
+        // `PackedBoolValues` into a `BoolSink` that folds it via popcount.
+        let mut sink = BoolSink {
+            should_update_stats,
+            descr: self.descr.as_ref(),
+            min_value: &mut self.min_value,
+            max_value: &mut self.max_value,
+            bloom: self.bloom_filter.as_mut(),
+            encoder: &mut self.encoder,
+        };
+        values.write_into(&mut sink)
+    }
+}
+
+/// The push-side consumer for the boolean write path: derives page min/max and the
+/// bloom filter from a single popcount, then bulk-`put`s the packed run — no
+/// per-value walk. A [`PackedBoolValues`] drives its whole run in as one chunk via
+/// [`PackedBoolValues::write_into`].
+#[cfg(feature = "arrow")]
+struct BoolSink<'e> {
+    should_update_stats: bool,
+    descr: &'e ColumnDescriptor,
+    min_value: &'e mut Option<bool>,
+    max_value: &'e mut Option<bool>,
+    bloom: Option<&'e mut Sbbf>,
+    encoder: &'e mut BoolEncoderObject,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> ChunkSink<PackedBoolValues<'a>> for BoolSink<'_> {
+    #[inline]
+    fn consume(&mut self, values: &PackedBoolValues<'a>) -> Result<()> {
+        let values = *values;
+        if !values.is_empty() && (self.should_update_stats || self.bloom.is_some()) {
+            let true_count = values.true_count();
+            if self.should_update_stats {
+                let min = true_count == values.len();
+                let max = true_count > 0;
+                update_min(self.descr, &min, self.min_value);
+                update_max(self.descr, &max, self.max_value);
+            }
+            if let Some(bloom) = self.bloom.as_deref_mut() {
+                if true_count < values.len() {
+                    bloom.insert(&false);
+                }
+                if true_count > 0 {
+                    bloom.insert(&true);
+                }
+            }
+        }
+        self.encoder.put_packed_bool(values)
     }
 }
 

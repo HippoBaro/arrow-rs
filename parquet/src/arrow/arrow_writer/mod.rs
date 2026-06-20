@@ -44,13 +44,13 @@ use crate::column::writer::{
     ColumnCloseResult, ColumnValueSource, ColumnWriter, GenericColumnWriter, Selected,
     ValueSelection, get_column_writer,
 };
-use crate::data_type::{ByteArray, FixedLenByteArray};
 use crate::data_type::{
-    DoubleType as ParquetDoubleType, FloatType as ParquetFloatType, Int32Type as ParquetInt32Type,
-    Int64Type as ParquetInt64Type,
+    BoolType, DoubleType as ParquetDoubleType, FloatType as ParquetFloatType,
+    Int32Type as ParquetInt32Type, Int64Type as ParquetInt64Type,
 };
+use crate::data_type::{ByteArray, FixedLenByteArray};
 use crate::encodings::encoding::{
-    DoubleValues, FloatValues, Int32Values, Int64Values, ValueIndices,
+    DoubleValues, FloatValues, Int32Values, Int64Values, PackedBoolValues, ValueIndices,
 };
 #[cfg(feature = "encryption")]
 use crate::encryption::encrypt::FileEncryptor;
@@ -1814,6 +1814,84 @@ fn write_int64_column_indices(
     encoder.write_int64_values(values)
 }
 
+#[derive(Clone, Copy)]
+enum BoolStorage<'a> {
+    PackedBits { bytes: &'a [u8], bit_offset: usize },
+}
+
+impl<'a> BoolStorage<'a> {
+    fn from_array(array: &'a arrow_array::BooleanArray) -> Self {
+        let values = array.values();
+        Self::PackedBits {
+            bytes: values.values(),
+            bit_offset: values.offset(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BoolSource<'a> {
+    storage: BoolStorage<'a>,
+    indices: ValueIndices<'a>,
+}
+
+impl<'a> BoolSource<'a> {
+    fn new(storage: BoolStorage<'a>, indices: ValueIndices<'a>) -> Self {
+        Self { storage, indices }
+    }
+}
+
+impl<'a> ColumnValueSource<ColumnValueEncoderImpl<BoolType>> for BoolSource<'a> {
+    fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Self {
+            storage: self.storage,
+            indices: self.indices.slice(offset, len),
+        }
+    }
+
+    fn write_to(self, encoder: &mut ColumnValueEncoderImpl<BoolType>) -> Result<()> {
+        let BoolStorage::PackedBits { bytes, bit_offset } = self.storage;
+
+        match self.indices {
+            ValueIndices::Empty => {
+                encoder.write_packed_bool(PackedBoolValues::new(bytes, bit_offset, 0))
+            }
+            ValueIndices::Dense { offset, len } => {
+                encoder.write_packed_bool(PackedBoolValues::new(bytes, bit_offset + offset, len))
+            }
+            ValueIndices::Sparse(indices) => {
+                encoder.write_packed_bool(PackedBoolValues::new_sparse(bytes, bit_offset, indices))
+            }
+        }
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        let per = std::mem::size_of::<bool>().max(1);
+        Some((budget / per).max(1).min(self.indices.len()))
+    }
+}
+
+fn write_bool_column(
+    writer: &mut GenericColumnWriter<ColumnValueEncoderImpl<BoolType>>,
+    column: &dyn arrow_array::Array,
+    levels: ArrayLevelsView<'_>,
+) -> Result<usize> {
+    let selection = levels.value_selection();
+    let array = column.as_boolean();
+    writer.write_batch_internal(
+        BoolSource::new(BoolStorage::from_array(array), value_indices(selection)),
+        levels.def_level_data(),
+        levels.rep_level_data(),
+        None,
+        None,
+        None,
+    )
+}
+
 macro_rules! primitive_float_bridge {
     (
         $native:ty,
@@ -1924,26 +2002,7 @@ fn write_leaf(
             None,
             None,
         ),
-        ColumnWriter::BoolColumnWriter(typed) => {
-            let array = column.as_boolean();
-            let values = match levels.value_selection() {
-                ValueSelection::Dense { offset, len } => {
-                    get_bool_array_slice(array, offset..offset + len)
-                }
-                ValueSelection::Sparse(idx) => get_bool_array_slice(array, idx.iter().copied()),
-                #[cfg(feature = "arrow")]
-                ValueSelection::Empty => Vec::new(),
-            };
-            let len = values.len();
-            typed.write_batch_internal(
-                Selected::new(values.as_slice(), ValueSelection::Dense { offset: 0, len }),
-                levels.def_level_data(),
-                levels.rep_level_data(),
-                None,
-                None,
-                None,
-            )
-        }
+        ColumnWriter::BoolColumnWriter(typed) => write_bool_column(typed, column, levels),
         ColumnWriter::Int64ColumnWriter(typed) => typed.write_batch_internal(
             Int64Source::new(Int64Storage::from_column(column), selection),
             levels.def_level_data(),
@@ -2030,17 +2089,6 @@ fn selection_indices(selection: ValueSelection<'_>) -> Vec<usize> {
         #[cfg(feature = "arrow")]
         ValueSelection::Empty => Vec::new(),
     }
-}
-
-fn get_bool_array_slice(
-    array: &arrow_array::BooleanArray,
-    indices: impl ExactSizeIterator<Item = usize>,
-) -> Vec<bool> {
-    let mut values = Vec::with_capacity(indices.len());
-    for i in indices {
-        values.push(array.value(i))
-    }
-    values
 }
 
 /// Returns 12-byte values representing 3 values of months, days and milliseconds (4-bytes each).
