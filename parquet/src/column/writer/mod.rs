@@ -504,6 +504,29 @@ impl<'a> ValueSelection<'a> {
             Self::Sparse(indices) => indices[idx],
         }
     }
+
+    #[cfg(feature = "arrow")]
+    #[inline]
+    pub(crate) fn try_for_each<E>(
+        self,
+        mut f: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Dense { offset, len } => {
+                for idx in offset..offset + len {
+                    f(idx)?;
+                }
+                Ok(())
+            }
+            Self::Sparse(indices) => {
+                for &idx in indices {
+                    f(idx)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A physical value storage shape paired with the selected logical values to write.

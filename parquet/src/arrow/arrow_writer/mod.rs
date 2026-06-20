@@ -35,7 +35,9 @@ use arrow_schema::{
 use super::schema::{add_encoded_arrow_schema_to_metadata, decimal_length_from_precision};
 
 use crate::arrow::ArrowSchemaConverter;
-use crate::arrow::arrow_writer::byte_array::ByteArrayEncoder;
+use crate::arrow::arrow_writer::byte_array::{
+    ByteArrayEncoder, ByteArraySource, ByteArraySourceStorage,
+};
 use crate::basic::PageType;
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
@@ -1180,21 +1182,11 @@ impl ArrowColumnWriter {
                 write_leaf(c, column, levels)?;
             }
             ArrowColumnWriterImpl::ByteArray(c) => {
-                // The byte-array encoder only implements the gather path. A
-                // sparse selection is already an explicit index slice, so it is
-                // used as-is (no copy); only a dense selection is expanded. This
-                // matches the pre-native behaviour exactly.
-                let dense_indices: Vec<usize>;
-                let selection = match levels.value_selection() {
-                    ValueSelection::Sparse(idx) => ValueSelection::Sparse(idx),
-                    ValueSelection::Empty => ValueSelection::Sparse(&[]),
-                    ValueSelection::Dense { offset, len } => {
-                        dense_indices = (offset..offset + len).collect();
-                        ValueSelection::Sparse(&dense_indices)
-                    }
-                };
                 c.write_batch_internal(
-                    Selected::new(levels.array(), selection),
+                    ByteArraySource::new(
+                        ByteArraySourceStorage::from_array(levels.array()),
+                        levels.value_selection(),
+                    ),
                     levels.def_level_data(),
                     levels.rep_level_data(),
                     None,

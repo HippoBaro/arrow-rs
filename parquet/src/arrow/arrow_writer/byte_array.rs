@@ -20,8 +20,9 @@ use crate::bloom_filter::Sbbf;
 use crate::column::writer::encoder::{
     ColumnValueEncoder, DataPageValues, DictionaryPage, create_bloom_filter,
 };
+use crate::column::writer::{ColumnValueSource, Selected, ValueSelection};
 use crate::data_type::{AsBytes, ByteArray, Int32Type};
-use crate::encodings::encoding::{DeltaBitPackEncoder, Encoder};
+use crate::encodings::encoding::{ChunkSink, DeltaBitPackEncoder, Encoder, ValueStream};
 use crate::encodings::rle::RleEncoder;
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
@@ -30,73 +31,77 @@ use crate::geospatial::statistics::GeospatialStatistics;
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::num_required_bits;
 use crate::util::interner::{Interner, Storage};
-use arrow_array::types::ByteArrayType;
+
+use arrow_array::types::{
+    ArrowDictionaryKeyType, BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, Utf8Type,
+};
 use arrow_array::{
-    Array, ArrayAccessor, BinaryArray, BinaryViewArray, DictionaryArray, FixedSizeBinaryArray,
-    GenericByteArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Array, BinaryArray, BinaryViewArray, DictionaryArray, FixedSizeBinaryArray, GenericByteArray,
+    LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
 };
 use arrow_buffer::{ArrowNativeType, Buffer};
 use arrow_schema::DataType;
 
-macro_rules! downcast_dict_impl {
-    ($array:ident, $key:ident, $val:ident, $op:expr $(, $arg:expr)*) => {{
-        $op($array
-            .as_any()
-            .downcast_ref::<DictionaryArray<arrow_array::types::$key>>()
-            .unwrap()
-            .downcast_dict::<$val>()
-            .unwrap()$(, $arg)*)
-    }};
-}
-
-macro_rules! downcast_dict_op {
-    ($key_type:expr, $val:ident, $array:ident, $op:expr $(, $arg:expr)*) => {
+macro_rules! with_dictionary_key_type {
+    ($key_type:expr, |$key:ident| $body:block, $fallback:expr) => {
         match $key_type.as_ref() {
-            DataType::UInt8 => downcast_dict_impl!($array, UInt8Type, $val, $op$(, $arg)*),
-            DataType::UInt16 => downcast_dict_impl!($array, UInt16Type, $val, $op$(, $arg)*),
-            DataType::UInt32 => downcast_dict_impl!($array, UInt32Type, $val, $op$(, $arg)*),
-            DataType::UInt64 => downcast_dict_impl!($array, UInt64Type, $val, $op$(, $arg)*),
-            DataType::Int8 => downcast_dict_impl!($array, Int8Type, $val, $op$(, $arg)*),
-            DataType::Int16 => downcast_dict_impl!($array, Int16Type, $val, $op$(, $arg)*),
-            DataType::Int32 => downcast_dict_impl!($array, Int32Type, $val, $op$(, $arg)*),
-            DataType::Int64 => downcast_dict_impl!($array, Int64Type, $val, $op$(, $arg)*),
-            _ => unreachable!(),
+            DataType::UInt8 => {
+                type $key = arrow_array::types::UInt8Type;
+                $body
+            }
+            DataType::UInt16 => {
+                type $key = arrow_array::types::UInt16Type;
+                $body
+            }
+            DataType::UInt32 => {
+                type $key = arrow_array::types::UInt32Type;
+                $body
+            }
+            DataType::UInt64 => {
+                type $key = arrow_array::types::UInt64Type;
+                $body
+            }
+            DataType::Int8 => {
+                type $key = arrow_array::types::Int8Type;
+                $body
+            }
+            DataType::Int16 => {
+                type $key = arrow_array::types::Int16Type;
+                $body
+            }
+            DataType::Int32 => {
+                type $key = arrow_array::types::Int32Type;
+                $body
+            }
+            DataType::Int64 => {
+                type $key = arrow_array::types::Int64Type;
+                $body
+            }
+            _ => $fallback,
         }
     };
 }
 
-macro_rules! downcast_op {
-    ($data_type:expr, $array:ident, $op:expr $(, $arg:expr)*) => {
-        match $data_type {
-            DataType::Utf8 => $op($array.as_any().downcast_ref::<StringArray>().unwrap()$(, $arg)*),
-            DataType::LargeUtf8 => {
-                $op($array.as_any().downcast_ref::<LargeStringArray>().unwrap()$(, $arg)*)
+macro_rules! with_generic_byte_dictionary_value_type {
+    ($value_type:expr, |$value:ident| $body:block, $fallback:expr) => {
+        match $value_type.as_ref() {
+            DataType::Utf8 => {
+                type $value = Utf8Type;
+                $body
             }
-            DataType::Utf8View => $op($array.as_any().downcast_ref::<StringViewArray>().unwrap()$(, $arg)*),
+            DataType::LargeUtf8 => {
+                type $value = LargeUtf8Type;
+                $body
+            }
             DataType::Binary => {
-                $op($array.as_any().downcast_ref::<BinaryArray>().unwrap()$(, $arg)*)
+                type $value = BinaryType;
+                $body
             }
             DataType::LargeBinary => {
-                $op($array.as_any().downcast_ref::<LargeBinaryArray>().unwrap()$(, $arg)*)
+                type $value = LargeBinaryType;
+                $body
             }
-            DataType::BinaryView => {
-                $op($array.as_any().downcast_ref::<BinaryViewArray>().unwrap()$(, $arg)*)
-            }
-            DataType::Dictionary(key, value) => match value.as_ref() {
-                DataType::Utf8 => downcast_dict_op!(key, StringArray, $array, $op$(, $arg)*),
-                DataType::LargeUtf8 => {
-                    downcast_dict_op!(key, LargeStringArray, $array, $op$(, $arg)*)
-                }
-                DataType::Binary => downcast_dict_op!(key, BinaryArray, $array, $op$(, $arg)*),
-                DataType::LargeBinary => {
-                    downcast_dict_op!(key, LargeBinaryArray, $array, $op$(, $arg)*)
-                }
-                DataType::FixedSizeBinary(_) => {
-                    downcast_dict_op!(key, FixedSizeBinaryArray, $array, $op$(, $arg)*)
-                }
-                d => unreachable!("cannot downcast {} dictionary value to byte array", d),
-            },
-            d => unreachable!("cannot downcast {} to byte array", d),
+            _ => $fallback,
         }
     };
 }
@@ -166,27 +171,23 @@ impl FallbackEncoder {
         })
     }
 
-    /// Encode `values` to the in-progress page
-    fn encode<T>(&mut self, values: T, indices: impl ExactSizeIterator<Item = usize>)
-    where
-        T: ArrayAccessor + Copy,
-        T::Item: AsRef<[u8]>,
-    {
-        self.num_values += indices.len();
+    /// Encode one tile of values, matching the concrete encoder once for the
+    /// whole tile and reserving the PLAIN buffer before appending.
+    #[inline(never)]
+    fn encode_values(&mut self, values: &[&[u8]]) {
+        self.num_values += values.len();
         match &mut self.encoder {
             FallbackEncoderImpl::Plain { buffer } => {
-                for idx in indices {
-                    let value = values.value(idx);
-                    let value = value.as_ref();
+                let total: usize = values.iter().map(|v| v.len()).sum();
+                buffer.reserve(total.saturating_add(values.len().saturating_mul(4)));
+                for &value in values {
                     buffer.extend_from_slice((value.len() as u32).as_bytes());
                     buffer.extend_from_slice(value);
                     self.variable_length_bytes += value.len() as i64;
                 }
             }
             FallbackEncoderImpl::DeltaLength { buffer, lengths } => {
-                for idx in indices {
-                    let value = values.value(idx);
-                    let value = value.as_ref();
+                for &value in values {
                     lengths.put(&[value.len() as i32]).unwrap();
                     buffer.extend_from_slice(value);
                     self.variable_length_bytes += value.len() as i64;
@@ -198,9 +199,7 @@ impl FallbackEncoder {
                 prefix_lengths,
                 suffix_lengths,
             } => {
-                for idx in indices {
-                    let value = values.value(idx);
-                    let value = value.as_ref();
+                for &value in values {
                     let mut prefix_length = 0;
 
                     while prefix_length < last_value.len()
@@ -344,19 +343,24 @@ struct DictEncoder {
 }
 
 impl DictEncoder {
-    /// Encode `values` to the in-progress page
-    fn encode<T>(&mut self, values: T, indices: impl ExactSizeIterator<Item = usize>)
-    where
-        T: ArrayAccessor + Copy,
-        T::Item: AsRef<[u8]>,
-    {
-        self.indices.reserve(indices.len());
+    fn reserve(&mut self, len: usize) {
+        self.indices.reserve(len);
+    }
 
-        for idx in indices {
-            let value = values.value(idx);
-            let interned = self.interner.intern(value.as_ref());
-            self.indices.push(interned);
-            self.variable_length_bytes += value.as_ref().len() as i64;
+    #[inline]
+    fn encode_value(&mut self, value: &[u8]) {
+        let interned = self.interner.intern(value);
+        self.indices.push(interned);
+        self.variable_length_bytes += value.len() as i64;
+    }
+
+    /// Intern one tile of values, keeping the hashing loop out of the caller's
+    /// chunk-dispatch path.
+    #[inline(never)]
+    fn encode_values(&mut self, values: &[&[u8]]) {
+        self.indices.reserve(values.len());
+        for &value in values {
+            self.encode_value(value);
         }
     }
 
@@ -420,6 +424,115 @@ impl DictEncoder {
     }
 }
 
+/// A [`ValueStream`] of `&[u8]` over the selected values of an offset-based byte
+/// array (`Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`).
+///
+/// Dense selections walk adjacent offset pairs with `windows(2)`. Variable
+/// length values have no contiguous `&[&[u8]]` backing slice, so this stream
+/// always yields gathered tiles.
+struct OffsetByteValues<'a, T: ByteArrayType> {
+    offsets: &'a [T::Offset],
+    data: &'a [u8],
+    selection: ValueSelection<'a>,
+}
+
+impl<'a, T: ByteArrayType> Clone for OffsetByteValues<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, T: ByteArrayType> Copy for OffsetByteValues<'a, T> {}
+
+impl<'a, T: ByteArrayType> OffsetByteValues<'a, T> {
+    #[inline]
+    fn new(values: &'a GenericByteArray<T>, selection: ValueSelection<'a>) -> Self {
+        Self {
+            offsets: values.value_offsets(),
+            data: values.value_data(),
+            selection,
+        }
+    }
+}
+
+impl<'a, T: ByteArrayType> ValueStream<'a, &'a [u8]> for OffsetByteValues<'a, T> {
+    // Variable-length values have no contiguous `&[&[u8]]` backing slice.
+    type Bulk = [&'a [u8]];
+
+    #[inline]
+    fn len(self) -> usize {
+        self.selection.len()
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [&'a [u8]]> {
+        None
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(&'a [u8]) -> Result<(), E>) -> Result<(), E> {
+        match self.selection {
+            ValueSelection::Empty => Ok(()),
+            ValueSelection::Dense { offset, len } => {
+                let data = self.data;
+                for w in self.offsets[offset..offset + len + 1].windows(2) {
+                    f(&data[w[0].as_usize()..w[1].as_usize()])?;
+                }
+                Ok(())
+            }
+            ValueSelection::Sparse(indices) => {
+                for &idx in indices {
+                    f(dense_byte_value::<T>(self.offsets, self.data, idx))?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A [`ValueStream`] of `&[u8]` whose values are produced by a per-index closure
+/// `get` — used for the layouts with O(1) value access (`Utf8View`/`BinaryView`,
+/// `FixedSizeBinary`) and for dictionary-keyed byte arrays, where each row maps
+/// through the keys to a dictionary value (or to `&[]` for a null key/value).
+#[derive(Clone, Copy)]
+struct MappedByteValues<'a, F> {
+    selection: ValueSelection<'a>,
+    get: F,
+}
+
+impl<'a, F> MappedByteValues<'a, F>
+where
+    F: Fn(usize) -> &'a [u8] + Copy,
+{
+    #[inline]
+    fn new(selection: ValueSelection<'a>, get: F) -> Self {
+        Self { selection, get }
+    }
+}
+
+impl<'a, F> ValueStream<'a, &'a [u8]> for MappedByteValues<'a, F>
+where
+    F: Fn(usize) -> &'a [u8] + Copy + 'a,
+{
+    // Per-index gathers have no contiguous run to hand over.
+    type Bulk = [&'a [u8]];
+
+    #[inline]
+    fn len(self) -> usize {
+        self.selection.len()
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [&'a [u8]]> {
+        None
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(&'a [u8]) -> Result<(), E>) -> Result<(), E> {
+        self.selection.try_for_each(|idx| f((self.get)(idx)))
+    }
+}
+
 pub struct ByteArrayEncoder {
     fallback: FallbackEncoder,
     dict_encoder: Option<DictEncoder>,
@@ -431,66 +544,112 @@ pub struct ByteArrayEncoder {
     geo_stats_accumulator: Option<Box<dyn GeoStatsAccumulator>>,
 }
 
-impl ColumnValueEncoder for ByteArrayEncoder {
-    type T = ByteArray;
-    type Values = dyn Array;
-    fn flush_bloom_filter(&mut self) -> Option<Sbbf> {
-        let mut sbbf = self.bloom_filter.take()?;
-        sbbf.fold_to_target_fpp(self.bloom_filter_target_fpp);
-        Some(sbbf)
-    }
+/// Where a [`ByteSink`] sends each encoded tile: interned into the dictionary, or
+/// bulk-encoded through the fallback encoder. Both `encode_values` are infallible.
+enum ByteSinkTarget<'e> {
+    Dict(&'e mut DictEncoder),
+    Fallback(&'e mut FallbackEncoder),
+}
 
-    fn try_new(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let dictionary = props
-            .dictionary_enabled(descr.path())
-            .then(DictEncoder::default);
+/// Consumes byte-array tiles: fold page stats, update the bloom filter, then
+/// encode through either the dictionary or fallback encoder.
+///
+/// Plain min/max keep borrowed values during the walk and copy only when the
+/// page-level extremum changes.
+struct ByteSink<'a, 'e> {
+    collect_stats: bool,
+    min: Option<&'a [u8]>,
+    max: Option<&'a [u8]>,
+    accumulator: Option<&'e mut Box<dyn GeoStatsAccumulator>>,
+    bloom: Option<&'e mut Sbbf>,
+    target: ByteSinkTarget<'e>,
+}
 
-        let fallback = FallbackEncoder::new(descr, props)?;
-
-        let (bloom_filter, bloom_filter_target_fpp) = create_bloom_filter(props, descr)?;
-
-        let statistics_enabled = props.statistics_enabled(descr.path());
-
-        let geo_stats_accumulator = try_new_geo_stats_accumulator(descr);
-
-        Ok(Self {
-            fallback,
-            statistics_enabled,
-            bloom_filter,
-            bloom_filter_target_fpp,
-            dict_encoder: dictionary,
-            min_value: None,
-            max_value: None,
-            geo_stats_accumulator,
-        })
-    }
-
-    fn write(&mut self, _values: &Self::Values, _offset: usize, _len: usize) -> Result<()> {
-        unreachable!("should call write_gather instead")
-    }
-
-    fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()> {
-        downcast_op!(
-            values.data_type(),
-            values,
-            encode,
-            indices.iter().copied(),
-            self
-        );
+impl<'a> ChunkSink<[&'a [u8]]> for ByteSink<'a, '_> {
+    #[inline]
+    fn consume(&mut self, chunk: &[&'a [u8]]) -> Result<()> {
+        if self.collect_stats {
+            if let Some(accumulator) = self.accumulator.as_deref_mut() {
+                for &v in chunk {
+                    if accumulator.is_valid() {
+                        accumulator.update_wkb(v);
+                    }
+                }
+            } else {
+                for &v in chunk {
+                    if self.min.is_none_or(|current| current > v) {
+                        self.min = Some(v);
+                    }
+                    if self.max.is_none_or(|current| current < v) {
+                        self.max = Some(v);
+                    }
+                }
+            }
+        }
+        // Insert the written values into the bloom filter.
+        if let Some(bloom) = self.bloom.as_deref_mut() {
+            for &v in chunk {
+                bloom.insert(v);
+            }
+        }
+        match &mut self.target {
+            ByteSinkTarget::Dict(dict_encoder) => dict_encoder.encode_values(chunk),
+            ByteSinkTarget::Fallback(fallback) => fallback.encode_values(chunk),
+        }
         Ok(())
     }
+}
 
-    fn count_values_within_byte_budget_gather(
-        values: &Self::Values,
+impl ByteArrayEncoder {
+    /// Encode an already-selected byte-value stream, folding page min/max and
+    /// bloom-filter state in the same pass.
+    fn write_byte_values<'a>(&mut self, values: impl ValueStream<'a, &'a [u8], Bulk = [&'a [u8]]>) {
+        let len = values.len();
+        let collect_stats = self.statistics_enabled != EnabledStatistics::None;
+
+        // `ByteSink` encodes infallibly; the shared `ChunkSink` API is fallible
+        // for other sinks.
+        let (min, max) = {
+            let target = match &mut self.dict_encoder {
+                Some(dict_encoder) => {
+                    dict_encoder.reserve(len);
+                    ByteSinkTarget::Dict(dict_encoder)
+                }
+                None => ByteSinkTarget::Fallback(&mut self.fallback),
+            };
+            let mut sink = ByteSink {
+                collect_stats,
+                min: None,
+                max: None,
+                accumulator: self.geo_stats_accumulator.as_mut(),
+                bloom: self.bloom_filter.as_mut(),
+                target,
+            };
+            values
+                .write_into(&mut sink)
+                .expect("byte-array encode is infallible");
+            (sink.min, sink.max)
+        };
+
+        if let Some(min) = min {
+            let min = ByteArray::from(min.to_vec());
+            if self.min_value.as_ref().is_none_or(|m| m > &min) {
+                self.min_value = Some(min);
+            }
+        }
+        if let Some(max) = max {
+            let max = ByteArray::from(max.to_vec());
+            if self.max_value.as_ref().is_none_or(|m| m < &max) {
+                self.max_value = Some(max);
+            }
+        }
+    }
+
+    fn count_sparse_within_byte_budget(
+        values: &dyn Array,
         indices: &[usize],
         byte_budget: usize,
     ) -> Option<usize> {
-        // `ByteArrayEncoder` only ever writes via `write_gather`, so this
-        // is the relevant method.
-        //
         // Two-stage walk for the simple offset-buffer byte array types:
         //   1. If indices are contiguous, compute the total payload in
         //      O(1) via a single subtraction on the offsets buffer.
@@ -549,16 +708,58 @@ impl ColumnValueEncoder for ByteArrayEncoder {
             // chunk as fitting and stay on the batched path. (A per-value
             // walk through dict keys on every chunk also measured ~+30-80%
             // slower than `main`.)
-            DataType::Dictionary(_, _) => indices.len(),
-            // Every byte-array type `ByteArrayEncoder` is constructed for
-            // has an explicit arm above. A `Dictionary(value = FixedSizeBinary)`
-            // column hits the `Dictionary(_, _)` arm (its `values.data_type()`
-            // is `Dictionary`), and a bare `FixedSizeBinary` column is routed
-            // to the generic column writer, never this encoder — so no other
-            // type can reach here.
+            DataType::Dictionary(_, _) | DataType::FixedSizeBinary(_) => indices.len(),
+            // Every other byte-array type `ByteArrayEncoder` is constructed for
+            // has an explicit arm above, so nothing else can reach here.
             data_type => unreachable!("ByteArrayEncoder cannot be constructed for {data_type:?}"),
         };
         Some(count)
+    }
+}
+
+impl ColumnValueEncoder for ByteArrayEncoder {
+    type T = ByteArray;
+    type Values = dyn Array;
+    fn flush_bloom_filter(&mut self) -> Option<Sbbf> {
+        let mut sbbf = self.bloom_filter.take()?;
+        sbbf.fold_to_target_fpp(self.bloom_filter_target_fpp);
+        Some(sbbf)
+    }
+
+    fn try_new(descr: &ColumnDescPtr, props: &WriterProperties) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let dictionary = props
+            .dictionary_enabled(descr.path())
+            .then(DictEncoder::default);
+
+        let fallback = FallbackEncoder::new(descr, props)?;
+
+        let (bloom_filter, bloom_filter_target_fpp) = create_bloom_filter(props, descr)?;
+
+        let statistics_enabled = props.statistics_enabled(descr.path());
+
+        let geo_stats_accumulator = try_new_geo_stats_accumulator(descr);
+
+        Ok(Self {
+            fallback,
+            statistics_enabled,
+            bloom_filter,
+            bloom_filter_target_fpp,
+            dict_encoder: dictionary,
+            min_value: None,
+            max_value: None,
+            geo_stats_accumulator,
+        })
+    }
+
+    fn write(&mut self, _values: &Self::Values, _offset: usize, _len: usize) -> Result<()> {
+        unreachable!("should call write_to instead")
+    }
+
+    fn write_gather(&mut self, _values: &Self::Values, _indices: &[usize]) -> Result<()> {
+        unreachable!("should call write_to instead")
     }
 
     fn num_values(&self) -> usize {
@@ -637,40 +838,332 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     }
 }
 
-/// Encodes the provided `values` and `indices` to `encoder`
-///
-/// This is a free function so it can be used with `downcast_op!`
-fn encode<T, I>(values: T, indices: I, encoder: &mut ByteArrayEncoder)
+pub(crate) type ByteArraySource<'a> = Selected<'a, ByteArraySourceStorage<'a>>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ByteArraySourceStorage<'a> {
+    values: &'a (dyn Array + 'static),
+}
+
+impl<'a> ByteArraySourceStorage<'a> {
+    pub(crate) fn from_array(values: &'a (dyn Array + 'static)) -> Self {
+        Self { values }
+    }
+}
+
+impl<'a> ColumnValueSource<ByteArrayEncoder> for Selected<'a, ByteArraySourceStorage<'a>> {
+    fn len(self) -> usize {
+        Selected::len(self)
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Selected::slice(self, offset, len)
+    }
+
+    fn write_to(self, encoder: &mut ByteArrayEncoder) -> Result<()> {
+        let values = self.storage().values;
+        let selection = self.selection();
+
+        match selection {
+            ValueSelection::Empty => Ok(()),
+            // Dense and sparse both flow through the one chunked path. The
+            // offset-array source specializes the dense walk (`windows(2)`)
+            // internally, so there is no separate dense encode path.
+            ValueSelection::Dense { .. } | ValueSelection::Sparse(_) => {
+                write_selection(values, selection, encoder)
+            }
+        }
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        let values = self.storage().values;
+        match self.selection() {
+            ValueSelection::Empty => None,
+            // Mirror the dense/sparse split in `write_to` so the byte-budget
+            // estimate matches the bytes actually written.
+            ValueSelection::Dense { offset, len } => {
+                Some(count_dense_within_byte_budget(values, offset, len, budget))
+            }
+            ValueSelection::Sparse(indices) => {
+                ByteArrayEncoder::count_sparse_within_byte_budget(values, indices, budget)
+            }
+        }
+    }
+}
+
+fn dense_byte_value<'a, T>(offsets: &[T::Offset], data: &'a [u8], idx: usize) -> &'a [u8]
 where
-    T: ArrayAccessor + Copy,
-    T::Item: Copy + Ord + AsRef<[u8]>,
-    I: ExactSizeIterator<Item = usize> + Clone,
+    T: ByteArrayType,
 {
-    if encoder.statistics_enabled != EnabledStatistics::None {
-        if let Some(accumulator) = encoder.geo_stats_accumulator.as_mut() {
-            update_geo_stats_accumulator(accumulator.as_mut(), values, indices.clone());
-        } else if let Some((min, max)) = compute_min_max(values, indices.clone()) {
-            if encoder.min_value.as_ref().is_none_or(|m| m > &min) {
-                encoder.min_value = Some(min);
+    let start = offsets[idx].as_usize();
+    let end = offsets[idx + 1].as_usize();
+    &data[start..end]
+}
+
+fn downcast_dictionary<K>(values: &dyn Array) -> Result<&DictionaryArray<K>>
+where
+    K: ArrowDictionaryKeyType,
+{
+    values
+        .as_any()
+        .downcast_ref::<DictionaryArray<K>>()
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Cannot downcast {} to dictionary",
+                values.data_type()
+            ))
+        })
+}
+
+/// Dispatch a selected write to the typed byte-array source for `values`' layout
+/// and hand it to [`ByteArrayEncoder::write_byte_values`]. Offset arrays build an
+/// [`OffsetByteValues`] (dense walks `windows(2)`); the O(1)-access layouts and
+/// dictionaries build a [`MappedByteValues`] over a per-index closure.
+fn write_selection(
+    values: &dyn Array,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()> {
+    match values.data_type() {
+        DataType::Utf8 => write_generic_byte_indices(
+            values.as_any().downcast_ref::<StringArray>().unwrap(),
+            selection,
+            encoder,
+        ),
+        DataType::LargeUtf8 => write_generic_byte_indices(
+            values.as_any().downcast_ref::<LargeStringArray>().unwrap(),
+            selection,
+            encoder,
+        ),
+        DataType::Binary => write_generic_byte_indices(
+            values.as_any().downcast_ref::<BinaryArray>().unwrap(),
+            selection,
+            encoder,
+        ),
+        DataType::LargeBinary => write_generic_byte_indices(
+            values.as_any().downcast_ref::<LargeBinaryArray>().unwrap(),
+            selection,
+            encoder,
+        ),
+        DataType::Utf8View => write_string_view_indices(
+            values.as_any().downcast_ref::<StringViewArray>().unwrap(),
+            selection,
+            encoder,
+        ),
+        DataType::BinaryView => write_binary_view_indices(
+            values.as_any().downcast_ref::<BinaryViewArray>().unwrap(),
+            selection,
+            encoder,
+        ),
+        DataType::FixedSizeBinary(_) => write_fixed_size_binary_indices(
+            values
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap(),
+            selection,
+            encoder,
+        ),
+        DataType::Dictionary(key, value) => match value.as_ref() {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                with_generic_byte_dictionary_value_type!(
+                    value,
+                    |T| {
+                        with_dictionary_key_type!(
+                            key,
+                            |K| {
+                                write_generic_byte_dictionary_indices::<K, T>(
+                                    values, selection, encoder,
+                                )
+                            },
+                            unreachable!()
+                        )
+                    },
+                    unreachable!()
+                )
             }
+            DataType::Utf8View => with_dictionary_key_type!(
+                key,
+                |K| { write_string_view_dictionary_indices::<K>(values, selection, encoder) },
+                unreachable!()
+            ),
+            DataType::BinaryView => with_dictionary_key_type!(
+                key,
+                |K| { write_binary_view_dictionary_indices::<K>(values, selection, encoder) },
+                unreachable!()
+            ),
+            DataType::FixedSizeBinary(_) => with_dictionary_key_type!(
+                key,
+                |K| { write_fixed_size_binary_dictionary_indices::<K>(values, selection, encoder) },
+                unreachable!()
+            ),
+            d => unreachable!("cannot downcast {d} dictionary value to byte array"),
+        },
+        d => unreachable!("cannot downcast {d} to byte array"),
+    }
+}
 
-            if encoder.max_value.as_ref().is_none_or(|m| m < &max) {
-                encoder.max_value = Some(max);
-            }
+fn write_generic_byte_indices<T>(
+    values: &GenericByteArray<T>,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()>
+where
+    T: ByteArrayType,
+{
+    encoder.write_byte_values(OffsetByteValues::<T>::new(values, selection));
+    Ok(())
+}
+
+fn write_string_view_indices(
+    values: &StringViewArray,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()> {
+    encoder.write_byte_values(MappedByteValues::new(selection, move |idx| {
+        values.value(idx).as_bytes()
+    }));
+    Ok(())
+}
+
+fn write_binary_view_indices(
+    values: &BinaryViewArray,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()> {
+    encoder.write_byte_values(MappedByteValues::new(selection, move |idx| {
+        values.value(idx)
+    }));
+    Ok(())
+}
+
+fn write_fixed_size_binary_indices(
+    values: &FixedSizeBinaryArray,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()> {
+    encoder.write_byte_values(MappedByteValues::new(selection, move |idx| {
+        values.value(idx)
+    }));
+    Ok(())
+}
+
+fn write_generic_byte_dictionary_indices<K, T>(
+    dictionary: &dyn Array,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()>
+where
+    K: ArrowDictionaryKeyType,
+    T: ByteArrayType,
+{
+    let dictionary = downcast_dictionary::<K>(dictionary)?;
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<GenericByteArray<T>>()
+        .unwrap();
+    let keys = dictionary.keys();
+    let offsets = values.value_offsets();
+    let data = values.value_data();
+    encoder.write_byte_values(MappedByteValues::new(selection, move |row| -> &[u8] {
+        if keys.is_null(row) {
+            return &[];
         }
-    }
-
-    // encode the values into bloom filter if enabled
-    if let Some(bloom_filter) = &mut encoder.bloom_filter {
-        for idx in indices.clone() {
-            bloom_filter.insert(values.value(idx).as_ref());
+        let key = keys.value(row).as_usize();
+        if values.is_null(key) {
+            &[]
+        } else {
+            dense_byte_value::<T>(offsets, data, key)
         }
-    }
+    }));
+    Ok(())
+}
 
-    match &mut encoder.dict_encoder {
-        Some(dict_encoder) => dict_encoder.encode(values, indices),
-        None => encoder.fallback.encode(values, indices),
-    }
+fn write_fixed_size_binary_dictionary_indices<K>(
+    dictionary: &dyn Array,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()>
+where
+    K: ArrowDictionaryKeyType,
+{
+    let dictionary = downcast_dictionary::<K>(dictionary)?;
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    let keys = dictionary.keys();
+    encoder.write_byte_values(MappedByteValues::new(selection, move |row| -> &[u8] {
+        if keys.is_null(row) {
+            return &[];
+        }
+        let key = keys.value(row).as_usize();
+        if values.is_null(key) {
+            &[]
+        } else {
+            values.value(key)
+        }
+    }));
+    Ok(())
+}
+
+fn write_string_view_dictionary_indices<K>(
+    dictionary: &dyn Array,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()>
+where
+    K: ArrowDictionaryKeyType,
+{
+    let dictionary = downcast_dictionary::<K>(dictionary)?;
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .unwrap();
+    let keys = dictionary.keys();
+    encoder.write_byte_values(MappedByteValues::new(selection, move |row| -> &[u8] {
+        if keys.is_null(row) {
+            return &[];
+        }
+        let key = keys.value(row).as_usize();
+        if values.is_null(key) {
+            &[]
+        } else {
+            values.value(key).as_bytes()
+        }
+    }));
+    Ok(())
+}
+
+fn write_binary_view_dictionary_indices<K>(
+    dictionary: &dyn Array,
+    selection: ValueSelection<'_>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<()>
+where
+    K: ArrowDictionaryKeyType,
+{
+    let dictionary = downcast_dictionary::<K>(dictionary)?;
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryViewArray>()
+        .unwrap();
+    let keys = dictionary.keys();
+    encoder.write_byte_values(MappedByteValues::new(selection, move |row| -> &[u8] {
+        if keys.is_null(row) {
+            return &[];
+        }
+        let key = keys.value(row).as_usize();
+        if values.is_null(key) {
+            &[]
+        } else {
+            values.value(key)
+        }
+    }));
+    Ok(())
 }
 
 /// Upper bound on any single value's byte length in a view array.
@@ -772,43 +1265,119 @@ fn count_within_budget_offsets<T: ByteArrayType>(
     n
 }
 
-/// Computes the min and max for the provided array and indices
+/// Number of leading values in the dense range `[offset, offset + len)` whose
+/// cumulative plain-encoded size fits `byte_budget` (boundary value included).
 ///
-/// This is a free function so it can be used with `downcast_op!`
-fn compute_min_max<T>(
-    array: T,
-    mut valid: impl Iterator<Item = usize>,
-) -> Option<(ByteArray, ByteArray)>
-where
-    T: ArrayAccessor,
-    T::Item: Copy + Ord + AsRef<[u8]>,
-{
-    let first_idx = valid.next()?;
-
-    let first_val = array.value(first_idx);
-    let mut min = first_val;
-    let mut max = first_val;
-    for idx in valid {
-        let val = array.value(idx);
-        min = min.min(val);
-        max = max.max(val);
+/// Dense counterpart of the sparse dispatch in
+/// [`ByteArrayEncoder::count_sparse_within_byte_budget`], used for the
+/// contiguous, all-valid selection produced for non-nullable byte columns.
+fn count_dense_within_byte_budget(
+    values: &dyn Array,
+    offset: usize,
+    len: usize,
+    byte_budget: usize,
+) -> usize {
+    match values.data_type() {
+        DataType::Utf8 => count_within_budget_offsets_dense(
+            values.as_any().downcast_ref::<StringArray>().unwrap(),
+            offset,
+            len,
+            byte_budget,
+        ),
+        DataType::LargeUtf8 => count_within_budget_offsets_dense(
+            values.as_any().downcast_ref::<LargeStringArray>().unwrap(),
+            offset,
+            len,
+            byte_budget,
+        ),
+        DataType::Binary => count_within_budget_offsets_dense(
+            values.as_any().downcast_ref::<BinaryArray>().unwrap(),
+            offset,
+            len,
+            byte_budget,
+        ),
+        DataType::LargeBinary => count_within_budget_offsets_dense(
+            values.as_any().downcast_ref::<LargeBinaryArray>().unwrap(),
+            offset,
+            len,
+            byte_budget,
+        ),
+        DataType::Utf8View => {
+            let array = values.as_any().downcast_ref::<StringViewArray>().unwrap();
+            count_within_budget_views_dense(
+                array.views(),
+                offset,
+                len,
+                byte_budget,
+                max_view_value_len(array.data_buffers()),
+            )
+        }
+        DataType::BinaryView => {
+            let array = values.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+            count_within_budget_views_dense(
+                array.views(),
+                offset,
+                len,
+                byte_budget,
+                max_view_value_len(array.data_buffers()),
+            )
+        }
+        // Dictionary values are already small and deduplicated, so there is
+        // nothing to bound — treat every chunk as fitting.
+        DataType::Dictionary(_, _) | DataType::FixedSizeBinary(_) => len,
+        data_type => unreachable!("ByteArrayEncoder cannot be constructed for {data_type:?}"),
     }
-    Some((min.as_ref().to_vec().into(), max.as_ref().to_vec().into()))
 }
 
-/// Updates geospatial statistics for the provided array and indices
-fn update_geo_stats_accumulator<T>(
-    bounder: &mut dyn GeoStatsAccumulator,
-    array: T,
-    valid: impl Iterator<Item = usize>,
-) where
-    T: ArrayAccessor,
-    T::Item: Copy + Ord + AsRef<[u8]>,
-{
-    if bounder.is_valid() {
-        for idx in valid {
-            let val = array.value(idx);
-            bounder.update_wkb(val.as_ref());
+/// Dense-range counterpart of [`count_within_budget_offsets`].
+fn count_within_budget_offsets_dense<T: ByteArrayType>(
+    values: &GenericByteArray<T>,
+    offset: usize,
+    len: usize,
+    byte_budget: usize,
+) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let offsets = values.value_offsets();
+    let prefix_overhead = std::mem::size_of::<u32>();
+    // Stage 1: O(1) span over the contiguous range.
+    let payload = (offsets[offset + len] - offsets[offset]).as_usize();
+    if payload + len * prefix_overhead <= byte_budget {
+        return len;
+    }
+    // Stage 2: per-value scan.
+    let mut cum: usize = 0;
+    for i in 0..len {
+        let value_len =
+            (offsets[offset + i + 1] - offsets[offset + i]).as_usize() + prefix_overhead;
+        cum = cum.saturating_add(value_len);
+        if cum > byte_budget {
+            return i + 1;
         }
     }
+    len
+}
+
+/// Dense-range counterpart of [`count_within_budget_views`].
+fn count_within_budget_views_dense(
+    views: &[u128],
+    offset: usize,
+    len: usize,
+    byte_budget: usize,
+    max_value_len: usize,
+) -> usize {
+    let per_value = max_value_len + std::mem::size_of::<u32>();
+    if len.saturating_mul(per_value) <= byte_budget {
+        return len;
+    }
+    let mut cum: usize = 0;
+    for i in 0..len {
+        let value_len = (views[offset + i] as u32) as usize;
+        cum = cum.saturating_add(value_len + std::mem::size_of::<u32>());
+        if cum > byte_budget {
+            return i + 1;
+        }
+    }
+    len
 }
