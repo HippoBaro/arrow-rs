@@ -29,7 +29,14 @@ use crate::data_type::{
     BoolType, ByteArrayType, DataType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type,
     Int64Type, Int96Type,
 };
-use crate::encodings::encoding::{DictEncoder, Encoder, EncoderFactory};
+#[cfg(feature = "arrow")]
+use crate::encodings::encoding::{
+    ChunkSink, DoubleValues, FloatValues, Int32Values, Int64Values, ValueStream,
+};
+use crate::encodings::encoding::{
+    DictEncoder, DoubleEncoderObject, Encoder, EncoderFactory, FloatEncoderObject,
+    Int32EncoderObject, Int64EncoderObject,
+};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
@@ -226,16 +233,16 @@ macro_rules! make_encoder_type {
 }
 
 make_encoder_type!(BoolType, BoolColumnWriter, dyn Encoder<Self>);
-make_encoder_type!(Int32Type, Int32ColumnWriter, dyn Encoder<Self>);
-make_encoder_type!(Int64Type, Int64ColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(Int32Type, Int32ColumnWriter, Int32EncoderObject);
+make_encoder_type!(Int64Type, Int64ColumnWriter, Int64EncoderObject);
 make_encoder_type!(
     FixedLenByteArrayType,
     FixedLenByteArrayColumnWriter,
     dyn Encoder<Self>
 );
 make_encoder_type!(Int96Type, Int96ColumnWriter, dyn Encoder<Self>);
-make_encoder_type!(FloatType, FloatColumnWriter, dyn Encoder<Self>);
-make_encoder_type!(DoubleType, DoubleColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(FloatType, FloatColumnWriter, FloatEncoderObject);
+make_encoder_type!(DoubleType, DoubleColumnWriter, DoubleEncoderObject);
 make_encoder_type!(ByteArrayType, ByteArrayColumnWriter, dyn Encoder<Self>);
 
 pub struct ColumnValueEncoderImpl<
@@ -292,6 +299,140 @@ impl<T: ColumnEncoderType, E: Encoder<T> + ?Sized> ColumnValueEncoderImpl<T, E> 
             _ => self.encoder.put(slice),
         }
     }
+}
+
+/// Shared chunked walk for numeric encoders. Dictionary adoption is handled by
+/// the native entry points before they fall back to this intern/PLAIN path.
+#[cfg(feature = "arrow")]
+#[allow(private_bounds)]
+impl<T, E> ColumnValueEncoderImpl<T, E>
+where
+    T: ColumnEncoderType,
+    E: Encoder<T> + ?Sized,
+    T::T: StatFold,
+{
+    #[inline]
+    pub(crate) fn fold_value_stream<'a, S: ValueStream<'a, T::T, Bulk = [T::T]>>(
+        &mut self,
+        values: S,
+    ) -> Result<()>
+    where
+        T::T: 'a,
+    {
+        let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+            && self.descr.converted_type() != ConvertedType::INTERVAL;
+        let ctx = <T::T as StatFold>::ctx(&self.descr);
+        self.num_values += values.len();
+
+        // Drive the selected values into a sink that folds stats and bloom
+        // state before encoding each chunk.
+        let (min, max) = {
+            let target = match self.dict_encoder.as_mut() {
+                Some(dict) => NumericSinkTarget::Dict(dict),
+                None => NumericSinkTarget::Plain(&mut *self.encoder),
+            };
+            let mut sink = NumericSink {
+                should_update_stats,
+                ctx,
+                min: None,
+                max: None,
+                bloom: self.bloom_filter.as_mut(),
+                target,
+            };
+            values.write_into(&mut sink)?;
+            (sink.min, sink.max)
+        };
+
+        if let Some(min) = min {
+            update_min_normalized(&self.descr, &min, &mut self.min_value);
+        }
+        if let Some(max) = max {
+            update_max_normalized(&self.descr, &max, &mut self.max_value);
+        }
+        Ok(())
+    }
+}
+
+/// Where a [`NumericSink`] sends each encoded chunk: interned into the column's
+/// dictionary, or bulk-`put` into the fallback encoder.
+#[cfg(feature = "arrow")]
+enum NumericSinkTarget<'a, T: DataType, E: ?Sized> {
+    Dict(&'a mut DictEncoder<T>),
+    Plain(&'a mut E),
+}
+
+/// Consumes numeric chunks: fold min/max, update the bloom filter, then encode.
+#[cfg(feature = "arrow")]
+struct NumericSink<'a, T: DataType, E: ?Sized>
+where
+    T::T: StatFold,
+{
+    should_update_stats: bool,
+    ctx: <T::T as StatFold>::Ctx,
+    min: Option<T::T>,
+    max: Option<T::T>,
+    bloom: Option<&'a mut Sbbf>,
+    target: NumericSinkTarget<'a, T, E>,
+}
+
+#[cfg(feature = "arrow")]
+impl<T: DataType, E: Encoder<T> + ?Sized> ChunkSink<[T::T]> for NumericSink<'_, T, E>
+where
+    T::T: StatFold,
+{
+    // Deliberately out-of-line. `ValueStream::write_into`'s gather path runs a
+    // per-value closure that fills an N=64 tile and calls `consume` only when the
+    // tile is full. Inlining `consume` (stats fold + bloom + dict/plain `put`)
+    // into that closure bloats it past the inliner's threshold, so the closure is
+    // emitted out-of-line and *called per value* — spilling the tile cursor/buffer
+    // to its captured environment every value. Cutting the inline here keeps the
+    // closure tiny so it folds into the gather loop (cursor in registers, no
+    // per-value call); `consume` then runs once per tile, amortized over 64 values.
+    #[inline(never)]
+    fn consume(&mut self, chunk: &[T::T]) -> Result<()> {
+        if self.should_update_stats {
+            for &value in chunk {
+                <T::T as StatFold>::observe(self.ctx, value, &mut self.min, &mut self.max);
+            }
+        }
+        if let Some(bloom) = self.bloom.as_deref_mut() {
+            for &value in chunk {
+                bloom.insert(&value);
+            }
+        }
+        match &mut self.target {
+            NumericSinkTarget::Dict(dict) => dict.put(chunk),
+            NumericSinkTarget::Plain(encoder) => encoder.put(chunk),
+        }
+    }
+}
+
+/// Generates `ColumnValueEncoderImpl::write_{int32,int64,float,double}_values`.
+/// The value stream handles selection and casts; [`StatFold`] handles min/max
+/// comparison.
+macro_rules! numeric_values_method {
+    ($fn:ident, $values_ty:ty) => {
+        #[cfg(feature = "arrow")]
+        pub(crate) fn $fn(&mut self, values: $values_ty) -> Result<()> {
+            self.fold_value_stream(values)
+        }
+    };
+}
+
+impl ColumnValueEncoderImpl<Int32Type, Int32EncoderObject> {
+    numeric_values_method!(write_int32_values, Int32Values<'_>);
+}
+
+impl ColumnValueEncoderImpl<Int64Type, Int64EncoderObject> {
+    numeric_values_method!(write_int64_values, Int64Values<'_>);
+}
+
+impl ColumnValueEncoderImpl<FloatType, FloatEncoderObject> {
+    numeric_values_method!(write_float_values, FloatValues<'_>);
+}
+
+impl ColumnValueEncoderImpl<DoubleType, DoubleEncoderObject> {
+    numeric_values_method!(write_double_values, DoubleValues<'_>);
 }
 
 impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
@@ -473,6 +614,136 @@ impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
     }
 }
 
+#[cfg(feature = "arrow")]
+#[inline]
+fn int_is_unsigned(descr: &ColumnDescriptor) -> bool {
+    if let Some(LogicalType::Integer(int)) = descr.logical_type_ref() {
+        if !int.is_signed {
+            return true;
+        }
+    }
+    matches!(
+        descr.converted_type(),
+        ConvertedType::UINT_8
+            | ConvertedType::UINT_16
+            | ConvertedType::UINT_32
+            | ConvertedType::UINT_64
+    )
+}
+
+#[cfg(feature = "arrow")]
+#[inline(always)]
+fn int32_greater(unsigned: bool, a: i32, b: i32) -> bool {
+    if unsigned {
+        (a as u32) > (b as u32)
+    } else {
+        a > b
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[inline(always)]
+fn int64_greater(unsigned: bool, a: i64, b: i64) -> bool {
+    if unsigned {
+        (a as u64) > (b as u64)
+    } else {
+        a > b
+    }
+}
+
+/// Per-physical-type min/max folding for the fused stats walks.
+///
+/// Integer types carry signedness in the context; float types skip NaN and
+/// compare with the natural order.
+#[cfg(feature = "arrow")]
+pub(crate) trait StatFold: Copy {
+    /// Per-column comparison context, derived from the descriptor once and
+    /// reused for every value (e.g. integer signedness).
+    type Ctx: Copy;
+    fn ctx(descr: &ColumnDescriptor) -> Self::Ctx;
+    /// `a > b` under the column's logical order.
+    fn greater(ctx: Self::Ctx, a: Self, b: Self) -> bool;
+    /// True for values excluded from min/max (NaN floats); always false for ints.
+    fn is_skippable(value: Self) -> bool;
+    /// Fold one value into the running `(min, max)`.
+    #[inline(always)]
+    fn observe(ctx: Self::Ctx, value: Self, min: &mut Option<Self>, max: &mut Option<Self>) {
+        if Self::is_skippable(value) {
+            return;
+        }
+        if min.is_none_or(|current| Self::greater(ctx, current, value)) {
+            *min = Some(value);
+        }
+        if max.is_none_or(|current| Self::greater(ctx, value, current)) {
+            *max = Some(value);
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl StatFold for i32 {
+    type Ctx = bool;
+    #[inline(always)]
+    fn ctx(descr: &ColumnDescriptor) -> bool {
+        int_is_unsigned(descr)
+    }
+    #[inline(always)]
+    fn greater(unsigned: bool, a: i32, b: i32) -> bool {
+        int32_greater(unsigned, a, b)
+    }
+    #[inline(always)]
+    fn is_skippable(_: i32) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl StatFold for i64 {
+    type Ctx = bool;
+    #[inline(always)]
+    fn ctx(descr: &ColumnDescriptor) -> bool {
+        int_is_unsigned(descr)
+    }
+    #[inline(always)]
+    fn greater(unsigned: bool, a: i64, b: i64) -> bool {
+        int64_greater(unsigned, a, b)
+    }
+    #[inline(always)]
+    fn is_skippable(_: i64) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl StatFold for f32 {
+    type Ctx = ();
+    #[inline(always)]
+    fn ctx(_: &ColumnDescriptor) {}
+    #[inline(always)]
+    fn greater(_: (), a: f32, b: f32) -> bool {
+        a > b
+    }
+    #[inline(always)]
+    fn is_skippable(value: f32) -> bool {
+        value.is_nan()
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl StatFold for f64 {
+    type Ctx = ();
+    #[inline(always)]
+    fn ctx(_: &ColumnDescriptor) {}
+    #[inline(always)]
+    fn greater(_: (), a: f64, b: f64) -> bool {
+        a > b
+    }
+    #[inline(always)]
+    fn is_skippable(value: f64) -> bool {
+        value.is_nan()
+    }
+}
+
 fn get_min_max<'a, T, I>(descr: &ColumnDescriptor, mut iter: I) -> Option<(T, T)>
 where
     T: ParquetValueType + 'a,
@@ -530,6 +801,28 @@ fn replace_zero<T: ParquetValueType>(val: &T, descr: &ColumnDescriptor, replace:
         }
         _ => val.clone(),
     }
+}
+
+#[inline]
+#[cfg(feature = "arrow")]
+fn update_min_normalized<T: ParquetValueType>(
+    descr: &ColumnDescriptor,
+    val: &T,
+    min_value: &mut Option<T>,
+) {
+    let val = replace_zero(val, descr, -0.0);
+    update_min(descr, &val, min_value);
+}
+
+#[inline]
+#[cfg(feature = "arrow")]
+fn update_max_normalized<T: ParquetValueType>(
+    descr: &ColumnDescriptor,
+    val: &T,
+    max_value: &mut Option<T>,
+) {
+    let val = replace_zero(val, descr, 0.0);
+    update_max(descr, &val, max_value);
 }
 
 /// Creates a bloom filter sized for the column's configured NDV, returning the filter

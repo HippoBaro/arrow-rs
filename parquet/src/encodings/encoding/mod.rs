@@ -27,6 +27,8 @@ use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{BitWriter, num_required_bits};
 
+#[cfg(feature = "arrow")]
+use arrow_buffer::i256;
 use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamSplitEncoder};
 use bytes::Bytes;
 pub use dict_encoder::DictEncoder;
@@ -78,6 +80,359 @@ pub trait Encoder<T: DataType>: Send {
     fn flush_buffer(&mut self) -> Result<Bytes>;
 }
 
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ValueIndices<'a> {
+    Empty,
+    Dense { offset: usize, len: usize },
+    Sparse(&'a [usize]),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> ValueIndices<'a> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Dense { len, .. } => len,
+            Self::Sparse(indices) => indices.len(),
+        }
+    }
+
+    pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
+        match self {
+            Self::Empty => {
+                debug_assert_eq!(offset, 0);
+                debug_assert_eq!(len, 0);
+                Self::Empty
+            }
+            Self::Dense {
+                offset: base,
+                len: _selection_len,
+            } => Self::Dense {
+                offset: base + offset,
+                len,
+            },
+            Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_for_each<E>(
+        self,
+        mut f: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Dense { offset, len } => {
+                for idx in offset..offset + len {
+                    f(idx)?;
+                }
+                Ok(())
+            }
+            Self::Sparse(indices) => {
+                for &idx in indices {
+                    f(idx)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+/// Consumes chunks produced by [`ValueStream::write_into`].
+///
+/// `C` is the chunk type, not necessarily the scalar value type: numeric
+/// streams push `[T]`, and other value families push their own packed chunk
+/// representation.
+pub(crate) trait ChunkSink<C: ?Sized> {
+    fn consume(&mut self, chunk: &C) -> Result<()>;
+}
+
+/// Shared iteration surface over a selected stream of physical values `T`.
+///
+/// Implementations provide length, optional dense bulk access, and per-value
+/// iteration. The default [`Self::write_into`] uses the bulk path when
+/// available, otherwise gathers small tiles and sends them to a [`ChunkSink`].
+#[cfg(feature = "arrow")]
+pub(crate) trait ValueStream<'a, T: Copy + Default + 'a>: Copy + 'a {
+    /// The contiguous chunk type used by [`Self::bulk`]. For numeric streams
+    /// this is `[T]`; for dense fixed-length byte arrays it is packed `[u8]`.
+    type Bulk: ?Sized;
+
+    fn len(self) -> usize;
+
+    /// The whole contiguous run when this stream can expose one.
+    fn bulk(self) -> Option<&'a Self::Bulk>;
+
+    fn try_for_each<E>(self, f: impl FnMut(T) -> Result<(), E>) -> Result<(), E>;
+
+    /// Push the selected values into `sink`, using one bulk chunk when possible
+    /// and fixed-size gathered tiles otherwise.
+    #[inline]
+    fn write_into<S: ChunkSink<[T]> + ChunkSink<Self::Bulk>>(self, sink: &mut S) -> Result<()> {
+        if let Some(bulk) = self.bulk() {
+            if self.len() != 0 {
+                sink.consume(bulk)?;
+            }
+            return Ok(());
+        }
+        const N: usize = 64;
+        let mut buf = [T::default(); N];
+        let mut filled = 0;
+        self.try_for_each(|v| -> Result<()> {
+            buf[filled] = v;
+            filled += 1;
+            if filled == N {
+                // `&buf[..]` (not `&buf`): with both `ChunkSink<[T]>` and
+                // `ChunkSink<Self::Bulk>` in scope the array→slice coercion is no
+                // longer inferred, so name the `[T]` slice explicitly.
+                sink.consume(&buf[..])?;
+                filled = 0;
+            }
+            Ok(())
+        })?;
+        if filled > 0 {
+            sink.consume(&buf[..filled])?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Int32Values<'a> {
+    I32(&'a [i32], ValueIndices<'a>),
+    I8(&'a [i8], ValueIndices<'a>),
+    I16(&'a [i16], ValueIndices<'a>),
+    U8(&'a [u8], ValueIndices<'a>),
+    U16(&'a [u16], ValueIndices<'a>),
+    Date64Days(&'a [i64], ValueIndices<'a>),
+    I64Cast(&'a [i64], ValueIndices<'a>),
+    I128Cast(&'a [i128], ValueIndices<'a>),
+    I256Cast(&'a [i256], ValueIndices<'a>),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> Int32Values<'a> {
+    pub(crate) fn i32(values: &'a [i32], indices: ValueIndices<'a>) -> Self {
+        Self::I32(values, indices)
+    }
+
+    pub(crate) fn i8(values: &'a [i8], indices: ValueIndices<'a>) -> Self {
+        Self::I8(values, indices)
+    }
+
+    pub(crate) fn i16(values: &'a [i16], indices: ValueIndices<'a>) -> Self {
+        Self::I16(values, indices)
+    }
+
+    pub(crate) fn u8(values: &'a [u8], indices: ValueIndices<'a>) -> Self {
+        Self::U8(values, indices)
+    }
+
+    pub(crate) fn u16(values: &'a [u16], indices: ValueIndices<'a>) -> Self {
+        Self::U16(values, indices)
+    }
+
+    pub(crate) fn date64_days(values: &'a [i64], indices: ValueIndices<'a>) -> Self {
+        Self::Date64Days(values, indices)
+    }
+
+    pub(crate) fn i64_cast(values: &'a [i64], indices: ValueIndices<'a>) -> Self {
+        Self::I64Cast(values, indices)
+    }
+
+    pub(crate) fn i128_cast(values: &'a [i128], indices: ValueIndices<'a>) -> Self {
+        Self::I128Cast(values, indices)
+    }
+
+    pub(crate) fn i256_cast(values: &'a [i256], indices: ValueIndices<'a>) -> Self {
+        Self::I256Cast(values, indices)
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> ValueStream<'a, i32> for Int32Values<'a> {
+    type Bulk = [i32];
+
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::I32(_, indices)
+            | Self::I8(_, indices)
+            | Self::I16(_, indices)
+            | Self::U8(_, indices)
+            | Self::U16(_, indices)
+            | Self::Date64Days(_, indices)
+            | Self::I64Cast(_, indices)
+            | Self::I128Cast(_, indices) => indices.len(),
+            Self::I256Cast(_, indices) => indices.len(),
+        }
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [i32]> {
+        match self {
+            Self::I32(values, ValueIndices::Dense { offset, len }) => {
+                Some(&values[offset..offset + len])
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(i32) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::I32(values, indices) => indices.try_for_each(|idx| f(values[idx])),
+            Self::I8(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::I16(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::U8(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::U16(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::Date64Days(values, indices) => {
+                indices.try_for_each(|idx| f((values[idx] / 86_400_000) as i32))
+            }
+            Self::I64Cast(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::I128Cast(values, indices) => indices.try_for_each(|idx| f(values[idx] as i32)),
+            Self::I256Cast(values, indices) => {
+                indices.try_for_each(|idx| f(values[idx].as_i128() as i32))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Int64Values<'a> {
+    I64(&'a [i64], ValueIndices<'a>),
+    I128Cast(&'a [i128], ValueIndices<'a>),
+    I256Cast(&'a [i256], ValueIndices<'a>),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> Int64Values<'a> {
+    pub(crate) fn i64(values: &'a [i64], indices: ValueIndices<'a>) -> Self {
+        Self::I64(values, indices)
+    }
+
+    pub(crate) fn i128_cast(values: &'a [i128], indices: ValueIndices<'a>) -> Self {
+        Self::I128Cast(values, indices)
+    }
+
+    pub(crate) fn i256_cast(values: &'a [i256], indices: ValueIndices<'a>) -> Self {
+        Self::I256Cast(values, indices)
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> ValueStream<'a, i64> for Int64Values<'a> {
+    type Bulk = [i64];
+
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::I64(_, indices) => indices.len(),
+            Self::I128Cast(_, indices) => indices.len(),
+            Self::I256Cast(_, indices) => indices.len(),
+        }
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [i64]> {
+        match self {
+            Self::I64(values, ValueIndices::Dense { offset, len }) => {
+                Some(&values[offset..offset + len])
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(i64) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::I64(values, indices) => indices.try_for_each(|idx| f(values[idx])),
+            Self::I128Cast(values, indices) => indices.try_for_each(|idx| f(values[idx] as i64)),
+            Self::I256Cast(values, indices) => {
+                indices.try_for_each(|idx| f(values[idx].as_i128() as i64))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FloatValues<'a> {
+    values: &'a [f32],
+    indices: ValueIndices<'a>,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> FloatValues<'a> {
+    pub(crate) fn new(values: &'a [f32], indices: ValueIndices<'a>) -> Self {
+        Self { values, indices }
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> ValueStream<'a, f32> for FloatValues<'a> {
+    type Bulk = [f32];
+
+    #[inline]
+    fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [f32]> {
+        match self.indices {
+            ValueIndices::Dense { offset, len } => Some(&self.values[offset..offset + len]),
+            ValueIndices::Empty | ValueIndices::Sparse(_) => None,
+        }
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(f32) -> Result<(), E>) -> Result<(), E> {
+        self.indices.try_for_each(|idx| f(self.values[idx]))
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DoubleValues<'a> {
+    values: &'a [f64],
+    indices: ValueIndices<'a>,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> DoubleValues<'a> {
+    pub(crate) fn new(values: &'a [f64], indices: ValueIndices<'a>) -> Self {
+        Self { values, indices }
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> ValueStream<'a, f64> for DoubleValues<'a> {
+    type Bulk = [f64];
+
+    #[inline]
+    fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [f64]> {
+        match self.indices {
+            ValueIndices::Dense { offset, len } => Some(&self.values[offset..offset + len]),
+            ValueIndices::Empty | ValueIndices::Sparse(_) => None,
+        }
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(f64) -> Result<(), E>) -> Result<(), E> {
+        self.indices.try_for_each(|idx| f(self.values[idx]))
+    }
+}
+
 /// Gets a encoder for the particular data type `T` and encoding `encoding`. Memory usage
 /// for the encoder instance is tracked by `mem_tracker`.
 pub fn get_encoder<T: DataType>(
@@ -119,6 +474,120 @@ pub trait EncoderFactory<T: DataType>: Encoder<T> {
 impl<T: DataType> EncoderFactory<T> for dyn Encoder<T> {
     fn get_encoder(encoding: Encoding, descr: &ColumnDescPtr) -> Result<Box<Self>> {
         get_encoder::<T>(encoding, descr)
+    }
+}
+
+/// Numeric encoder-object enum, generic over the physical type `T`.
+#[doc(hidden)]
+pub enum NumericEncoderObject<T: DataType> {
+    Plain(PlainEncoder<T>),
+    Rle(RleValueEncoder<T>),
+    // The DELTA family wraps one or more (large) `DeltaBitPackEncoder`s; box
+    // them so the enum stays small. These are cold fallback paths.
+    DeltaBinaryPacked(Box<DeltaBitPackEncoder<T>>),
+    DeltaLengthByteArray(Box<DeltaLengthByteArrayEncoder<T>>),
+    DeltaByteArray(Box<DeltaByteArrayEncoder<T>>),
+    ByteStreamSplit(ByteStreamSplitEncoder<T>),
+}
+
+impl<T: DataType> Encoder<T> for NumericEncoderObject<T> {
+    fn put(&mut self, values: &[<T as DataType>::T]) -> Result<()> {
+        match self {
+            Self::Plain(e) => e.put(values),
+            Self::Rle(e) => e.put(values),
+            Self::DeltaBinaryPacked(e) => e.put(values),
+            Self::DeltaLengthByteArray(e) => e.put(values),
+            Self::DeltaByteArray(e) => e.put(values),
+            Self::ByteStreamSplit(e) => e.put(values),
+        }
+    }
+
+    fn encoding(&self) -> Encoding {
+        match self {
+            Self::Plain(e) => e.encoding(),
+            Self::Rle(e) => e.encoding(),
+            Self::DeltaBinaryPacked(e) => e.encoding(),
+            Self::DeltaLengthByteArray(e) => e.encoding(),
+            Self::DeltaByteArray(e) => e.encoding(),
+            Self::ByteStreamSplit(e) => e.encoding(),
+        }
+    }
+
+    fn estimated_data_encoded_size(&self) -> usize {
+        match self {
+            Self::Plain(e) => e.estimated_data_encoded_size(),
+            Self::Rle(e) => e.estimated_data_encoded_size(),
+            Self::DeltaBinaryPacked(e) => e.estimated_data_encoded_size(),
+            Self::DeltaLengthByteArray(e) => e.estimated_data_encoded_size(),
+            Self::DeltaByteArray(e) => e.estimated_data_encoded_size(),
+            Self::ByteStreamSplit(e) => e.estimated_data_encoded_size(),
+        }
+    }
+
+    fn estimated_memory_size(&self) -> usize {
+        match self {
+            Self::Plain(e) => e.estimated_memory_size(),
+            Self::Rle(e) => e.estimated_memory_size(),
+            Self::DeltaBinaryPacked(e) => e.estimated_memory_size(),
+            Self::DeltaLengthByteArray(e) => e.estimated_memory_size(),
+            Self::DeltaByteArray(e) => e.estimated_memory_size(),
+            Self::ByteStreamSplit(e) => e.estimated_memory_size(),
+        }
+    }
+
+    fn flush_buffer(&mut self) -> Result<Bytes> {
+        match self {
+            Self::Plain(e) => e.flush_buffer(),
+            Self::Rle(e) => e.flush_buffer(),
+            Self::DeltaBinaryPacked(e) => e.flush_buffer(),
+            Self::DeltaLengthByteArray(e) => e.flush_buffer(),
+            Self::DeltaByteArray(e) => e.flush_buffer(),
+            Self::ByteStreamSplit(e) => e.flush_buffer(),
+        }
+    }
+}
+
+/// Per-physical-type aliases used by the column writer.
+pub type Int32EncoderObject = NumericEncoderObject<Int32Type>;
+pub type Int64EncoderObject = NumericEncoderObject<Int64Type>;
+pub type FloatEncoderObject = NumericEncoderObject<FloatType>;
+pub type DoubleEncoderObject = NumericEncoderObject<DoubleType>;
+
+/// The encoding -> concrete-variant selection shared by every encoder-object
+/// enum's `EncoderFactory` impl (`BoolEncoderObject`,
+/// `FixedLenByteArrayEncoderObject`, `NumericEncoderObject<T>`). It mirrors
+/// `get_encoder` — which builds the `Box<dyn Encoder>` fallback for the
+/// non-static-dispatch types (`Int96`, `ByteArray`) — but constructs concrete
+/// `Self::` variants for static dispatch. `$bss` is the `BYTE_STREAM_SPLIT` arm,
+/// the only part that differs between the enums
+/// (`FixedLenByteArrayEncoderObject` uses the variable-width encoder, which
+/// needs `descr`). The `return`s in the dictionary/unsupported arms exit the
+/// caller's `get_encoder`, so this is only valid inside that method.
+macro_rules! encoder_object_from_encoding {
+    ($encoding:expr, $bss:expr $(,)?) => {
+        match $encoding {
+            Encoding::PLAIN => Self::Plain(PlainEncoder::new()),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                return Err(general_err!(
+                    "Cannot initialize this encoding through this function"
+                ));
+            }
+            Encoding::RLE => Self::Rle(RleValueEncoder::new()),
+            Encoding::DELTA_BINARY_PACKED => Self::DeltaBinaryPacked(Box::default()),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => Self::DeltaLengthByteArray(Box::default()),
+            Encoding::DELTA_BYTE_ARRAY => Self::DeltaByteArray(Box::default()),
+            Encoding::BYTE_STREAM_SPLIT => $bss,
+            e => return Err(nyi_err!("Encoding {} is not supported", e)),
+        }
+    };
+}
+
+impl<T: DataType> EncoderFactory<T> for NumericEncoderObject<T> {
+    fn get_encoder(encoding: Encoding, _descr: &ColumnDescPtr) -> Result<Box<Self>> {
+        Ok(Box::new(encoder_object_from_encoding!(
+            encoding,
+            Self::ByteStreamSplit(ByteStreamSplitEncoder::new())
+        )))
     }
 }
 

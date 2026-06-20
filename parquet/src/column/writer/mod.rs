@@ -517,6 +517,16 @@ impl<'a, S> Selected<'a, S> {
     pub(crate) fn new(storage: S, selection: ValueSelection<'a>) -> Self {
         Self { storage, selection }
     }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn storage(self) -> S {
+        self.storage
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn selection(self) -> ValueSelection<'a> {
+        self.selection
+    }
 }
 
 impl<'a, S: Copy> Selected<'a, S> {

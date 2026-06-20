@@ -539,6 +539,7 @@ pub trait SliceAsBytes: Sized {
 }
 
 impl AsBytes for [u8] {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self
     }
@@ -547,6 +548,7 @@ impl AsBytes for [u8] {
 macro_rules! gen_as_bytes {
     ($source_ty:ident) => {
         impl AsBytes for $source_ty {
+            #[inline]
             #[allow(clippy::size_of_in_element_count)]
             fn as_bytes(&self) -> &[u8] {
                 // SAFETY: macro is only used with primitive types that have no padding, so the
@@ -623,6 +625,7 @@ unimplemented_slice_as_bytes!(ByteArray);
 unimplemented_slice_as_bytes!(FixedLenByteArray);
 
 impl AsBytes for bool {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: a bool is guaranteed to be either 0x00 or 0x01 in memory, so the memory is
         // valid.
@@ -638,12 +641,14 @@ impl AsBytes for Int96 {
 }
 
 impl AsBytes for ByteArray {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self.data()
     }
 }
 
 impl AsBytes for FixedLenByteArray {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self.data()
     }
@@ -744,6 +749,7 @@ pub(crate) mod private {
         ///
         /// This is essentially the same as `std::convert::TryInto<u64>` but can't be
         /// implemented for `f32` and `f64`, types that would fail orphan rules
+        #[inline]
         fn as_u64(&self) -> Result<u64> {
             self.as_i64()
                 .map_err(|_| general_err!("Type cannot be converted to u64"))
