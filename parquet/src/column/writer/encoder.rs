@@ -273,8 +273,8 @@ impl<T: ColumnEncoderType, E: Encoder<T> + ?Sized> ColumnValueEncoderImpl<T, E> 
     }
 }
 
-/// Shared chunked walk for numeric encoders. Dictionary adoption is handled by
-/// the native entry points before they fall back to this intern/PLAIN path.
+/// Shared chunked walk for numeric encoders: interns each value into the
+/// dictionary (or appends to the PLAIN/fallback encoder) and folds page stats.
 #[cfg(feature = "arrow")]
 #[allow(private_bounds)]
 impl<T, E> ColumnValueEncoderImpl<T, E>
@@ -300,7 +300,10 @@ where
         // state before encoding each chunk.
         let (min, max) = {
             let target = match self.dict_encoder.as_mut() {
-                Some(dict) => NumericSinkTarget::Dict(dict),
+                Some(dict) => {
+                    dict.reserve(values.len());
+                    NumericSinkTarget::Dict(dict)
+                }
                 None => NumericSinkTarget::Plain(&mut *self.encoder),
             };
             let mut sink = NumericSink {
@@ -634,7 +637,12 @@ where
             }
         }
         match &mut self.target {
-            NumericSinkTarget::Dict(dict) => dict.put(chunk),
+            NumericSinkTarget::Dict(dict) => {
+                for &value in chunk {
+                    dict.put_value(&value);
+                }
+                Ok(())
+            }
             NumericSinkTarget::Plain(encoder) => encoder.put(chunk),
         }
     }
@@ -830,7 +838,7 @@ impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> SliceColumnValueEncode
                     })?;
                     self.fold_stats(std::slice::from_ref(value));
                     match &mut self.dict_encoder {
-                        Some(encoder) => encoder.put(std::slice::from_ref(value))?,
+                        Some(encoder) => encoder.put_value(value),
                         None => self.encoder.put(std::slice::from_ref(value))?,
                     }
                 }

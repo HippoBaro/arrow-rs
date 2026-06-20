@@ -58,7 +58,6 @@ impl<S: Storage> Interner<S> {
         }
     }
 
-    /// Intern the value, returning the interned key, and if this was a new value
     pub fn intern(&mut self, value: &S::Value) -> S::Key {
         let hash = self.state.hash_one(value.as_bytes());
 

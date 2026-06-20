@@ -27,7 +27,8 @@ use std::vec::IntoIter;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchWriter};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchWriter};
+use arrow_buffer::NullBuffer;
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field, IntervalUnit, SchemaRef, TimeUnit,
 };
@@ -51,8 +52,9 @@ use crate::data_type::{
     FloatType as ParquetFloatType, Int32Type as ParquetInt32Type, Int64Type as ParquetInt64Type,
 };
 use crate::encodings::encoding::{
-    DoubleValues, FixedLenByteArrayValues, FloatValues, Int32Values, Int64Values, PackedBoolValues,
-    ValueIndices, ValueStream,
+    DefaultedDictionaryValueIndices, DefaultedValues, DictionaryValueIndices, DoubleValues,
+    FixedLenByteArrayValues, FloatValues, Int32Values, Int64Values, PackedBoolValues, ValueIndices,
+    ValueStream,
 };
 #[cfg(feature = "encryption")]
 use crate::encryption::encrypt::FileEncryptor;
@@ -1109,7 +1111,7 @@ impl ArrowColumnWriter {
     /// Write an [`ArrowLeafColumn`]
     pub fn write(&mut self, col: &ArrowLeafColumn) -> Result<()> {
         let view = col.0.view();
-        let materialized = self.maybe_materialize_dictionary(view.array())?;
+        let materialized = self.maybe_materialize_unsupported_dictionary(view.array())?;
         let column = materialized.as_deref().unwrap_or_else(|| view.array());
         self.write_internal(view, column)
     }
@@ -1121,10 +1123,10 @@ impl ArrowColumnWriter {
         chunker: &mut ContentDefinedChunker,
     ) -> Result<()> {
         let levels = &col.0;
-        // Materialize a dictionary leaf once per column rather than once per
-        // chunk: `chunk_view` keeps the full array plus a selection, so taking
-        // per chunk would re-expand the whole dictionary for every chunk.
-        let materialized = self.maybe_materialize_dictionary(levels.array().as_ref())?;
+        // Bool and FLBA column writers expect non-dictionary arrays here; keep
+        // the previous dense fallback for those writer families only.
+        let materialized =
+            self.maybe_materialize_unsupported_dictionary(levels.array().as_ref())?;
         let chunks = chunker.get_arrow_chunks(
             levels.def_level_data().as_ref(),
             levels.rep_level_data().as_ref(),
@@ -1151,25 +1153,30 @@ impl ArrowColumnWriter {
         Ok(())
     }
 
-    /// Materializes a dictionary leaf into its values for the generic column
-    /// writer (primitive/bool/FLBA), which still consumes materialized values.
-    /// Returns `None` for non-dictionary arrays, and for the byte-array writer
-    /// which consumes dictionaries natively from the original array.
-    fn maybe_materialize_dictionary(
+    fn maybe_materialize_unsupported_dictionary(
         &self,
         array: &dyn arrow_array::Array,
     ) -> Result<Option<ArrayRef>> {
-        if matches!(self.writer, ArrowColumnWriterImpl::ByteArray(_)) {
+        if !matches!(array.data_type(), ArrowDataType::Dictionary(_, _)) {
             return Ok(None);
         }
-        match array.as_any_dictionary_opt() {
-            Some(dictionary) => Ok(Some(arrow_select::take::take(
-                dictionary.values(),
-                dictionary.keys(),
-                None,
-            )?)),
-            None => Ok(None),
+
+        let should_materialize = matches!(
+            &self.writer,
+            ArrowColumnWriterImpl::Column(
+                ColumnWriter::BoolColumnWriter(_) | ColumnWriter::FixedLenByteArrayColumnWriter(_)
+            )
+        );
+        if !should_materialize {
+            return Ok(None);
         }
+
+        let dictionary = array.as_any_dictionary();
+        Ok(Some(arrow_select::take::take(
+            dictionary.values(),
+            dictionary.keys(),
+            None,
+        )?))
     }
 
     fn write_internal(
@@ -1564,246 +1571,195 @@ impl ArrowColumnWriterFactory {
     }
 }
 
-fn value_indices(selection: ValueSelection<'_>) -> ValueIndices<'_> {
-    match selection {
-        ValueSelection::Empty => ValueIndices::Empty,
-        ValueSelection::Dense { offset, len } => ValueIndices::Dense { offset, len },
-        ValueSelection::Sparse(indices) => ValueIndices::Sparse(indices),
-    }
+enum DictionaryInput<'a> {
+    Direct {
+        values: &'a dyn arrow_array::Array,
+        indices: ValueIndices<'a>,
+    },
+    Defaulted {
+        values: &'a dyn arrow_array::Array,
+        indices: DefaultedDictionaryValueIndices<'a>,
+    },
+    NonDictionary {
+        values: &'a dyn arrow_array::Array,
+        indices: ValueIndices<'a>,
+    },
 }
 
-type Int32Source<'a> = Selected<'a, Int32Storage<'a>>;
-
-#[derive(Clone, Copy)]
-struct Int32Storage<'a> {
+fn dispatch_dictionary_input<'a>(
     column: &'a dyn arrow_array::Array,
-}
-
-impl<'a> Int32Storage<'a> {
-    fn from_column(column: &'a dyn arrow_array::Array) -> Self {
-        Self { column }
-    }
-}
-
-impl<'a> ColumnValueSource<ColumnValueEncoderImpl<ParquetInt32Type>>
-    for Selected<'a, Int32Storage<'a>>
-{
-    fn len(self) -> usize {
-        Selected::len(self)
-    }
-
-    fn slice(self, offset: usize, len: usize) -> Self {
-        Selected::slice(self, offset, len)
-    }
-
-    fn write_to(self, encoder: &mut ColumnValueEncoderImpl<ParquetInt32Type>) -> Result<()> {
-        write_int32_column(encoder, self.storage().column, self.selection())
-    }
-
-    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
-        let per = std::mem::size_of::<i32>().max(1);
-        Some((budget / per).max(1).min(Selected::len(self)))
-    }
-}
-
-fn write_int32_column(
-    encoder: &mut ColumnValueEncoderImpl<ParquetInt32Type>,
-    column: &dyn arrow_array::Array,
-    selection: ValueSelection<'_>,
-) -> Result<()> {
-    write_int32_column_indices(encoder, column, value_indices(selection))
-}
-
-fn write_int32_column_indices(
-    encoder: &mut ColumnValueEncoderImpl<ParquetInt32Type>,
-    column: &dyn arrow_array::Array,
-    indices: ValueIndices<'_>,
-) -> Result<()> {
-    let values = match column.data_type() {
-        ArrowDataType::Null => {
-            let zeros = vec![0i32; column.len()];
-            return encoder.write_int32_values(Int32Values::i32(&zeros, indices));
-        }
-        ArrowDataType::Int8 => Int32Values::i8(column.as_primitive::<Int8Type>().values(), indices),
-        ArrowDataType::Int16 => {
-            Int32Values::i16(column.as_primitive::<Int16Type>().values(), indices)
-        }
-        ArrowDataType::Int32 => {
-            Int32Values::i32(column.as_primitive::<Int32Type>().values(), indices)
-        }
-        ArrowDataType::UInt8 => {
-            Int32Values::u8(column.as_primitive::<UInt8Type>().values(), indices)
-        }
-        ArrowDataType::UInt16 => {
-            Int32Values::u16(column.as_primitive::<UInt16Type>().values(), indices)
-        }
-        // Follow the C++ implementation and use an overflow/reinterpret cast from
-        // u32 to i32, which maps `(i32::MAX as u32)..u32::MAX` to `i32::MIN..0`.
-        ArrowDataType::UInt32 => Int32Values::i32(
-            column
-                .as_primitive::<UInt32Type>()
-                .values()
-                .inner()
-                .typed_data(),
-            indices,
-        ),
-        ArrowDataType::Date32 => {
-            Int32Values::i32(column.as_primitive::<Date32Type>().values(), indices)
-        }
-        // Date64 is in milliseconds; truncate to days for the INT32 date
-        // representation (86_400_000 ms per day).
-        ArrowDataType::Date64 => {
-            Int32Values::date64_days(column.as_primitive::<Date64Type>().values(), indices)
-        }
-        ArrowDataType::Time32(TimeUnit::Second) => {
-            Int32Values::i32(column.as_primitive::<Time32SecondType>().values(), indices)
-        }
-        ArrowDataType::Time32(TimeUnit::Millisecond) => Int32Values::i32(
-            column.as_primitive::<Time32MillisecondType>().values(),
-            indices,
-        ),
-        ArrowDataType::Decimal32(_, _) => {
-            Int32Values::i32(column.as_primitive::<Decimal32Type>().values(), indices)
-        }
-        // Represent the decimal using int32 at reduced precision.
-        ArrowDataType::Decimal64(_, _) => {
-            Int32Values::i64_cast(column.as_primitive::<Decimal64Type>().values(), indices)
-        }
-        // Represent the decimal using int32 at reduced precision.
-        ArrowDataType::Decimal128(_, _) => {
-            Int32Values::i128_cast(column.as_primitive::<Decimal128Type>().values(), indices)
-        }
-        // Represent the decimal using int32 at reduced precision.
-        ArrowDataType::Decimal256(_, _) => {
-            Int32Values::i256_cast(column.as_primitive::<Decimal256Type>().values(), indices)
-        }
-        d => return Err(ParquetError::General(format!("Cannot coerce {d} to I32"))),
+    selection: ValueSelection<'a>,
+) -> Result<DictionaryInput<'a>> {
+    let ArrowDataType::Dictionary(key_type, _) = column.data_type() else {
+        return Ok(DictionaryInput::NonDictionary {
+            values: column,
+            indices: value_indices(selection),
+        });
     };
-    encoder.write_int32_values(values)
+
+    let dictionary = column.as_any_dictionary();
+    let values = dictionary.values();
+    let indices = dictionary_value_indices(column, key_type.as_ref(), selection)?;
+
+    // Null dictionary key slots may contain arbitrary key values; null
+    // dictionary values likewise have arbitrary physical storage. Required
+    // writers substitute type defaults and stream that substitution through the
+    // selected-value path instead of materializing a taken Arrow array.
+    let key_selection = value_indices(selection);
+    // A sparse key selection lists only valid row positions by construction, so
+    // it cannot reference a null key slot. Dense selections still need the scan.
+    if (!key_selection.is_sparse() && value_indices_include_nulls(column.nulls(), key_selection))
+        || value_indices_include_nulls(values.nulls(), indices)
+    {
+        let ValueIndices::Dictionary(indices) = indices else {
+            unreachable!("dictionary_value_indices always returns dictionary indices");
+        };
+        return Ok(DictionaryInput::Defaulted {
+            values: values.as_ref(),
+            indices: DefaultedDictionaryValueIndices::new(indices, column.nulls(), values.nulls()),
+        });
+    }
+
+    Ok(DictionaryInput::Direct {
+        values: values.as_ref(),
+        indices,
+    })
 }
 
-type Int64Source<'a> = Selected<'a, Int64Storage<'a>>;
+fn value_indices_include_nulls(nulls: Option<&NullBuffer>, indices: ValueIndices<'_>) -> bool {
+    let Some(nulls) = nulls else {
+        return false;
+    };
+    if nulls.null_count() == 0 {
+        return false;
+    }
 
-#[derive(Clone, Copy)]
-struct Int64Storage<'a> {
+    match indices {
+        ValueIndices::Empty => false,
+        ValueIndices::Dense { offset, len } => nulls.slice(offset, len).null_count() > 0,
+        ValueIndices::Sparse(indices) => indices.iter().any(|&idx| nulls.is_null(idx)),
+        ValueIndices::Dictionary(_) => (0..indices.len()).any(|idx| {
+            let idx = indices.index_at(idx);
+            idx < nulls.len() && nulls.is_null(idx)
+        }),
+    }
+}
+
+fn dictionary_value_indices<'a>(
     column: &'a dyn arrow_array::Array,
-}
-
-impl<'a> Int64Storage<'a> {
-    fn from_column(column: &'a dyn arrow_array::Array) -> Self {
-        Self { column }
+    key_type: &ArrowDataType,
+    selection: ValueSelection<'a>,
+) -> Result<ValueIndices<'a>> {
+    match key_type {
+        ArrowDataType::UInt8 => Ok(ValueIndices::dictionary(DictionaryValueIndices::u8(
+            dictionary_key_values::<UInt8Type>(column)?,
+            selection,
+        ))),
+        ArrowDataType::UInt16 => Ok(ValueIndices::dictionary(DictionaryValueIndices::u16(
+            dictionary_key_values::<UInt16Type>(column)?,
+            selection,
+        ))),
+        ArrowDataType::UInt32 => Ok(ValueIndices::dictionary(DictionaryValueIndices::u32(
+            dictionary_key_values::<UInt32Type>(column)?,
+            selection,
+        ))),
+        ArrowDataType::UInt64 => Ok(ValueIndices::dictionary(DictionaryValueIndices::u64(
+            dictionary_key_values::<UInt64Type>(column)?,
+            selection,
+        ))),
+        ArrowDataType::Int8 => Ok(ValueIndices::dictionary(DictionaryValueIndices::i8(
+            dictionary_key_values::<Int8Type>(column)?,
+            selection,
+        ))),
+        ArrowDataType::Int16 => Ok(ValueIndices::dictionary(DictionaryValueIndices::i16(
+            dictionary_key_values::<Int16Type>(column)?,
+            selection,
+        ))),
+        ArrowDataType::Int32 => Ok(ValueIndices::dictionary(DictionaryValueIndices::i32(
+            dictionary_key_values::<Int32Type>(column)?,
+            selection,
+        ))),
+        ArrowDataType::Int64 => Ok(ValueIndices::dictionary(DictionaryValueIndices::i64(
+            dictionary_key_values::<Int64Type>(column)?,
+            selection,
+        ))),
+        _ => Err(ParquetError::General(format!(
+            "Unsupported dictionary key type {key_type}"
+        ))),
     }
 }
 
-impl<'a> ColumnValueSource<ColumnValueEncoderImpl<ParquetInt64Type>>
-    for Selected<'a, Int64Storage<'a>>
+fn dictionary_key_values<K>(column: &dyn arrow_array::Array) -> Result<&[K::Native]>
+where
+    K: ArrowDictionaryKeyType,
 {
-    fn len(self) -> usize {
-        Selected::len(self)
-    }
+    let dictionary = column
+        .as_any()
+        .downcast_ref::<arrow_array::DictionaryArray<K>>()
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "Cannot downcast {} to dictionary",
+                column.data_type()
+            ))
+        })?;
 
-    fn slice(self, offset: usize, len: usize) -> Self {
-        Selected::slice(self, offset, len)
-    }
-
-    fn write_to(self, encoder: &mut ColumnValueEncoderImpl<ParquetInt64Type>) -> Result<()> {
-        write_int64_column(encoder, self.storage().column, self.selection())
-    }
-
-    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
-        let per = std::mem::size_of::<i64>().max(1);
-        Some((budget / per).max(1).min(Selected::len(self)))
-    }
+    Ok(dictionary.keys().values().as_ref())
 }
 
-fn write_int64_column(
-    encoder: &mut ColumnValueEncoderImpl<ParquetInt64Type>,
-    column: &dyn arrow_array::Array,
-    selection: ValueSelection<'_>,
-) -> Result<()> {
-    write_int64_column_indices(encoder, column, value_indices(selection))
+#[inline]
+fn defaulted_values<'a, S, T, F>(
+    values: &'a [S],
+    indices: DefaultedDictionaryValueIndices<'a>,
+    map: F,
+) -> DefaultedValues<'a, T, impl Fn(Option<usize>) -> T + Copy + 'a>
+where
+    S: Copy + 'a,
+    T: Copy + Default + 'a,
+    F: Fn(S) -> T + Copy + 'a,
+{
+    DefaultedValues::new(indices, move |idx| {
+        idx.map_or_else(T::default, |idx| map(values[idx]))
+    })
 }
 
-fn write_int64_column_indices(
-    encoder: &mut ColumnValueEncoderImpl<ParquetInt64Type>,
-    column: &dyn arrow_array::Array,
-    indices: ValueIndices<'_>,
-) -> Result<()> {
-    let values = match column.data_type() {
-        ArrowDataType::Int64 => {
-            Int64Values::i64(column.as_primitive::<Int64Type>().values(), indices)
-        }
-        // Follow the C++ implementation and use an overflow/reinterpret cast from
-        // u64 to i64, which maps `(i64::MAX as u64)..u64::MAX` to `i64::MIN..0`.
-        ArrowDataType::UInt64 => Int64Values::i64(
-            column
-                .as_primitive::<UInt64Type>()
-                .values()
-                .inner()
-                .typed_data(),
-            indices,
-        ),
-        ArrowDataType::Date64 => {
-            Int64Values::i64(column.as_primitive::<Date64Type>().values(), indices)
-        }
-        ArrowDataType::Time64(TimeUnit::Microsecond) => Int64Values::i64(
-            column.as_primitive::<Time64MicrosecondType>().values(),
-            indices,
-        ),
-        ArrowDataType::Time64(TimeUnit::Nanosecond) => Int64Values::i64(
-            column.as_primitive::<Time64NanosecondType>().values(),
-            indices,
-        ),
-        ArrowDataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Second => Int64Values::i64(
-                column.as_primitive::<TimestampSecondType>().values(),
-                indices,
-            ),
-            TimeUnit::Millisecond => Int64Values::i64(
-                column.as_primitive::<TimestampMillisecondType>().values(),
-                indices,
-            ),
-            TimeUnit::Microsecond => Int64Values::i64(
-                column.as_primitive::<TimestampMicrosecondType>().values(),
-                indices,
-            ),
-            TimeUnit::Nanosecond => Int64Values::i64(
-                column.as_primitive::<TimestampNanosecondType>().values(),
-                indices,
-            ),
-        },
-        ArrowDataType::Duration(unit) => match unit {
-            TimeUnit::Second => Int64Values::i64(
-                column.as_primitive::<DurationSecondType>().values(),
-                indices,
-            ),
-            TimeUnit::Millisecond => Int64Values::i64(
-                column.as_primitive::<DurationMillisecondType>().values(),
-                indices,
-            ),
-            TimeUnit::Microsecond => Int64Values::i64(
-                column.as_primitive::<DurationMicrosecondType>().values(),
-                indices,
-            ),
-            TimeUnit::Nanosecond => Int64Values::i64(
-                column.as_primitive::<DurationNanosecondType>().values(),
-                indices,
-            ),
-        },
-        ArrowDataType::Decimal64(_, _) => {
-            Int64Values::i64(column.as_primitive::<Decimal64Type>().values(), indices)
-        }
-        // Represent the decimal using int64 at reduced precision.
-        ArrowDataType::Decimal128(_, _) => {
-            Int64Values::i128_cast(column.as_primitive::<Decimal128Type>().values(), indices)
-        }
-        // Represent the decimal using int64 at reduced precision.
-        ArrowDataType::Decimal256(_, _) => {
-            Int64Values::i256_cast(column.as_primitive::<Decimal256Type>().values(), indices)
-        }
-        d => return Err(ParquetError::General(format!("Cannot coerce {d} to I64"))),
-    };
-    encoder.write_int64_values(values)
+#[inline]
+fn defaulted_null_values<'a, T>(
+    indices: DefaultedDictionaryValueIndices<'a>,
+) -> DefaultedValues<'a, T, impl Fn(Option<usize>) -> T + Copy + 'a>
+where
+    T: Copy + Default + 'a,
+{
+    DefaultedValues::new(indices, |_| T::default())
+}
+
+macro_rules! fold_defaulted_primitive {
+    ($encoder:expr, $column:expr, $indices:expr, $arrow_ty:ty, $map:expr $(,)?) => {{
+        let values = $column.as_primitive::<$arrow_ty>().values();
+        $encoder.fold_value_stream(defaulted_values(values.as_ref(), $indices, $map))
+    }};
+    (@typed_data $encoder:expr, $column:expr, $indices:expr, $arrow_ty:ty, $map:expr $(,)?) => {{
+        let values = $column
+            .as_primitive::<$arrow_ty>()
+            .values()
+            .inner()
+            .typed_data();
+        $encoder.fold_value_stream(defaulted_values(values, $indices, $map))
+    }};
+}
+
+#[inline]
+fn date64_millis_to_days(value: i64) -> i32 {
+    (value / 86_400_000) as i32
+}
+
+#[inline]
+fn decimal256_to_i32(value: arrow_buffer::i256) -> i32 {
+    value.as_i128() as i32
+}
+
+#[inline]
+fn decimal256_to_i64(value: arrow_buffer::i256) -> i64 {
+    value.as_i128() as i64
 }
 
 #[derive(Clone, Copy)]
@@ -1858,6 +1814,12 @@ impl<'a> ColumnValueSource<ColumnValueEncoderImpl<BoolType>> for BoolSource<'a> 
             ValueIndices::Sparse(indices) => {
                 encoder.write_packed_bool(PackedBoolValues::new_sparse(bytes, bit_offset, indices))
             }
+            // Boolean dictionaries are not yet adopted natively (the boolean
+            // dict path lands in a later commit); `write_bool_column` only
+            // produces non-dictionary selections, so this arm is unreachable.
+            ValueIndices::Dictionary(_) => {
+                unreachable!("boolean dictionary indices are not produced yet")
+            }
         }
     }
 
@@ -1865,23 +1827,6 @@ impl<'a> ColumnValueSource<ColumnValueEncoderImpl<BoolType>> for BoolSource<'a> 
         let per = std::mem::size_of::<bool>().max(1);
         Some((budget / per).max(1).min(self.indices.len()))
     }
-}
-
-fn write_bool_column(
-    writer: &mut GenericColumnWriter<ColumnValueEncoderImpl<BoolType>>,
-    column: &dyn arrow_array::Array,
-    levels: ArrayLevelsView<'_>,
-) -> Result<usize> {
-    let selection = levels.value_selection();
-    let array = column.as_boolean();
-    writer.write_batch_internal(
-        BoolSource::new(BoolStorage::from_array(array), value_indices(selection)),
-        levels.def_level_data(),
-        levels.rep_level_data(),
-        None,
-        None,
-        None,
-    )
 }
 
 type FixedLenByteArraySource<'a> = Selected<'a, FixedLenByteArrayStorage<'a>>;
@@ -2084,6 +2029,394 @@ fn fixed_len_for_each_value<F: FnMut(&[u8]) -> Result<()>>(
     }
 }
 
+type Int32Source<'a> = Selected<'a, Int32Storage<'a>>;
+
+#[derive(Clone, Copy)]
+struct Int32Storage<'a> {
+    column: &'a dyn arrow_array::Array,
+}
+
+impl<'a> Int32Storage<'a> {
+    fn from_column(column: &'a dyn arrow_array::Array) -> Self {
+        Self { column }
+    }
+}
+
+impl<'a> ColumnValueSource<ColumnValueEncoderImpl<ParquetInt32Type>>
+    for Selected<'a, Int32Storage<'a>>
+{
+    fn len(self) -> usize {
+        Selected::len(self)
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Selected::slice(self, offset, len)
+    }
+
+    fn write_to(self, encoder: &mut ColumnValueEncoderImpl<ParquetInt32Type>) -> Result<()> {
+        write_int32_column(encoder, self.storage().column, self.selection())
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        let per = std::mem::size_of::<i32>().max(1);
+        Some((budget / per).max(1).min(Selected::len(self)))
+    }
+}
+
+fn write_int32_column(
+    encoder: &mut ColumnValueEncoderImpl<ParquetInt32Type>,
+    column: &dyn arrow_array::Array,
+    selection: ValueSelection<'_>,
+) -> Result<()> {
+    match dispatch_dictionary_input(column, selection)? {
+        DictionaryInput::Direct { values, indices }
+        | DictionaryInput::NonDictionary { values, indices } => {
+            write_int32_column_indices(encoder, values, indices)
+        }
+        DictionaryInput::Defaulted { values, indices } => {
+            write_int32_column_defaulted(encoder, values, indices)
+        }
+    }
+}
+
+fn write_int32_column_indices(
+    encoder: &mut ColumnValueEncoderImpl<ParquetInt32Type>,
+    column: &dyn arrow_array::Array,
+    indices: ValueIndices<'_>,
+) -> Result<()> {
+    let values = match column.data_type() {
+        ArrowDataType::Null => {
+            let zeros = vec![0i32; column.len()];
+            return encoder.write_int32_values(Int32Values::i32(&zeros, indices));
+        }
+        ArrowDataType::Int8 => Int32Values::i8(column.as_primitive::<Int8Type>().values(), indices),
+        ArrowDataType::Int16 => {
+            Int32Values::i16(column.as_primitive::<Int16Type>().values(), indices)
+        }
+        ArrowDataType::Int32 => {
+            Int32Values::i32(column.as_primitive::<Int32Type>().values(), indices)
+        }
+        ArrowDataType::UInt8 => {
+            Int32Values::u8(column.as_primitive::<UInt8Type>().values(), indices)
+        }
+        ArrowDataType::UInt16 => {
+            Int32Values::u16(column.as_primitive::<UInt16Type>().values(), indices)
+        }
+        // Follow the C++ implementation and use an overflow/reinterpret cast from
+        // u32 to i32, which maps `(i32::MAX as u32)..u32::MAX` to `i32::MIN..0`.
+        ArrowDataType::UInt32 => Int32Values::i32(
+            column
+                .as_primitive::<UInt32Type>()
+                .values()
+                .inner()
+                .typed_data(),
+            indices,
+        ),
+        ArrowDataType::Date32 => {
+            Int32Values::i32(column.as_primitive::<Date32Type>().values(), indices)
+        }
+        // Date64 is in milliseconds; truncate to days for the INT32 date
+        // representation (86_400_000 ms per day).
+        ArrowDataType::Date64 => {
+            Int32Values::date64_days(column.as_primitive::<Date64Type>().values(), indices)
+        }
+        ArrowDataType::Time32(TimeUnit::Second) => {
+            Int32Values::i32(column.as_primitive::<Time32SecondType>().values(), indices)
+        }
+        ArrowDataType::Time32(TimeUnit::Millisecond) => Int32Values::i32(
+            column.as_primitive::<Time32MillisecondType>().values(),
+            indices,
+        ),
+        ArrowDataType::Decimal32(_, _) => {
+            Int32Values::i32(column.as_primitive::<Decimal32Type>().values(), indices)
+        }
+        // Represent the decimal using int32 at reduced precision.
+        ArrowDataType::Decimal64(_, _) => {
+            Int32Values::i64_cast(column.as_primitive::<Decimal64Type>().values(), indices)
+        }
+        // Represent the decimal using int32 at reduced precision.
+        ArrowDataType::Decimal128(_, _) => {
+            Int32Values::i128_cast(column.as_primitive::<Decimal128Type>().values(), indices)
+        }
+        // Represent the decimal using int32 at reduced precision.
+        ArrowDataType::Decimal256(_, _) => {
+            Int32Values::i256_cast(column.as_primitive::<Decimal256Type>().values(), indices)
+        }
+        d => return Err(ParquetError::General(format!("Cannot coerce {d} to I32"))),
+    };
+    encoder.write_int32_values(values)
+}
+
+fn write_int32_column_defaulted(
+    encoder: &mut ColumnValueEncoderImpl<ParquetInt32Type>,
+    column: &dyn arrow_array::Array,
+    indices: DefaultedDictionaryValueIndices<'_>,
+) -> Result<()> {
+    match column.data_type() {
+        ArrowDataType::Null => encoder.fold_value_stream(defaulted_null_values::<i32>(indices)),
+        ArrowDataType::Int8 => {
+            fold_defaulted_primitive!(encoder, column, indices, Int8Type, |v| v as i32)
+        }
+        ArrowDataType::Int16 => {
+            fold_defaulted_primitive!(encoder, column, indices, Int16Type, |v| v as i32)
+        }
+        ArrowDataType::Int32 => {
+            fold_defaulted_primitive!(encoder, column, indices, Int32Type, |v| v)
+        }
+        ArrowDataType::UInt8 => {
+            fold_defaulted_primitive!(encoder, column, indices, UInt8Type, |v| v as i32)
+        }
+        ArrowDataType::UInt16 => {
+            fold_defaulted_primitive!(encoder, column, indices, UInt16Type, |v| v as i32)
+        }
+        ArrowDataType::UInt32 => {
+            fold_defaulted_primitive!(@typed_data encoder, column, indices, UInt32Type, |v| v)
+        }
+        ArrowDataType::Date32 => {
+            fold_defaulted_primitive!(encoder, column, indices, Date32Type, |v| v)
+        }
+        ArrowDataType::Date64 => {
+            fold_defaulted_primitive!(encoder, column, indices, Date64Type, date64_millis_to_days)
+        }
+        ArrowDataType::Time32(TimeUnit::Second) => {
+            fold_defaulted_primitive!(encoder, column, indices, Time32SecondType, |v| v)
+        }
+        ArrowDataType::Time32(TimeUnit::Millisecond) => {
+            fold_defaulted_primitive!(encoder, column, indices, Time32MillisecondType, |v| v)
+        }
+        ArrowDataType::Decimal32(_, _) => {
+            fold_defaulted_primitive!(encoder, column, indices, Decimal32Type, |v| v)
+        }
+        ArrowDataType::Decimal64(_, _) => {
+            fold_defaulted_primitive!(encoder, column, indices, Decimal64Type, |v| v as i32)
+        }
+        ArrowDataType::Decimal128(_, _) => {
+            fold_defaulted_primitive!(encoder, column, indices, Decimal128Type, |v| v as i32)
+        }
+        ArrowDataType::Decimal256(_, _) => {
+            fold_defaulted_primitive!(encoder, column, indices, Decimal256Type, decimal256_to_i32)
+        }
+        d => Err(ParquetError::General(format!("Cannot coerce {d} to I32"))),
+    }
+}
+
+type Int64Source<'a> = Selected<'a, Int64Storage<'a>>;
+
+#[derive(Clone, Copy)]
+struct Int64Storage<'a> {
+    column: &'a dyn arrow_array::Array,
+}
+
+impl<'a> Int64Storage<'a> {
+    fn from_column(column: &'a dyn arrow_array::Array) -> Self {
+        Self { column }
+    }
+}
+
+impl<'a> ColumnValueSource<ColumnValueEncoderImpl<ParquetInt64Type>>
+    for Selected<'a, Int64Storage<'a>>
+{
+    fn len(self) -> usize {
+        Selected::len(self)
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Selected::slice(self, offset, len)
+    }
+
+    fn write_to(self, encoder: &mut ColumnValueEncoderImpl<ParquetInt64Type>) -> Result<()> {
+        write_int64_column(encoder, self.storage().column, self.selection())
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        let per = std::mem::size_of::<i64>().max(1);
+        Some((budget / per).max(1).min(Selected::len(self)))
+    }
+}
+
+fn write_int64_column(
+    encoder: &mut ColumnValueEncoderImpl<ParquetInt64Type>,
+    column: &dyn arrow_array::Array,
+    selection: ValueSelection<'_>,
+) -> Result<()> {
+    match dispatch_dictionary_input(column, selection)? {
+        DictionaryInput::Direct { values, indices }
+        | DictionaryInput::NonDictionary { values, indices } => {
+            write_int64_column_indices(encoder, values, indices)
+        }
+        DictionaryInput::Defaulted { values, indices } => {
+            write_int64_column_defaulted(encoder, values, indices)
+        }
+    }
+}
+
+fn write_int64_column_indices(
+    encoder: &mut ColumnValueEncoderImpl<ParquetInt64Type>,
+    column: &dyn arrow_array::Array,
+    indices: ValueIndices<'_>,
+) -> Result<()> {
+    let values = match column.data_type() {
+        ArrowDataType::Int64 => {
+            Int64Values::i64(column.as_primitive::<Int64Type>().values(), indices)
+        }
+        // Follow the C++ implementation and use an overflow/reinterpret cast from
+        // u64 to i64, which maps `(i64::MAX as u64)..u64::MAX` to `i64::MIN..0`.
+        ArrowDataType::UInt64 => Int64Values::i64(
+            column
+                .as_primitive::<UInt64Type>()
+                .values()
+                .inner()
+                .typed_data(),
+            indices,
+        ),
+        ArrowDataType::Date64 => {
+            Int64Values::i64(column.as_primitive::<Date64Type>().values(), indices)
+        }
+        ArrowDataType::Time64(TimeUnit::Microsecond) => Int64Values::i64(
+            column.as_primitive::<Time64MicrosecondType>().values(),
+            indices,
+        ),
+        ArrowDataType::Time64(TimeUnit::Nanosecond) => Int64Values::i64(
+            column.as_primitive::<Time64NanosecondType>().values(),
+            indices,
+        ),
+        ArrowDataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => Int64Values::i64(
+                column.as_primitive::<TimestampSecondType>().values(),
+                indices,
+            ),
+            TimeUnit::Millisecond => Int64Values::i64(
+                column.as_primitive::<TimestampMillisecondType>().values(),
+                indices,
+            ),
+            TimeUnit::Microsecond => Int64Values::i64(
+                column.as_primitive::<TimestampMicrosecondType>().values(),
+                indices,
+            ),
+            TimeUnit::Nanosecond => Int64Values::i64(
+                column.as_primitive::<TimestampNanosecondType>().values(),
+                indices,
+            ),
+        },
+        ArrowDataType::Duration(unit) => match unit {
+            TimeUnit::Second => Int64Values::i64(
+                column.as_primitive::<DurationSecondType>().values(),
+                indices,
+            ),
+            TimeUnit::Millisecond => Int64Values::i64(
+                column.as_primitive::<DurationMillisecondType>().values(),
+                indices,
+            ),
+            TimeUnit::Microsecond => Int64Values::i64(
+                column.as_primitive::<DurationMicrosecondType>().values(),
+                indices,
+            ),
+            TimeUnit::Nanosecond => Int64Values::i64(
+                column.as_primitive::<DurationNanosecondType>().values(),
+                indices,
+            ),
+        },
+        ArrowDataType::Decimal64(_, _) => {
+            Int64Values::i64(column.as_primitive::<Decimal64Type>().values(), indices)
+        }
+        // Represent the decimal using int64 at reduced precision.
+        ArrowDataType::Decimal128(_, _) => {
+            Int64Values::i128_cast(column.as_primitive::<Decimal128Type>().values(), indices)
+        }
+        // Represent the decimal using int64 at reduced precision.
+        ArrowDataType::Decimal256(_, _) => {
+            Int64Values::i256_cast(column.as_primitive::<Decimal256Type>().values(), indices)
+        }
+        d => return Err(ParquetError::General(format!("Cannot coerce {d} to I64"))),
+    };
+    encoder.write_int64_values(values)
+}
+
+fn write_int64_column_defaulted(
+    encoder: &mut ColumnValueEncoderImpl<ParquetInt64Type>,
+    column: &dyn arrow_array::Array,
+    indices: DefaultedDictionaryValueIndices<'_>,
+) -> Result<()> {
+    match column.data_type() {
+        ArrowDataType::Int64 => {
+            fold_defaulted_primitive!(encoder, column, indices, Int64Type, |v| v)
+        }
+        ArrowDataType::UInt64 => {
+            fold_defaulted_primitive!(@typed_data encoder, column, indices, UInt64Type, |v| v)
+        }
+        ArrowDataType::Date64 => {
+            fold_defaulted_primitive!(encoder, column, indices, Date64Type, |v| v)
+        }
+        ArrowDataType::Time64(TimeUnit::Microsecond) => {
+            fold_defaulted_primitive!(encoder, column, indices, Time64MicrosecondType, |v| v)
+        }
+        ArrowDataType::Time64(TimeUnit::Nanosecond) => {
+            fold_defaulted_primitive!(encoder, column, indices, Time64NanosecondType, |v| v)
+        }
+        ArrowDataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => {
+                fold_defaulted_primitive!(encoder, column, indices, TimestampSecondType, |v| v)
+            }
+            TimeUnit::Millisecond => {
+                fold_defaulted_primitive!(encoder, column, indices, TimestampMillisecondType, |v| v)
+            }
+            TimeUnit::Microsecond => {
+                fold_defaulted_primitive!(encoder, column, indices, TimestampMicrosecondType, |v| v)
+            }
+            TimeUnit::Nanosecond => {
+                fold_defaulted_primitive!(encoder, column, indices, TimestampNanosecondType, |v| v)
+            }
+        },
+        ArrowDataType::Duration(unit) => match unit {
+            TimeUnit::Second => {
+                fold_defaulted_primitive!(encoder, column, indices, DurationSecondType, |v| v)
+            }
+            TimeUnit::Millisecond => {
+                fold_defaulted_primitive!(encoder, column, indices, DurationMillisecondType, |v| v)
+            }
+            TimeUnit::Microsecond => {
+                fold_defaulted_primitive!(encoder, column, indices, DurationMicrosecondType, |v| v)
+            }
+            TimeUnit::Nanosecond => {
+                fold_defaulted_primitive!(encoder, column, indices, DurationNanosecondType, |v| v)
+            }
+        },
+        ArrowDataType::Decimal64(_, _) => {
+            fold_defaulted_primitive!(encoder, column, indices, Decimal64Type, |v| v)
+        }
+        ArrowDataType::Decimal128(_, _) => {
+            fold_defaulted_primitive!(encoder, column, indices, Decimal128Type, |v| v as i64)
+        }
+        ArrowDataType::Decimal256(_, _) => {
+            fold_defaulted_primitive!(encoder, column, indices, Decimal256Type, decimal256_to_i64)
+        }
+        d => Err(ParquetError::General(format!("Cannot coerce {d} to I64"))),
+    }
+}
+
+fn write_bool_column(
+    writer: &mut GenericColumnWriter<ColumnValueEncoderImpl<BoolType>>,
+    column: &dyn arrow_array::Array,
+    levels: ArrayLevelsView<'_>,
+) -> Result<usize> {
+    let selection = levels.value_selection();
+    let array = column.as_boolean();
+    writer.write_batch_internal(
+        BoolSource::new(BoolStorage::from_array(array), value_indices(selection)),
+        levels.def_level_data(),
+        levels.rep_level_data(),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Generates the float/double Arrow→parquet bridge: the `*Source` /
+/// `Defaulted*Source` [`ColumnValueSource`] adapters, the `write_*_column`
+/// entry point, and the `write_f*_values` helper. Float and double differ only
+/// by the element type and the Arrow/parquet type tags, so they share this
+/// macro (the integer bridges can't: their Arrow→physical cast matrices accept
+/// disjoint Arrow types).
 macro_rules! primitive_float_bridge {
     (
         $native:ty,
@@ -2091,6 +2424,7 @@ macro_rules! primitive_float_bridge {
         $parquet_ty:ty,
         $values:ident,
         $source:ident,
+        $defaulted_source:ident,
         $write_column:ident,
         $write_values_fn:ident,
         $encoder_method:ident
@@ -2129,21 +2463,72 @@ macro_rules! primitive_float_bridge {
             }
         }
 
+        #[derive(Clone, Copy)]
+        struct $defaulted_source<'a> {
+            values: &'a [$native],
+            indices: DefaultedDictionaryValueIndices<'a>,
+        }
+
+        impl<'a> $defaulted_source<'a> {
+            fn new(values: &'a [$native], indices: DefaultedDictionaryValueIndices<'a>) -> Self {
+                Self { values, indices }
+            }
+        }
+
+        impl<'a> ColumnValueSource<ColumnValueEncoderImpl<$parquet_ty>> for $defaulted_source<'a> {
+            fn len(self) -> usize {
+                self.indices.len()
+            }
+
+            fn slice(self, offset: usize, len: usize) -> Self {
+                Self {
+                    values: self.values,
+                    indices: self.indices.slice(offset, len),
+                }
+            }
+
+            fn write_to(self, encoder: &mut ColumnValueEncoderImpl<$parquet_ty>) -> Result<()> {
+                encoder.fold_value_stream(defaulted_values(self.values, self.indices, |v| v))
+            }
+
+            fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+                let per = std::mem::size_of::<$native>().max(1);
+                Some((budget / per).max(1).min(self.indices.len()))
+            }
+        }
+
         fn $write_column(
             writer: &mut GenericColumnWriter<ColumnValueEncoderImpl<$parquet_ty>>,
             column: &dyn arrow_array::Array,
             levels: ArrayLevelsView<'_>,
         ) -> Result<usize> {
             let selection = levels.value_selection();
-            let array = column.as_primitive::<$arrow_ty>();
-            writer.write_batch_internal(
-                $source::new(array.values().as_ref(), value_indices(selection)),
-                levels.def_level_data(),
-                levels.rep_level_data(),
-                None,
-                None,
-                None,
-            )
+
+            match dispatch_dictionary_input(column, selection)? {
+                DictionaryInput::Direct { values, indices }
+                | DictionaryInput::NonDictionary { values, indices } => {
+                    let array = values.as_primitive::<$arrow_ty>();
+                    return writer.write_batch_internal(
+                        $source::new(array.values().as_ref(), indices),
+                        levels.def_level_data(),
+                        levels.rep_level_data(),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                DictionaryInput::Defaulted { values, indices } => {
+                    let array = values.as_primitive::<$arrow_ty>();
+                    return writer.write_batch_internal(
+                        $defaulted_source::new(array.values().as_ref(), indices),
+                        levels.def_level_data(),
+                        levels.rep_level_data(),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }
         }
 
         fn $write_values_fn(
@@ -2162,6 +2547,7 @@ primitive_float_bridge!(
     ParquetFloatType,
     FloatValues,
     FloatSource,
+    DefaultedFloatSource,
     write_float_column,
     write_f32_values,
     write_float_values
@@ -2172,6 +2558,7 @@ primitive_float_bridge!(
     ParquetDoubleType,
     DoubleValues,
     DoubleSource,
+    DefaultedDoubleSource,
     write_double_column,
     write_f64_values,
     write_double_values
@@ -2219,6 +2606,14 @@ fn write_leaf(
             None,
             None,
         ),
+    }
+}
+
+fn value_indices(selection: ValueSelection<'_>) -> ValueIndices<'_> {
+    match selection {
+        ValueSelection::Empty => ValueIndices::Empty,
+        ValueSelection::Dense { offset, len } => ValueIndices::Dense { offset, len },
+        ValueSelection::Sparse(indices) => ValueIndices::Sparse(indices),
     }
 }
 
@@ -3174,6 +3569,41 @@ mod tests {
         test_fixed_size_binary_in_dict_inner::<Int16Type>();
         test_fixed_size_binary_in_dict_inner::<Int32Type>();
         test_fixed_size_binary_in_dict_inner::<Int64Type>();
+    }
+
+    #[test]
+    fn test_fixed_size_binary_zero_width_write() {
+        let mut builder = FixedSizeBinaryBuilder::new(0);
+        builder.append_value(b"").unwrap();
+        builder.append_value(b"").unwrap();
+        builder.append_value(b"").unwrap();
+
+        let array: ArrayRef = Arc::new(builder.finish());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::FixedSizeBinary(0),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+
+        for props in [
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .build(),
+            WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_1_0)
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::BYTE_STREAM_SPLIT)
+                .build(),
+        ] {
+            let mut file = vec![];
+            let mut writer = ArrowWriter::try_new(&mut file, schema.clone(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            let metadata = writer.close().unwrap();
+
+            assert_eq!(metadata.file_metadata().num_rows(), 3);
+            assert_eq!(metadata.row_groups()[0].column(0).num_values(), 3);
+        }
     }
 
     #[test]
@@ -4506,6 +4936,116 @@ mod tests {
     }
 
     #[test]
+    fn arrow_writer_boolean_dictionary() {
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Boolean,
+            true,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Boolean)),
+            true,
+        )]));
+        let keys = UInt8Array::from(vec![Some(0), Some(1), None, Some(0), Some(1)]);
+        let values = BooleanArray::from(vec![Some(true), Some(false)]);
+        let array = DictionaryArray::<UInt8Type>::new(keys, Arc::new(values));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let expected = RecordBatch::try_new(
+            writer_schema,
+            vec![Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                None,
+                Some(true),
+                Some(false),
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn arrow_writer_required_primitive_dictionary_with_null_key() {
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Int32,
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
+            true,
+        )]));
+
+        let keys = Int32Array::new(
+            vec![0, 99, 1].into(),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let values = Int32Array::from(vec![10, 20]);
+        let array = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let expected = RecordBatch::try_new(
+            writer_schema,
+            vec![Arc::new(Int32Array::from(vec![10, 0, 20]))],
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn arrow_writer_required_primitive_dictionary_with_null_value() {
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Int32,
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
+            true,
+        )]));
+
+        let keys = Int32Array::from(vec![0, 1, 2]);
+        let values = Int32Array::new(
+            vec![10, 99, 20].into(),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let array = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let expected = RecordBatch::try_new(
+            writer_schema,
+            vec![Arc::new(Int32Array::from(vec![10, 0, 20]))],
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn arrow_writer_decimal32_dictionary() {
         let integers = vec![12345, 56789, 34567];
 
@@ -4566,6 +5106,92 @@ mod tests {
 
         let array = array.with_values(Arc::new(values));
         one_column_roundtrip(Arc::new(array), true);
+    }
+
+    #[test]
+    fn arrow_writer_fixed_len_decimal128_dictionary() {
+        // Precision > 18 routes Decimal128 through the generic FLBA writer, not
+        // the numeric dictionary path or FixedSizeBinary's byte-array writer.
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Decimal128(30, 2),
+            true,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(
+                Box::new(DataType::UInt8),
+                Box::new(DataType::Decimal128(30, 2)),
+            ),
+            true,
+        )]));
+        let integers = vec![12345, 56789, 34567];
+        let keys = UInt8Array::from(vec![Some(0), None, Some(1), Some(2), Some(1)]);
+        let values = Decimal128Array::from(integers)
+            .with_precision_and_scale(30, 2)
+            .unwrap();
+        let array = DictionaryArray::<UInt8Type>::new(keys, Arc::new(values));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let expected_values = Decimal128Array::from(vec![
+            Some(12345),
+            None,
+            Some(56789),
+            Some(34567),
+            Some(56789),
+        ])
+        .with_precision_and_scale(30, 2)
+        .unwrap();
+        let expected =
+            RecordBatch::try_new(writer_schema, vec![Arc::new(expected_values)]).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn arrow_writer_float16_dictionary() {
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Float16,
+            true,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Float16)),
+            true,
+        )]));
+        let keys = UInt8Array::from(vec![Some(0), None, Some(1), Some(2), Some(1)]);
+        let values = Float16Array::from(vec![
+            f16::from_f32(1.25),
+            f16::from_f32(-2.5),
+            f16::from_f32(4.0),
+        ]);
+        let array = DictionaryArray::<UInt8Type>::new(keys, Arc::new(values));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let expected_values = Float16Array::from(vec![
+            Some(f16::from_f32(1.25)),
+            None,
+            Some(f16::from_f32(-2.5)),
+            Some(f16::from_f32(4.0)),
+            Some(f16::from_f32(-2.5)),
+        ]);
+        let expected =
+            RecordBatch::try_new(writer_schema, vec![Arc::new(expected_values)]).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

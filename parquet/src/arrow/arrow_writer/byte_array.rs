@@ -188,7 +188,7 @@ impl FallbackEncoder {
             }
             FallbackEncoderImpl::DeltaLength { buffer, lengths } => {
                 for &value in values {
-                    lengths.put(&[value.len() as i32]).unwrap();
+                    lengths.put_i64(value.len() as i64).unwrap();
                     buffer.extend_from_slice(value);
                     self.variable_length_bytes += value.len() as i64;
                 }
@@ -215,8 +215,8 @@ impl FallbackEncoder {
                     last_value.extend_from_slice(value);
 
                     buffer.extend_from_slice(&value[prefix_length..]);
-                    prefix_lengths.put(&[prefix_length as i32]).unwrap();
-                    suffix_lengths.put(&[suffix_length as i32]).unwrap();
+                    prefix_lengths.put_i64(prefix_length as i64).unwrap();
+                    suffix_lengths.put_i64(suffix_length as i64).unwrap();
                     self.variable_length_bytes += value.len() as i64;
                 }
             }

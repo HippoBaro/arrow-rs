@@ -20,6 +20,8 @@
 use std::{cmp, marker::PhantomData};
 
 use crate::basic::*;
+#[cfg(feature = "arrow")]
+use crate::column::writer::ValueSelection;
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::*;
 use crate::encodings::rle::RleEncoder;
@@ -32,7 +34,7 @@ use crate::util::bit_util::get_bit;
 #[cfg(feature = "arrow")]
 use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
 #[cfg(feature = "arrow")]
-use arrow_buffer::i256;
+use arrow_buffer::{ArrowNativeType, NullBuffer, i256};
 use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamSplitEncoder};
 use bytes::Bytes;
 pub use dict_encoder::DictEncoder;
@@ -82,6 +84,224 @@ pub trait Encoder<T: DataType>: Send {
     /// Flushes the underlying byte buffer that's being processed by this encoder, and
     /// return the immutable copy of it. This will also reset the internal state.
     fn flush_buffer(&mut self) -> Result<Bytes>;
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DictionaryValueIndices<'a> {
+    I8(&'a [i8], ValueSelection<'a>),
+    I16(&'a [i16], ValueSelection<'a>),
+    I32(&'a [i32], ValueSelection<'a>),
+    I64(&'a [i64], ValueSelection<'a>),
+    U8(&'a [u8], ValueSelection<'a>),
+    U16(&'a [u16], ValueSelection<'a>),
+    U32(&'a [u32], ValueSelection<'a>),
+    U64(&'a [u64], ValueSelection<'a>),
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> DictionaryValueIndices<'a> {
+    pub(crate) fn i8(keys: &'a [i8], selection: ValueSelection<'a>) -> Self {
+        Self::I8(keys, selection)
+    }
+
+    pub(crate) fn i16(keys: &'a [i16], selection: ValueSelection<'a>) -> Self {
+        Self::I16(keys, selection)
+    }
+
+    pub(crate) fn i32(keys: &'a [i32], selection: ValueSelection<'a>) -> Self {
+        Self::I32(keys, selection)
+    }
+
+    pub(crate) fn i64(keys: &'a [i64], selection: ValueSelection<'a>) -> Self {
+        Self::I64(keys, selection)
+    }
+
+    pub(crate) fn u8(keys: &'a [u8], selection: ValueSelection<'a>) -> Self {
+        Self::U8(keys, selection)
+    }
+
+    pub(crate) fn u16(keys: &'a [u16], selection: ValueSelection<'a>) -> Self {
+        Self::U16(keys, selection)
+    }
+
+    pub(crate) fn u32(keys: &'a [u32], selection: ValueSelection<'a>) -> Self {
+        Self::U32(keys, selection)
+    }
+
+    pub(crate) fn u64(keys: &'a [u64], selection: ValueSelection<'a>) -> Self {
+        Self::U64(keys, selection)
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::I8(_, selection)
+            | Self::I16(_, selection)
+            | Self::I32(_, selection)
+            | Self::I64(_, selection)
+            | Self::U8(_, selection)
+            | Self::U16(_, selection)
+            | Self::U32(_, selection)
+            | Self::U64(_, selection) => selection.len(),
+        }
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        match self {
+            Self::I8(keys, selection) => Self::I8(keys, selection.slice(offset, len)),
+            Self::I16(keys, selection) => Self::I16(keys, selection.slice(offset, len)),
+            Self::I32(keys, selection) => Self::I32(keys, selection.slice(offset, len)),
+            Self::I64(keys, selection) => Self::I64(keys, selection.slice(offset, len)),
+            Self::U8(keys, selection) => Self::U8(keys, selection.slice(offset, len)),
+            Self::U16(keys, selection) => Self::U16(keys, selection.slice(offset, len)),
+            Self::U32(keys, selection) => Self::U32(keys, selection.slice(offset, len)),
+            Self::U64(keys, selection) => Self::U64(keys, selection.slice(offset, len)),
+        }
+    }
+
+    #[inline(always)]
+    fn index_at(self, idx: usize) -> usize {
+        match self {
+            Self::I8(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::I16(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::I32(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::I64(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::U8(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::U16(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::U32(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+            Self::U64(keys, selection) => keys[selection.index_at(idx)].as_usize(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_for_each<E>(
+        self,
+        mut f: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::I8(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::I16(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::I32(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::I64(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::U8(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::U16(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::U32(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+            Self::U64(keys, selection) => selection.try_for_each(|idx| f(keys[idx].as_usize())),
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DefaultedDictionaryValueIndices<'a> {
+    indices: DictionaryValueIndices<'a>,
+    key_nulls: Option<&'a NullBuffer>,
+    value_nulls: Option<&'a NullBuffer>,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> DefaultedDictionaryValueIndices<'a> {
+    pub(crate) fn new(
+        indices: DictionaryValueIndices<'a>,
+        key_nulls: Option<&'a NullBuffer>,
+        value_nulls: Option<&'a NullBuffer>,
+    ) -> Self {
+        Self {
+            indices,
+            key_nulls,
+            value_nulls,
+        }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
+        Self {
+            indices: self.indices.slice(offset, len),
+            key_nulls: self.key_nulls,
+            value_nulls: self.value_nulls,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_for_each<E>(
+        self,
+        mut f: impl FnMut(Option<usize>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self.indices {
+            DictionaryValueIndices::I8(keys, selection) => {
+                self.try_for_each_key(keys, selection, &mut f)
+            }
+            DictionaryValueIndices::I16(keys, selection) => {
+                self.try_for_each_key(keys, selection, &mut f)
+            }
+            DictionaryValueIndices::I32(keys, selection) => {
+                self.try_for_each_key(keys, selection, &mut f)
+            }
+            DictionaryValueIndices::I64(keys, selection) => {
+                self.try_for_each_key(keys, selection, &mut f)
+            }
+            DictionaryValueIndices::U8(keys, selection) => {
+                self.try_for_each_key(keys, selection, &mut f)
+            }
+            DictionaryValueIndices::U16(keys, selection) => {
+                self.try_for_each_key(keys, selection, &mut f)
+            }
+            DictionaryValueIndices::U32(keys, selection) => {
+                self.try_for_each_key(keys, selection, &mut f)
+            }
+            DictionaryValueIndices::U64(keys, selection) => {
+                self.try_for_each_key(keys, selection, &mut f)
+            }
+        }
+    }
+
+    #[inline]
+    fn try_for_each_key<K, E>(
+        self,
+        keys: &'a [K],
+        selection: ValueSelection<'a>,
+        f: &mut impl FnMut(Option<usize>) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        K: ArrowNativeType,
+    {
+        // Hoist the loop-invariant null-buffer presence out of the per-row loop
+        // by specializing on which of (key_nulls, value_nulls) are set. The
+        // common defaulted case (key nulls only) then skips the value-null arm,
+        // and the no-nulls case degenerates to a plain keyed gather.
+        match (self.key_nulls, self.value_nulls) {
+            (None, None) => selection.try_for_each(|row| f(Some(keys[row].as_usize()))),
+            (Some(key_nulls), None) => selection.try_for_each(|row| {
+                if key_nulls.is_null(row) {
+                    f(None)
+                } else {
+                    f(Some(keys[row].as_usize()))
+                }
+            }),
+            (None, Some(value_nulls)) => selection.try_for_each(|row| {
+                let idx = keys[row].as_usize();
+                if idx < value_nulls.len() && value_nulls.is_null(idx) {
+                    f(None)
+                } else {
+                    f(Some(idx))
+                }
+            }),
+            (Some(key_nulls), Some(value_nulls)) => selection.try_for_each(|row| {
+                if key_nulls.is_null(row) {
+                    return f(None);
+                }
+                let idx = keys[row].as_usize();
+                if idx < value_nulls.len() && value_nulls.is_null(idx) {
+                    f(None)
+                } else {
+                    f(Some(idx))
+                }
+            }),
+        }
+    }
 }
 
 /// Borrowed packed boolean values.
@@ -216,16 +436,26 @@ pub(crate) enum ValueIndices<'a> {
     Empty,
     Dense { offset: usize, len: usize },
     Sparse(&'a [usize]),
+    Dictionary(DictionaryValueIndices<'a>),
 }
 
 #[cfg(feature = "arrow")]
 impl<'a> ValueIndices<'a> {
+    pub(crate) fn dictionary(indices: DictionaryValueIndices<'a>) -> Self {
+        Self::Dictionary(indices)
+    }
+
     pub(crate) fn len(self) -> usize {
         match self {
             Self::Empty => 0,
             Self::Dense { len, .. } => len,
             Self::Sparse(indices) => indices.len(),
+            Self::Dictionary(indices) => indices.len(),
         }
+    }
+
+    pub(crate) fn is_sparse(self) -> bool {
+        matches!(self, Self::Sparse(_))
     }
 
     pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
@@ -243,6 +473,7 @@ impl<'a> ValueIndices<'a> {
                 len,
             },
             Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
+            Self::Dictionary(indices) => Self::Dictionary(indices.slice(offset, len)),
         }
     }
 
@@ -253,6 +484,7 @@ impl<'a> ValueIndices<'a> {
             Self::Empty => unreachable!("empty indices have no values"),
             Self::Dense { offset, .. } => offset + idx,
             Self::Sparse(indices) => indices[idx],
+            Self::Dictionary(indices) => indices.index_at(idx),
         }
     }
 
@@ -275,6 +507,7 @@ impl<'a> ValueIndices<'a> {
                 }
                 Ok(())
             }
+            Self::Dictionary(indices) => indices.try_for_each(f),
         }
     }
 }
@@ -526,7 +759,7 @@ impl<'a> ValueStream<'a, f32> for FloatValues<'a> {
     fn bulk(self) -> Option<&'a [f32]> {
         match self.indices {
             ValueIndices::Dense { offset, len } => Some(&self.values[offset..offset + len]),
-            ValueIndices::Empty | ValueIndices::Sparse(_) => None,
+            ValueIndices::Empty | ValueIndices::Sparse(_) | ValueIndices::Dictionary(_) => None,
         }
     }
 
@@ -563,7 +796,7 @@ impl<'a> ValueStream<'a, f64> for DoubleValues<'a> {
     fn bulk(self) -> Option<&'a [f64]> {
         match self.indices {
             ValueIndices::Dense { offset, len } => Some(&self.values[offset..offset + len]),
-            ValueIndices::Empty | ValueIndices::Sparse(_) => None,
+            ValueIndices::Empty | ValueIndices::Sparse(_) | ValueIndices::Dictionary(_) => None,
         }
     }
 
@@ -714,6 +947,59 @@ impl<'a> Iterator for FixedLenByteArrayValueIter<'a> {
 
 #[cfg(feature = "arrow")]
 impl ExactSizeIterator for FixedLenByteArrayValueIter<'_> {}
+
+/// [`ValueStream`] for a dictionary selection that substitutes a default value
+/// for null keys or null dictionary values.
+#[cfg(feature = "arrow")]
+#[derive(Clone, Copy)]
+pub(crate) struct DefaultedValues<'a, T, F> {
+    indices: DefaultedDictionaryValueIndices<'a>,
+    map: F,
+    _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a, T, F> DefaultedValues<'a, T, F>
+where
+    T: Copy + Default + 'a,
+    F: Fn(Option<usize>) -> T + Copy,
+{
+    #[inline]
+    pub(crate) fn new(indices: DefaultedDictionaryValueIndices<'a>, map: F) -> Self {
+        Self {
+            indices,
+            map,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+impl<'a, T, F> ValueStream<'a, T> for DefaultedValues<'a, T, F>
+where
+    T: Copy + Default + 'a,
+    F: Fn(Option<usize>) -> T + Copy + 'a,
+{
+    // A defaulted dictionary is always a keyed gather (each row maps through the
+    // keys and substitutes a default for nulls), so there is never a contiguous
+    // run to hand over — it always tiles.
+    type Bulk = [T];
+
+    #[inline]
+    fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [T]> {
+        None
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(T) -> Result<(), E>) -> Result<(), E> {
+        self.indices.try_for_each(|opt| f((self.map)(opt)))
+    }
+}
 
 /// Encodes packed boolean values.
 ///
@@ -1472,30 +1758,44 @@ impl<T: DataType> DeltaBitPackEncoder<T> {
         );
         Ok(())
     }
-}
 
-// Implementation is shared between Int32Type and Int64Type,
-// see `DeltaBitPackEncoderConversion` below for specifics.
-impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
-    fn put(&mut self, values: &[T::T]) -> Result<()> {
-        if values.is_empty() {
+    #[inline]
+    #[cfg(feature = "arrow")]
+    pub(crate) fn put_i64(&mut self, value: i64) -> Result<()> {
+        if self.total_values == 0 {
+            self.first_value = value;
+            self.current_value = value;
+            self.total_values = 1;
             return Ok(());
         }
 
-        // Define values to encode, initialize state
+        self.total_values += 1;
+        self.deltas[self.values_in_block] = self.subtract(value, self.current_value);
+        self.current_value = value;
+        self.values_in_block += 1;
+        if self.values_in_block == self.block_size {
+            self.flush_block_values()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn put_i64_values(&mut self, len: usize, mut value_at: impl FnMut(usize) -> i64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
         let mut idx = if self.total_values == 0 {
-            self.first_value = self.as_i64(values, 0);
+            self.first_value = value_at(0);
             self.current_value = self.first_value;
             1
         } else {
             0
         };
-        // Add all values (including first value)
-        self.total_values += values.len();
+        self.total_values += len;
 
-        // Write block
-        while idx < values.len() {
-            let value = self.as_i64(values, idx);
+        while idx < len {
+            let value = value_at(idx);
             self.deltas[self.values_in_block] = self.subtract(value, self.current_value);
             self.current_value = value;
             idx += 1;
@@ -1505,6 +1805,16 @@ impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
             }
         }
         Ok(())
+    }
+}
+
+// Implementation is shared between Int32Type and Int64Type,
+// see `DeltaBitPackEncoderConversion` below for specifics.
+impl<T: DataType> Encoder<T> for DeltaBitPackEncoder<T> {
+    fn put(&mut self, values: &[T::T]) -> Result<()> {
+        self.put_i64_values(values.len(), |idx| {
+            values[idx].as_i64().expect(DELTA_BIT_PACK_TYPE_ERROR)
+        })
     }
 
     // Performance Note:
@@ -1559,8 +1869,6 @@ trait DeltaBitPackEncoderConversion<T: DataType> {
     // Method should panic if type is not supported, otherwise no-op
     fn assert_supported_type();
 
-    fn as_i64(&self, values: &[T::T], index: usize) -> i64;
-
     fn subtract(&self, left: i64, right: i64) -> i64;
 
     fn subtract_u64(&self, left: i64, right: i64) -> u64;
@@ -1573,11 +1881,6 @@ impl<T: DataType> DeltaBitPackEncoderConversion<T> for DeltaBitPackEncoder<T> {
     #[inline]
     fn assert_supported_type() {
         ensure_phys_ty!(Type::INT32 | Type::INT64, "{}", DELTA_BIT_PACK_TYPE_ERROR);
-    }
-
-    #[inline]
-    fn as_i64(&self, values: &[T::T], index: usize) -> i64 {
-        values[index].as_i64().expect(DELTA_BIT_PACK_TYPE_ERROR)
     }
 
     #[inline]
@@ -1900,6 +2203,75 @@ mod tests {
     use crate::util::test_common::rand_gen::{RandGen, random_bytes};
 
     const TEST_SET_SIZE: usize = 1024;
+
+    /// A [`ChunkSink`] that simply collects every value handed to it, so a test
+    /// can assert which values a [`ValueStream`] selects/converts via `write_into`
+    /// and in what order.
+    #[cfg(feature = "arrow")]
+    #[derive(Default)]
+    struct CollectSink<T> {
+        values: Vec<T>,
+    }
+
+    #[cfg(feature = "arrow")]
+    impl<T: Clone> ChunkSink<[T]> for CollectSink<T> {
+        fn consume(&mut self, chunk: &[T]) -> Result<()> {
+            self.values.extend_from_slice(chunk);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn write_into_int32_dense_pushes_whole_slice() {
+        let mut sink = CollectSink::<i32>::default();
+        let values = [1, 2, 3, 4];
+
+        Int32Values::i32(&values, ValueIndices::Dense { offset: 1, len: 2 })
+            .write_into(&mut sink)
+            .unwrap();
+
+        assert_eq!(sink.values, [2, 3]);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn write_into_int32_gathers_converted_values() {
+        let mut sink = CollectSink::<i32>::default();
+        let values = [1i8, 2, 3, 4];
+
+        Int32Values::i8(&values, ValueIndices::Dense { offset: 1, len: 2 })
+            .write_into(&mut sink)
+            .unwrap();
+
+        assert_eq!(sink.values, [2, 3]);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn write_into_int64_dense_pushes_whole_slice() {
+        let mut sink = CollectSink::<i64>::default();
+        let values = [1, 2, 3, 4];
+
+        Int64Values::i64(&values, ValueIndices::Dense { offset: 1, len: 2 })
+            .write_into(&mut sink)
+            .unwrap();
+
+        assert_eq!(sink.values, [2, 3]);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn write_into_int64_gathers_converted_values() {
+        let mut sink = CollectSink::<i64>::default();
+        let values = [1i128, 2, 3, 4];
+
+        Int64Values::i128_cast(&values, ValueIndices::Dense { offset: 1, len: 2 })
+            .write_into(&mut sink)
+            .unwrap();
+
+        assert_eq!(sink.values, [2, 3]);
+    }
 
     #[test]
     fn test_get_encoders() {

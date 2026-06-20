@@ -44,6 +44,7 @@ impl<T: DataType> Storage for KeyStorage<T> {
     type Key = u64;
     type Value = T::T;
 
+    #[inline]
     fn get(&self, idx: Self::Key) -> &Self::Value {
         &self.uniques[idx as usize]
     }
@@ -145,8 +146,14 @@ impl<T: DataType> DictEncoder<T> {
         Ok(encoder.consume().into())
     }
 
+    #[inline]
     fn put_one(&mut self, value: &T::T) {
         self.indices.push(self.interner.intern(value));
+    }
+
+    #[inline]
+    pub(crate) fn put_value(&mut self, value: &T::T) {
+        self.put_one(value);
     }
 
     /// Intern a value by its raw bytes, constructing the owned `T::T` (via `make`)
@@ -157,6 +164,14 @@ impl<T: DataType> DictEncoder<T> {
     #[inline]
     pub(crate) fn put_value_bytes(&mut self, bytes: &[u8], make: impl FnOnce() -> T::T) {
         self.indices.push(self.interner.intern_bytes(bytes, make));
+    }
+
+    /// Reserve capacity for `additional` more dictionary indices, so the
+    /// per-value [`Self::put_value`] pushes on the streaming intern path
+    /// amortize their growth (matching the bulk [`Encoder::put`] reserve).
+    #[cfg(feature = "arrow")]
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.indices.reserve(additional);
     }
 
     #[inline]
