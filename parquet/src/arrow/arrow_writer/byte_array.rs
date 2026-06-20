@@ -754,14 +754,6 @@ impl ColumnValueEncoder for ByteArrayEncoder {
         })
     }
 
-    fn write(&mut self, _values: &Self::Values, _offset: usize, _len: usize) -> Result<()> {
-        unreachable!("should call write_to instead")
-    }
-
-    fn write_gather(&mut self, _values: &Self::Values, _indices: &[usize]) -> Result<()> {
-        unreachable!("should call write_to instead")
-    }
-
     fn num_values(&self) -> usize {
         match &self.dict_encoder {
             Some(encoder) => encoder.indices.len(),

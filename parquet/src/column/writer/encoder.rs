@@ -20,7 +20,9 @@ use half::f16;
 
 use crate::basic::{ConvertedType, Encoding, LogicalType, Type};
 use crate::bloom_filter::Sbbf;
-use crate::column::writer::{ColumnWriter, ColumnWriterImpl};
+use crate::column::writer::{
+    ColumnWriter, ColumnWriterImpl, SliceColumnValueEncoder, SliceColumnValueSource, ValueSelection,
+};
 use crate::column::writer::{
     compare_greater, fallback_encoding, has_dictionary_support, is_nan, update_max, update_min,
 };
@@ -100,48 +102,6 @@ pub trait ColumnValueEncoder {
     where
         Self: Sized;
 
-    /// Write the corresponding values to this [`ColumnValueEncoder`]
-    fn write(&mut self, values: &Self::Values, offset: usize, len: usize) -> Result<()>;
-
-    /// Write the values at the indexes in `indices` to this [`ColumnValueEncoder`]
-    fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()>;
-
-    /// Returns the largest `k` such that the first `k` values in
-    /// `values[offset..offset + len]` encode to at most `byte_budget`
-    /// bytes — i.e. how many values fit in a single page byte budget.
-    ///
-    /// Returns `len` if every value fits. Returns at least 1 if a single
-    /// value alone exceeds the budget, matching parquet's "at least one
-    /// value per data page" rule.
-    ///
-    /// `None` means "no cheap estimate available"; the caller stays on
-    /// the batched fast path and lets the post-write
-    /// `should_add_data_page` check handle bounding.
-    ///
-    /// Implementations should short-circuit aggressively: the typical
-    /// case is "everything fits, return `len`", and the next-most-common
-    /// case is "one wide value, return 1." The variable-width walk only
-    /// needs to be precise when the chunk is genuinely near the budget.
-    fn count_values_within_byte_budget(
-        _values: &Self::Values,
-        _offset: usize,
-        _len: usize,
-        _byte_budget: usize,
-    ) -> Option<usize> {
-        None
-    }
-
-    /// As [`Self::count_values_within_byte_budget`] but using gather
-    /// `indices` rather than a contiguous range. Returns the number of
-    /// `indices` that fit, not the maximum index value.
-    fn count_values_within_byte_budget_gather(
-        _values: &Self::Values,
-        _indices: &[usize],
-        _byte_budget: usize,
-    ) -> Option<usize> {
-        None
-    }
-
     /// Returns the number of buffered values
     fn num_values(&self) -> usize;
 
@@ -161,8 +121,8 @@ pub trait ColumnValueEncoder {
     /// <already_written_encoded_byte_size> + <estimated_encoded_size_of_unflushed_bytes>
     fn estimated_data_page_size(&self) -> usize;
 
-    /// Flush the dictionary page for this column chunk if any. Any subsequent calls to
-    /// [`Self::write`] will not be dictionary encoded
+    /// Flush the dictionary page for this column chunk if any. Any subsequent writes
+    /// will not be dictionary encoded
     ///
     /// Note: [`Self::flush_data_page`] must be called first, as this will error if there
     /// are any pending page values
@@ -276,6 +236,18 @@ impl<T: ColumnEncoderType, E: Encoder<T> + ?Sized> ColumnValueEncoderImpl<T, E> 
     }
 
     fn write_slice(&mut self, slice: &[T::T]) -> Result<()> {
+        self.fold_stats(slice);
+
+        match &mut self.dict_encoder {
+            Some(encoder) => encoder.put(slice),
+            _ => self.encoder.put(slice),
+        }
+    }
+
+    /// Fold a slice of values into the column statistics, variable-length byte
+    /// total, and bloom filter — everything [`Self::write_slice`] does except
+    /// the actual encoding.
+    fn fold_stats(&mut self, slice: &[T::T]) {
         if self.statistics_enabled != EnabledStatistics::None
             // INTERVAL, Geometry, and Geography have undefined sort order, so don't write min/max stats for them
             && self.descr.converted_type() != ConvertedType::INTERVAL
@@ -292,16 +264,11 @@ impl<T: ColumnEncoderType, E: Encoder<T> + ?Sized> ColumnValueEncoderImpl<T, E> 
             }
         }
 
-        // encode the values into bloom filter if enabled
+        // encode the written values into the bloom filter if enabled
         if let Some(bloom_filter) = &mut self.bloom_filter {
             for value in slice {
                 bloom_filter.insert(value);
             }
-        }
-
-        match &mut self.dict_encoder {
-            Some(encoder) => encoder.put(slice),
-            _ => self.encoder.put(slice),
         }
     }
 }
@@ -748,59 +715,6 @@ impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
         })
     }
 
-    fn write(&mut self, values: &[T::T], offset: usize, len: usize) -> Result<()> {
-        self.num_values += len;
-
-        let slice = values.get(offset..offset + len).ok_or_else(|| {
-            general_err!(
-                "Expected to write {} values, but have only {}",
-                len,
-                values.len() - offset
-            )
-        })?;
-
-        self.write_slice(slice)
-    }
-
-    fn write_gather(&mut self, values: &Self::Values, indices: &[usize]) -> Result<()> {
-        self.num_values += indices.len();
-        let slice: Vec<_> = indices.iter().map(|idx| values[*idx].clone()).collect();
-        self.write_slice(&slice)
-    }
-
-    fn count_values_within_byte_budget(
-        values: &[T::T],
-        offset: usize,
-        len: usize,
-        byte_budget: usize,
-    ) -> Option<usize> {
-        // Clamp so that a caller-supplied `len` that overruns the input
-        // (e.g. a level/value mismatch the encoder will reject later)
-        // returns an estimate instead of panicking here.
-        let end = (offset + len).min(values.len());
-        let start = offset.min(end);
-        count_within_budget::<T>(
-            end - start,
-            byte_budget,
-            values[start..end].iter().map(Some),
-        )
-    }
-
-    fn count_values_within_byte_budget_gather(
-        values: &[T::T],
-        indices: &[usize],
-        byte_budget: usize,
-    ) -> Option<usize> {
-        // `values.get` yields `None` for an out-of-range index (defensive
-        // against a level/value mismatch the encoder rejects later); such a
-        // position is counted but contributes no bytes.
-        count_within_budget::<T>(
-            indices.len(),
-            byte_budget,
-            indices.iter().map(|&i| values.get(i)),
-        )
-    }
-
     fn num_values(&self) -> usize {
         self.num_values
     }
@@ -877,6 +791,80 @@ impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
 
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>> {
         self.geo_stats_accumulator.as_mut().map(|a| a.finish())?
+    }
+}
+
+impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> SliceColumnValueEncoder
+    for ColumnValueEncoderImpl<T, E>
+{
+    fn write_slice_source(
+        &mut self,
+        source: SliceColumnValueSource<'_, Self::Values>,
+    ) -> Result<()> {
+        match source.selection() {
+            #[cfg(feature = "arrow")]
+            ValueSelection::Empty => Ok(()),
+            ValueSelection::Dense { offset, len } => {
+                self.num_values += len;
+                let values = source.storage();
+                let slice = values.get(offset..offset + len).ok_or_else(|| {
+                    general_err!(
+                        "Expected to write {} values, but have only {}",
+                        len,
+                        values.len().saturating_sub(offset)
+                    )
+                })?;
+
+                self.write_slice(slice)
+            }
+            ValueSelection::Sparse(indices) => {
+                self.num_values += indices.len();
+                let values = source.storage();
+                for &idx in indices {
+                    let value = values.get(idx).ok_or_else(|| {
+                        general_err!(
+                            "Expected to write value at index {}, but have only {} values",
+                            idx,
+                            values.len()
+                        )
+                    })?;
+                    self.fold_stats(std::slice::from_ref(value));
+                    match &mut self.dict_encoder {
+                        Some(encoder) => encoder.put(std::slice::from_ref(value))?,
+                        None => self.encoder.put(std::slice::from_ref(value))?,
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn count_slice_source_within_byte_budget(
+        source: SliceColumnValueSource<'_, Self::Values>,
+        byte_budget: usize,
+    ) -> Option<usize> {
+        match source.selection() {
+            #[cfg(feature = "arrow")]
+            ValueSelection::Empty => None,
+            ValueSelection::Dense { offset, len } => {
+                let values = source.storage();
+                let end = (offset + len).min(values.len());
+                let start = offset.min(end);
+                count_within_budget::<T>(
+                    end - start,
+                    byte_budget,
+                    values[start..end].iter().map(Some),
+                )
+            }
+            ValueSelection::Sparse(indices) => {
+                let values = source.storage();
+                count_within_budget::<T>(
+                    indices.len(),
+                    byte_budget,
+                    indices.iter().map(|&i| values.get(i)),
+                )
+            }
+        }
     }
 }
 
@@ -1148,17 +1136,17 @@ fn plain_encoded_byte_size<T: DataType>(value: &T::T) -> usize {
 }
 
 /// How many leading values fit in `byte_budget` bytes, shared by the two
-/// `ColumnValueEncoder::count_values_within_byte_budget*` methods (one walks a
-/// contiguous slice, the other gathers by index).
+/// slice-source byte-budget paths (one walks a contiguous slice, the other
+/// resolves sparse indices).
 ///
 /// `n` is the answer when everything fits; `vals` yields each candidate value,
 /// or `None` for a position that should still be counted but contributes no
-/// bytes (an out-of-range gather index). The boundary value that crosses the
+/// bytes (an out-of-range selected index). The boundary value that crosses the
 /// budget is included in the count so the caller's page-flush check trips on
 /// this mini-batch rather than leaving a sliver for the next page; this also
 /// catches a lone outlier wherever it lands among small values.
 ///
-/// Defined at the end of the module alongside `plain_encoded_byte_size` for
+/// Defined at the end of the module alongside [`plain_encoded_byte_size`] for
 /// the same reason — see that function's note on code placement and the
 /// `string` / `string_and_binary_view` benchmarks.
 #[inline]

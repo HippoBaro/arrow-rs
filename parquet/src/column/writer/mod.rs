@@ -448,9 +448,20 @@ pub(crate) trait ColumnValueSource<E: ColumnValueEncoder>: Copy {
     /// encode within `budget` bytes, or `None` when no cheap estimate is
     /// available (the caller then treats the whole selection as fitting).
     ///
-    /// Mirrors [`ColumnValueEncoder::count_values_within_byte_budget`] and is
-    /// used by [`ByteBudgetChunker`] to bound a mini-batch by page byte size.
+    /// Used by [`ByteBudgetChunker`] to bound a mini-batch by page byte size.
     fn count_within_byte_budget(self, budget: usize) -> Option<usize>;
+}
+
+pub(crate) trait SliceColumnValueEncoder: ColumnValueEncoder {
+    fn write_slice_source(
+        &mut self,
+        source: SliceColumnValueSource<'_, Self::Values>,
+    ) -> Result<()>;
+
+    fn count_slice_source_within_byte_budget(
+        source: SliceColumnValueSource<'_, Self::Values>,
+        budget: usize,
+    ) -> Option<usize>;
 }
 
 /// Borrowed view of a selected set of values.
@@ -541,12 +552,10 @@ impl<'a, S> Selected<'a, S> {
         Self { storage, selection }
     }
 
-    #[cfg(feature = "arrow")]
     pub(crate) fn storage(self) -> S {
         self.storage
     }
 
-    #[cfg(feature = "arrow")]
     pub(crate) fn selection(self) -> ValueSelection<'a> {
         self.selection
     }
@@ -569,7 +578,7 @@ pub(crate) type SliceColumnValueSource<'a, V> = Selected<'a, &'a V>;
 
 impl<'a, E> ColumnValueSource<E> for Selected<'a, &'a E::Values>
 where
-    E: ColumnValueEncoder,
+    E: SliceColumnValueEncoder,
 {
     fn len(self) -> usize {
         Selected::len(self)
@@ -580,25 +589,11 @@ where
     }
 
     fn write_to(self, encoder: &mut E) -> Result<()> {
-        match self.selection {
-            #[cfg(feature = "arrow")]
-            ValueSelection::Empty => Ok(()),
-            ValueSelection::Dense { offset, len } => encoder.write(self.storage, offset, len),
-            ValueSelection::Sparse(indices) => encoder.write_gather(self.storage, indices),
-        }
+        encoder.write_slice_source(self)
     }
 
     fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
-        match self.selection {
-            #[cfg(feature = "arrow")]
-            ValueSelection::Empty => None,
-            ValueSelection::Dense { offset, len } => {
-                E::count_values_within_byte_budget(self.storage, offset, len, budget)
-            }
-            ValueSelection::Sparse(indices) => {
-                E::count_values_within_byte_budget_gather(self.storage, indices, budget)
-            }
-        }
+        E::count_slice_source_within_byte_budget(self, budget)
     }
 }
 /// Typed column writer for a primitive column.
@@ -833,12 +828,16 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     ///
     /// Definition and/or repetition levels can be omitted, if values are
     /// non-nullable and/or non-repeated.
+    #[allow(private_bounds)]
     pub fn write_batch(
         &mut self,
         values: &E::Values,
         def_levels: Option<&[i16]>,
         rep_levels: Option<&[i16]>,
-    ) -> Result<usize> {
+    ) -> Result<usize>
+    where
+        E: SliceColumnValueEncoder,
+    {
         let value_selection = ValueSelection::Dense {
             offset: 0,
             len: values.len(),
@@ -860,6 +859,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// for these statistics to take effect. If [`EnabledStatistics::None`] they will be ignored,
     /// and if [`EnabledStatistics::Page`] the chunk statistics will instead be computed from the
     /// computed page statistics
+    #[allow(private_bounds)]
     pub fn write_batch_with_statistics(
         &mut self,
         values: &E::Values,
@@ -868,7 +868,10 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         min: Option<&E::T>,
         max: Option<&E::T>,
         distinct_count: Option<u64>,
-    ) -> Result<usize> {
+    ) -> Result<usize>
+    where
+        E: SliceColumnValueEncoder,
+    {
         let value_selection = ValueSelection::Dense {
             offset: 0,
             len: values.len(),
