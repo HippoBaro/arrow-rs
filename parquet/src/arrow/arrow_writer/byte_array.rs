@@ -855,7 +855,6 @@ impl<'a> ColumnValueSource<ByteArrayEncoder> for Selected<'a, ByteArraySourceSto
     fn write_to(self, encoder: &mut ByteArrayEncoder) -> Result<()> {
         let values = self.storage().values;
         let selection = self.selection();
-
         match selection {
             ValueSelection::Empty => Ok(()),
             // Dense and sparse both flow through the one chunked path. The

@@ -326,6 +326,15 @@ enum PackedBoolSelection<'a> {
         bit_offset: usize,
         indices: &'a [usize],
     },
+    Indexed {
+        bit_offset: usize,
+        indices: ValueIndices<'a>,
+    },
+    Defaulted {
+        value_bits: &'a [u8],
+        value_bit_offset: usize,
+        indices: DefaultedDictionaryValueIndices<'a>,
+    },
 }
 
 #[cfg(feature = "arrow")]
@@ -347,10 +356,44 @@ impl<'a> PackedBoolValues<'a> {
         }
     }
 
+    pub(crate) fn new_indexed(
+        bytes: &'a [u8],
+        bit_offset: usize,
+        indices: ValueIndices<'a>,
+    ) -> Self {
+        Self {
+            bytes,
+            selection: PackedBoolSelection::Indexed {
+                bit_offset,
+                indices,
+            },
+        }
+    }
+
+    /// Selects bits from a boolean dictionary's `value_bits` through defaulted
+    /// keyed indices, yielding `false` for any null key or null dictionary value.
+    pub(crate) fn new_defaulted(
+        value_bits: &'a [u8],
+        value_bit_offset: usize,
+        indices: DefaultedDictionaryValueIndices<'a>,
+    ) -> Self {
+        // The byte source lives in the `Defaulted` selection; `bytes` is unused.
+        Self {
+            bytes: value_bits,
+            selection: PackedBoolSelection::Defaulted {
+                value_bits,
+                value_bit_offset,
+                indices,
+            },
+        }
+    }
+
     pub(crate) fn dense(self) -> Option<(&'a [u8], usize, usize)> {
         match self.selection {
             PackedBoolSelection::Dense { bit_offset, len } => Some((self.bytes, bit_offset, len)),
-            PackedBoolSelection::Sparse { .. } => None,
+            PackedBoolSelection::Sparse { .. }
+            | PackedBoolSelection::Indexed { .. }
+            | PackedBoolSelection::Defaulted { .. } => None,
         }
     }
 
@@ -358,6 +401,8 @@ impl<'a> PackedBoolValues<'a> {
         match self.selection {
             PackedBoolSelection::Dense { len, .. } => len,
             PackedBoolSelection::Sparse { indices, .. } => indices.len(),
+            PackedBoolSelection::Indexed { indices, .. } => indices.len(),
+            PackedBoolSelection::Defaulted { indices, .. } => indices.len(),
         }
     }
 
@@ -390,6 +435,22 @@ impl<'a> PackedBoolValues<'a> {
                     f(get_bit(bytes, bit_offset + idx));
                 }
             }
+            PackedBoolSelection::Indexed {
+                bit_offset,
+                indices,
+            } => {
+                indices.for_each(|idx| f(get_bit(bytes, bit_offset + idx)));
+            }
+            PackedBoolSelection::Defaulted {
+                value_bits,
+                value_bit_offset,
+                indices,
+            } => {
+                let _ = indices.try_for_each(|idx| -> Result<(), ()> {
+                    f(idx.is_some_and(|idx| get_bit(value_bits, value_bit_offset + idx)));
+                    Ok(())
+                });
+            }
         }
     }
 
@@ -419,9 +480,11 @@ impl<'a> PackedBoolValues<'a> {
             PackedBoolSelection::Dense { bit_offset, len } => {
                 UnalignedBitChunk::new(self.bytes, bit_offset, len).count_ones()
             }
-            // Sparse: selected bits are non-contiguous, so resolve the
-            // selection once and count via `for_each` (no popcount).
-            PackedBoolSelection::Sparse { .. } => {
+            // Sparse/Indexed/Defaulted: selected bits are non-contiguous, so
+            // resolve the selection once and count via `for_each` (no popcount).
+            PackedBoolSelection::Sparse { .. }
+            | PackedBoolSelection::Indexed { .. }
+            | PackedBoolSelection::Defaulted { .. } => {
                 let mut count = 0;
                 self.for_each(|b| count += b as usize);
                 count
@@ -509,6 +572,14 @@ impl<'a> ValueIndices<'a> {
             }
             Self::Dictionary(indices) => indices.try_for_each(f),
         }
+    }
+
+    #[inline]
+    pub(crate) fn for_each(self, mut f: impl FnMut(usize)) {
+        let _ = self.try_for_each(|idx| -> Result<(), ()> {
+            f(idx);
+            Ok(())
+        });
     }
 }
 

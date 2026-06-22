@@ -27,7 +27,7 @@ use std::vec::IntoIter;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
-use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchWriter};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchWriter};
 use arrow_buffer::NullBuffer;
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field, IntervalUnit, SchemaRef, TimeUnit,
@@ -1812,13 +1812,49 @@ impl<'a> ColumnValueSource<ColumnValueEncoderImpl<BoolType>> for BoolSource<'a> 
             ValueIndices::Sparse(indices) => {
                 encoder.write_packed_bool(PackedBoolValues::new_sparse(bytes, bit_offset, indices))
             }
-            // Boolean dictionaries are not yet adopted natively (the boolean
-            // dict path lands in a later commit); `write_bool_column` only
-            // produces non-dictionary selections, so this arm is unreachable.
-            ValueIndices::Dictionary(_) => {
-                unreachable!("boolean dictionary indices are not produced yet")
-            }
+            ValueIndices::Dictionary(_) => encoder.write_packed_bool(
+                PackedBoolValues::new_indexed(bytes, bit_offset, self.indices),
+            ),
         }
+    }
+
+    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+        let per = std::mem::size_of::<bool>().max(1);
+        Some((budget / per).max(1).min(self.indices.len()))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DefaultedBoolSource<'a> {
+    values: &'a BooleanArray,
+    indices: DefaultedDictionaryValueIndices<'a>,
+}
+
+impl<'a> DefaultedBoolSource<'a> {
+    fn new(values: &'a BooleanArray, indices: DefaultedDictionaryValueIndices<'a>) -> Self {
+        Self { values, indices }
+    }
+}
+
+impl<'a> ColumnValueSource<ColumnValueEncoderImpl<BoolType>> for DefaultedBoolSource<'a> {
+    fn len(self) -> usize {
+        self.indices.len()
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Self {
+            values: self.values,
+            indices: self.indices.slice(offset, len),
+        }
+    }
+
+    fn write_to(self, encoder: &mut ColumnValueEncoderImpl<BoolType>) -> Result<()> {
+        let values = self.values.values();
+        encoder.write_packed_bool(PackedBoolValues::new_defaulted(
+            values.values(),
+            values.offset(),
+            self.indices,
+        ))
     }
 
     fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
@@ -2435,15 +2471,32 @@ fn write_bool_column(
     levels: ArrayLevelsView<'_>,
 ) -> Result<usize> {
     let selection = levels.value_selection();
-    let array = column.as_boolean();
-    writer.write_batch_internal(
-        BoolSource::new(BoolStorage::from_array(array), value_indices(selection)),
-        levels.def_level_data(),
-        levels.rep_level_data(),
-        None,
-        None,
-        None,
-    )
+
+    match dispatch_dictionary_input(column, selection)? {
+        DictionaryInput::Direct { values, indices }
+        | DictionaryInput::NonDictionary { values, indices } => {
+            let array = values.as_boolean();
+            writer.write_batch_internal(
+                BoolSource::new(BoolStorage::from_array(array), indices),
+                levels.def_level_data(),
+                levels.rep_level_data(),
+                None,
+                None,
+                None,
+            )
+        }
+        DictionaryInput::Defaulted { values, indices } => {
+            let array = values.as_boolean();
+            writer.write_batch_internal(
+                DefaultedBoolSource::new(array, indices),
+                levels.def_level_data(),
+                levels.rep_level_data(),
+                None,
+                None,
+                None,
+            )
+        }
+    }
 }
 
 /// Generates the float/double Arrow→parquet bridge: the `*Source` /
@@ -4163,6 +4216,23 @@ mod tests {
     }
 
     #[test]
+    fn all_null_bool_rle_single_column() {
+        let values = Arc::new(BooleanArray::from(vec![None; SMALL_SIZE]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col",
+            DataType::Boolean,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+        let props = WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_encoding(Encoding::RLE)
+            .build();
+
+        roundtrip_opts(&batch, props);
+    }
+
+    #[test]
     fn bool_large_single_column() {
         let values = Arc::new(
             [None, Some(true), Some(false)]
@@ -4773,6 +4843,30 @@ mod tests {
     }
 
     #[test]
+    fn arrow_writer_low_cardinality_string_dictionary() {
+        #[allow(deprecated)]
+        let schema = Arc::new(Schema::new(vec![Field::new_dict(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+            42,
+            true,
+        )]));
+
+        let values = (0..64).map(|idx| {
+            Some(match idx % 4 {
+                0 => "alpha",
+                1 => "beta",
+                2 => "gamma",
+                _ => "delta",
+            })
+        });
+        let d: Int32DictionaryArray = values.collect();
+
+        one_column_roundtrip_with_schema(Arc::new(d), schema);
+    }
+
+    #[test]
     fn arrow_writer_test_type_compatibility() {
         fn ensure_compatible_write<T1, T2>(array1: T1, array2: T2, expected_result: T1)
         where
@@ -5136,6 +5230,42 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    fn arrow_writer_required_byte_dictionary_with_null_key() {
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+
+        let keys = Int32Array::new(
+            vec![0, 1, 2].into(),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let values = StringArray::from(vec!["alpha", "wrong", "beta"]);
+        let array = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let expected = RecordBatch::try_new(
+            writer_schema,
+            vec![Arc::new(StringArray::from(vec!["alpha", "", "beta"]))],
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
     // -------------------------------------------------------------------------
     // Added coverage for input-shape specialization branches introduced by this
     // series (native value sources, dictionary fast paths, null defaulting).
@@ -5266,6 +5396,11 @@ mod tests {
 
     #[test]
     fn arrow_writer_required_dictionary_with_null_value_types() {
+        // Boolean has a dedicated packed-bit/default streaming path.
+        check_required_dict_null_value(
+            Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+            Arc::new(BooleanArray::from(vec![true, false, false])),
+        );
         // Integers.
         check_required_dict_null_value(
             Arc::new(Int8Array::from(vec![Some(10), None, Some(20)])),
@@ -5503,6 +5638,24 @@ mod tests {
         inner::<Int64Type>();
     }
 
+    /// Low-cardinality `Binary` / `LargeBinary` dictionaries round-trip through
+    /// the byte-array dictionary (interning) path.
+    #[test]
+    fn arrow_writer_low_cardinality_binary_dictionary() {
+        let dict_vals: Vec<&[u8]> = vec![b"alpha".as_ref(), b"beta", b"gamma", b"delta"];
+        let keys = Int32Array::from_iter_values((0..64).map(|i| i % 4));
+        let bin = DictionaryArray::<Int32Type>::new(
+            keys.clone(),
+            Arc::new(BinaryArray::from_iter_values(dict_vals.clone())),
+        );
+        one_column_roundtrip(Arc::new(bin), true);
+        let lbin = DictionaryArray::<Int32Type>::new(
+            keys,
+            Arc::new(LargeBinaryArray::from_iter_values(dict_vals)),
+        );
+        one_column_roundtrip(Arc::new(lbin), true);
+    }
+
     /// Plain (non-dictionary) `Decimal32` / `Decimal64` columns. (These
     /// precisions map to INT32 / INT64 storage, not FixedLenByteArray.)
     #[test]
@@ -5523,6 +5676,18 @@ mod tests {
             .with_precision_and_scale(12, 2)
             .unwrap();
         one_column_roundtrip(Arc::new(d64n), true);
+    }
+
+    /// Low-cardinality dictionary with a bloom filter enabled -> the
+    /// `encode_dictionary` bloom-filter `insert` branch in the fast path.
+    #[test]
+    fn arrow_writer_low_cardinality_dictionary_with_bloom_filter() {
+        let keys = Int32Array::from_iter_values((0..64).map(|i| i % 4));
+        let values = StringArray::from(vec!["alpha", "beta", "gamma", "delta"]);
+        let dict = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+        let mut opts = RoundTripOptions::new(Arc::new(dict), true);
+        opts.bloom_filter = true;
+        one_column_roundtrip_with_options(opts);
     }
 
     #[test]
@@ -5552,6 +5717,20 @@ mod tests {
         }
 
         let keys = UInt8Array::from(vec![Some(0), Some(1), None, Some(0), Some(1)]);
+
+        let bool_values = BooleanArray::from(vec![Some(true), None]);
+        let array = DictionaryArray::new(keys.clone(), Arc::new(bool_values));
+        roundtrip_with_native_schema(
+            Arc::new(array),
+            DataType::Boolean,
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                None,
+                None,
+                Some(true),
+                None,
+            ])),
+        );
 
         let float_values = Float32Array::from(vec![1.25, -2.5]);
         let array = DictionaryArray::new(keys.clone(), Arc::new(float_values));
@@ -6492,6 +6671,58 @@ mod tests {
         assert!(matches!(a_idx, ColumnIndexMetaData::NONE), "{a_idx:?}");
         let b_idx = &column_index[0][1];
         assert!(matches!(b_idx, ColumnIndexMetaData::NONE), "{b_idx:?}");
+    }
+
+    #[test]
+    fn arrow_writer_byte_dictionary_per_page_stats() {
+        // A dictionary entry referenced across several data pages must
+        // contribute to *each* page's min/max, not just the page of its first
+        // reference. Regression test for the byte-array dictionary encoder's
+        // per-page statistics.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+            false,
+        )]));
+
+        let values = StringArray::from(vec!["a", "m", "z"]);
+        // 16 rows, 8 per page. Page 0 references {a, m}; page 1 references
+        // {m, z}. "m" is first referenced in page 0 and repeats in page 1, so a
+        // global-first-reference fold would leave page 1's min as "z".
+        let keys = UInt8Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 1, 2, 1, 2, 1, 2, 1, 2]);
+        let dict = DictionaryArray::new(keys, Arc::new(values));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dict)]).unwrap();
+
+        let props = WriterProperties::builder()
+            // Force two data pages of 8 rows: page splitting happens at
+            // mini-batch boundaries, so the write batch size must be ≤ the page
+            // row-count limit.
+            .set_write_batch_size(8)
+            .set_data_page_row_count_limit(8)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(Bytes::from(buf), options).unwrap();
+        let column_index = reader.metadata().column_index().unwrap();
+        let ColumnIndexMetaData::BYTE_ARRAY(idx) = &column_index[0][0] else {
+            panic!(
+                "expected BYTE_ARRAY column index, got {:?}",
+                column_index[0][0]
+            );
+        };
+
+        assert_eq!(idx.min_values_iter().count(), 2, "expected two data pages");
+        assert_eq!(idx.min_value(0), Some("a".as_bytes()));
+        assert_eq!(idx.max_value(0), Some("m".as_bytes()));
+        // The fix: "m" repeats into page 1, so it must be page 1's min.
+        assert_eq!(idx.min_value(1), Some("m".as_bytes()));
+        assert_eq!(idx.max_value(1), Some("z".as_bytes()));
     }
 
     #[test]
