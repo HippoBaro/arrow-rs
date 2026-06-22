@@ -153,6 +153,31 @@ impl RleEncoder {
         self.repeat_count += count;
     }
 
+    /// Encodes `count` consecutive copies of `value` as a single logical run.
+    ///
+    /// Equivalent to calling [`put`](Self::put) `count` times, but extends the
+    /// RLE run in O(1) once accumulation mode is reached — so a long run costs
+    /// O(1) rather than O(count). Used to emit run-end-encoded dictionary
+    /// indices without materializing one index per row.
+    #[inline]
+    #[cfg(feature = "arrow")]
+    pub fn put_run(&mut self, value: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.put(value);
+        let mut remaining = count - 1;
+        // Feed values individually until the encoder enters RLE accumulation
+        // mode for `value`, then bulk-extend the remainder.
+        while remaining > 0 && !self.is_accumulating_rle(value) {
+            self.put(value);
+            remaining -= 1;
+        }
+        if remaining > 0 {
+            self.extend_run(remaining);
+        }
+    }
+
     /// Encodes `value`, which must be representable with `bit_width` bits.
     #[inline]
     pub fn put(&mut self, value: u64) {
@@ -1082,6 +1107,52 @@ mod tests {
         let n = dec.get_batch::<i32>(&mut out).unwrap();
         assert_eq!(n, 100);
         assert!(out.iter().all(|&v| v == value as i32));
+    }
+
+    #[test]
+    #[cfg(feature = "arrow")]
+    fn test_put_run_matches_individual_puts() {
+        let bit_width = 3;
+        // Mixed runs: length 1, below the RLE boundary, and well past it.
+        let runs: &[(u64, usize)] = &[(1, 1), (2, 5), (3, 100), (1, 8), (4, 3), (2, 1), (5, 250)];
+
+        // Reference: expand each run into individual `put`s.
+        let mut reference = RleEncoder::new(bit_width, 256);
+        for &(v, n) in runs {
+            for _ in 0..n {
+                reference.put(v);
+            }
+        }
+        let reference = reference.consume();
+
+        // Under test: one `put_run` per run — must produce byte-identical output.
+        let mut run_encoded = RleEncoder::new(bit_width, 256);
+        for &(v, n) in runs {
+            run_encoded.put_run(v, n);
+        }
+        let run_encoded = run_encoded.consume();
+        assert_eq!(run_encoded, reference, "put_run must match individual puts");
+
+        // And it decodes back to the expanded sequence.
+        let total: usize = runs.iter().map(|&(_, n)| n).sum();
+        let mut expected = Vec::with_capacity(total);
+        for &(v, n) in runs {
+            expected.extend(std::iter::repeat_n(v as i32, n));
+        }
+        let mut dec = RleDecoder::new(bit_width);
+        dec.set_data(run_encoded.into()).unwrap();
+        let mut out = vec![0i32; total];
+        let n = dec.get_batch::<i32>(&mut out).unwrap();
+        assert_eq!(n, total);
+        assert_eq!(out, expected);
+
+        // `put_run(_, 0)` is a no-op.
+        let mut a = RleEncoder::new(bit_width, 64);
+        a.put(7);
+        let mut b = RleEncoder::new(bit_width, 64);
+        b.put(7);
+        b.put_run(3, 0);
+        assert_eq!(a.consume(), b.consume());
     }
 
     #[test]

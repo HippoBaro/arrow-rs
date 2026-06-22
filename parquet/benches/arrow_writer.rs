@@ -34,7 +34,7 @@ use arrow::util::bench_util::{create_f16_array, create_f32_array, create_f64_arr
 use arrow::{record_batch::RecordBatch, util::data_gen::*};
 use arrow_array::{
     ArrayRef, Decimal128Array, DictionaryArray, FixedSizeBinaryArray, Float64Array, Int32Array,
-    Int64Array, RecordBatchOptions, StringArray,
+    Int64Array, RecordBatchOptions, RunArray, StringArray,
 };
 use arrow_buffer::NullBuffer;
 use parquet::errors::Result;
@@ -256,6 +256,7 @@ fn create_string_dictionary_bench_batch(
         true_density,
     )?)
 }
+
 fn create_ree_bench_batch(
     value_dt: DataType,
     size: usize,
@@ -279,6 +280,45 @@ fn create_ree_bench_batch(
         null_density,
         true_density,
     )?)
+}
+
+/// A single run-end-encoded column with explicit control over run length and
+/// run-end index width. `make_values` produces the per-run value array (its
+/// length is the run count), so callers choose the value type and distinct-value
+/// cardinality. Unlike [`create_ree_bench_batch`] this can build REE's intended
+/// regime — long runs with few distinct values — and `Int64` run ends.
+fn create_controlled_ree_batch(
+    run_ends_type: DataType,
+    size: usize,
+    run_len: usize,
+    make_values: impl Fn(usize) -> ArrayRef,
+) -> RecordBatch {
+    let num_runs = size.div_ceil(run_len);
+    let mut acc = 0usize;
+    let run_ends: Vec<i64> = (0..num_runs)
+        .map(|_| {
+            acc = (acc + run_len).min(size);
+            acc as i64
+        })
+        .collect();
+    let values = make_values(num_runs);
+    let run_array: ArrayRef = match run_ends_type {
+        DataType::Int32 => {
+            let ends = Int32Array::from_iter_values(run_ends.iter().map(|&v| v as i32));
+            Arc::new(RunArray::<Int32Type>::try_new(&ends, &values).unwrap())
+        }
+        DataType::Int64 => {
+            let ends = Int64Array::from_iter_values(run_ends.iter().copied());
+            Arc::new(RunArray::<Int64Type>::try_new(&ends, &values).unwrap())
+        }
+        other => panic!("unsupported REE run-ends type for bench: {other:?}"),
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "_1",
+        run_array.data_type().clone(),
+        true,
+    )]));
+    RecordBatch::try_new(schema, vec![run_array]).unwrap()
 }
 
 fn create_string_dictionary_bench_batch_1pct_cardinality(
@@ -732,6 +772,7 @@ fn create_batches() -> Vec<(&'static str, RecordBatch)> {
     let batch = create_string_bench_batch_non_null(BATCH_SIZE, 0.25, 0.75).unwrap();
     batches.push(("string_non_null", batch));
 
+    // Run-end-encoded — high-cardinality / short-run regime (random runs).
     let batch = create_ree_bench_batch(DataType::Utf8, BATCH_SIZE, None, 0.75).unwrap();
     batches.push(("string_ree", batch));
 
@@ -750,6 +791,49 @@ fn create_batches() -> Vec<(&'static str, RecordBatch)> {
 
     let batch = create_ree_bench_batch(DataType::Int32, BATCH_SIZE, Some(95), 0.75).unwrap();
     batches.push(("int32_ree_95pct_null", batch));
+
+    // Run-end-encoded — REE's intended regime: long runs (256 rows) of few (16)
+    // distinct values, across value families and run-end widths.
+    batches.push((
+        "string_ree_low_cardinality",
+        create_controlled_ree_batch(DataType::Int32, BATCH_SIZE, 256, |n| {
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|i| format!("category_{:02}", i % 16)),
+            ))
+        }),
+    ));
+    // Same long-run string data, but Int64 run ends (exercises the i64 run-end arm).
+    batches.push((
+        "string_ree_int64_run_ends",
+        create_controlled_ree_batch(DataType::Int64, BATCH_SIZE, 256, |n| {
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|i| format!("category_{:02}", i % 16)),
+            ))
+        }),
+    ));
+    // Numeric (Int64) run values.
+    batches.push((
+        "int64_ree_low_cardinality",
+        create_controlled_ree_batch(DataType::Int32, BATCH_SIZE, 256, |n| {
+            Arc::new(Int64Array::from_iter_values(
+                (0..n).map(|i| (i % 16) as i64),
+            ))
+        }),
+    ));
+    // Fixed-length byte-array run values (FLBA path).
+    batches.push((
+        "fixed_size_binary_ree_low_cardinality",
+        create_controlled_ree_batch(DataType::Int32, BATCH_SIZE, 256, |n| {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter((0..n).map(|i| {
+                    let mut b = [0u8; 16];
+                    b[0] = (i % 16) as u8;
+                    b
+                }))
+                .unwrap(),
+            )
+        }),
+    ));
 
     let batch = create_float_bench_batch_with_nans(BATCH_SIZE, 0.5).unwrap();
     batches.push(("float_with_nans", batch));
@@ -841,6 +925,14 @@ fn bench_all_writers(c: &mut Criterion) {
     let props = create_writer_props();
 
     for (batch_name, batch) in &batches {
+        // Content-defined chunking is not supported for run-end-encoded columns,
+        // so the `cdc` writer config is skipped for REE batches.
+        let is_ree = batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| matches!(f.data_type(), DataType::RunEndEncoded(_, _)));
+
         let mut group = c.benchmark_group(*batch_name);
         group.throughput(Throughput::Bytes(
             batch
@@ -851,6 +943,9 @@ fn bench_all_writers(c: &mut Criterion) {
         ));
 
         for (prop_name, prop) in &props {
+            if is_ree && *prop_name == "cdc" {
+                continue;
+            }
             group.bench_function(*prop_name, |b| {
                 write_batch_with_option(b, batch, Some(prop.clone())).unwrap()
             });

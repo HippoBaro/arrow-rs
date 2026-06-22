@@ -191,6 +191,175 @@ impl<'a> DictionaryValueIndices<'a> {
     }
 }
 
+/// Run boundaries of an Arrow run-end-encoded array, type-erased over the
+/// run-end index width. `run_ends[j]` is the logical position one past the end
+/// of physical run `j`.
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunEnds<'a> {
+    I16(&'a [i16]),
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+}
+
+#[cfg(feature = "arrow")]
+impl RunEnds<'_> {
+    /// Physical run index containing absolute logical position `pos` — the
+    /// first run whose end is strictly past `pos`. Equivalent to
+    /// `RunEndBuffer::get_physical_index`.
+    #[inline(always)]
+    pub(crate) fn run_of(self, pos: usize) -> usize {
+        match self {
+            Self::I16(ends) => ends.partition_point(|&end| (end as usize) <= pos),
+            Self::I32(ends) => ends.partition_point(|&end| (end as usize) <= pos),
+            Self::I64(ends) => ends.partition_point(|&end| (end as usize) <= pos),
+        }
+    }
+
+    /// Logical end (one past the last row) of physical run `run`.
+    #[inline(always)]
+    pub(crate) fn end_of(self, run: usize) -> usize {
+        match self {
+            Self::I16(ends) => ends[run] as usize,
+            Self::I32(ends) => ends[run] as usize,
+            Self::I64(ends) => ends[run] as usize,
+        }
+    }
+
+    /// Number of physical runs (the length of the run-ends buffer).
+    #[inline(always)]
+    pub(crate) fn num_runs(self) -> usize {
+        match self {
+            Self::I16(ends) => ends.len(),
+            Self::I32(ends) => ends.len(),
+            Self::I64(ends) => ends.len(),
+        }
+    }
+}
+
+/// Maps selected logical rows of a run-end-encoded array to physical run (i.e.
+/// run-value) indices, never materializing a dense logical array. The physical
+/// run index is an index into the run-values child; the encoder interns/adopts
+/// those run values as a dictionary so each run collapses to a single RLE run
+/// in the `RLE_DICTIONARY` data page.
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunEndValueIndices<'a> {
+    run_ends: RunEnds<'a>,
+    /// Logical offset of the (possibly sliced) run-array window.
+    offset: usize,
+    /// Selected logical rows, relative to the window.
+    selection: ValueSelection<'a>,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> RunEndValueIndices<'a> {
+    pub(crate) fn new(run_ends: RunEnds<'a>, offset: usize, selection: ValueSelection<'a>) -> Self {
+        Self {
+            run_ends,
+            offset,
+            selection,
+        }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.selection.len()
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Self {
+            selection: self.selection.slice(offset, len),
+            ..self
+        }
+    }
+
+    /// Resolve the physical run index of each selected logical row, in order.
+    /// Dense and run-end selections use the same monotonic cursor as
+    /// [`Self::for_each_run`]; sparse selections may be out of order (for
+    /// example under `ListView`) and resolve each row independently.
+    #[inline]
+    pub(crate) fn try_for_each<E>(
+        self,
+        mut f: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let run_ends = self.run_ends;
+        let offset = self.offset;
+        match self.selection {
+            ValueSelection::Empty => Ok(()),
+            ValueSelection::Sparse(indices) => {
+                for &pos in indices {
+                    f(run_ends.run_of(offset + pos))?;
+                }
+                Ok(())
+            }
+            selection => {
+                // Dense and run-end selections are monotonically increasing, so
+                // resolve runs with one advancing cursor (O(rows + runs)).
+                let mut run = 0usize;
+                selection.try_for_each(|pos| {
+                    let pos = offset + pos;
+                    while run_ends.end_of(run) <= pos {
+                        run += 1;
+                    }
+                    f(run)
+                })
+            }
+        }
+    }
+
+    /// Group the selected rows by physical run, invoking `f(run, count)` once per
+    /// run with the number of selected rows in it. Dense and run-sourced
+    /// selections are walked as ranges, so grouping is O(touched runs) instead
+    /// of O(rows).
+    #[inline]
+    pub(crate) fn for_each_run<E>(
+        self,
+        mut f: impl FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let run_ends = self.run_ends;
+        let offset = self.offset;
+        let mut current: Option<usize> = None;
+        let mut count = 0usize;
+
+        let mut emit = |run, run_count| -> Result<(), E> {
+            if run_count == 0 {
+                return Ok(());
+            }
+            match current {
+                Some(r) if r == run => count += run_count,
+                Some(r) => {
+                    f(r, count)?;
+                    current = Some(run);
+                    count = run_count;
+                }
+                None => {
+                    current = Some(run);
+                    count = run_count;
+                }
+            }
+            Ok(())
+        };
+
+        self.selection
+            .try_for_each_range(|range_start, range_len| -> Result<(), E> {
+                let mut pos = offset + range_start;
+                let end = pos + range_len;
+                let mut run = run_ends.run_of(pos);
+                while pos < end {
+                    let run_end = run_ends.end_of(run).min(end);
+                    emit(run, run_end - pos)?;
+                    pos = run_end;
+                    run += 1;
+                }
+                Ok(())
+            })?;
+        if let Some(r) = current {
+            f(r, count)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "arrow")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DefaultedDictionaryValueIndices<'a> {
@@ -500,6 +669,7 @@ pub(crate) enum ValueIndices<'a> {
     Dense { offset: usize, len: usize },
     Sparse(&'a [usize]),
     Dictionary(DictionaryValueIndices<'a>),
+    RunEnd(RunEndValueIndices<'a>),
 }
 
 #[cfg(feature = "arrow")]
@@ -508,12 +678,17 @@ impl<'a> ValueIndices<'a> {
         Self::Dictionary(indices)
     }
 
+    pub(crate) fn run_end(indices: RunEndValueIndices<'a>) -> Self {
+        Self::RunEnd(indices)
+    }
+
     pub(crate) fn len(self) -> usize {
         match self {
             Self::Empty => 0,
             Self::Dense { len, .. } => len,
             Self::Sparse(indices) => indices.len(),
             Self::Dictionary(indices) => indices.len(),
+            Self::RunEnd(indices) => indices.len(),
         }
     }
 
@@ -537,6 +712,7 @@ impl<'a> ValueIndices<'a> {
             },
             Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
             Self::Dictionary(indices) => Self::Dictionary(indices.slice(offset, len)),
+            Self::RunEnd(indices) => Self::RunEnd(indices.slice(offset, len)),
         }
     }
 
@@ -548,6 +724,10 @@ impl<'a> ValueIndices<'a> {
             Self::Dense { offset, .. } => offset + idx,
             Self::Sparse(indices) => indices[idx],
             Self::Dictionary(indices) => indices.index_at(idx),
+            // Run-end indices never reach `index_at`: REE nulls are resolved at
+            // the level layer, so a run-end selection never feeds the random-access
+            // null scan (`value_indices_include_nulls`) that is its only caller.
+            Self::RunEnd(_) => unreachable!("run-end indices are not random-accessed"),
         }
     }
 
@@ -571,6 +751,7 @@ impl<'a> ValueIndices<'a> {
                 Ok(())
             }
             Self::Dictionary(indices) => indices.try_for_each(f),
+            Self::RunEnd(indices) => indices.try_for_each(f),
         }
     }
 
@@ -580,6 +761,20 @@ impl<'a> ValueIndices<'a> {
             f(idx);
             Ok(())
         });
+    }
+
+    /// Group selected rows into runs, invoking `f(value_index, count)` per run.
+    /// Run-end indices yield their physical runs (O(runs) callbacks); every other
+    /// shape has no run structure, so each value is a degenerate run of one.
+    #[inline]
+    pub(crate) fn for_each_run<E>(
+        self,
+        mut f: impl FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::RunEnd(indices) => indices.for_each_run(f),
+            other => other.try_for_each(|idx| f(idx, 1)),
+        }
     }
 }
 
@@ -610,6 +805,15 @@ pub(crate) trait ValueStream<'a, T: Copy + Default + 'a>: Copy + 'a {
     fn bulk(self) -> Option<&'a Self::Bulk>;
 
     fn try_for_each<E>(self, f: impl FnMut(T) -> Result<(), E>) -> Result<(), E>;
+
+    /// Iterate the selected values grouped into runs, invoking `f(value, count)`
+    /// once per run. The default treats every value as its own run; run-end
+    /// streams override this to collapse each physical run into a single call,
+    /// which the dictionary path uses to buffer one index per run.
+    #[inline]
+    fn for_each_run<E>(self, mut f: impl FnMut(T, usize) -> Result<(), E>) -> Result<(), E> {
+        self.try_for_each(|v| f(v, 1))
+    }
 
     /// Push the selected values into `sink`, using one bulk chunk when possible
     /// and fixed-size gathered tiles otherwise.
@@ -743,6 +947,29 @@ impl<'a> ValueStream<'a, i32> for Int32Values<'a> {
             }
         }
     }
+
+    #[inline]
+    fn for_each_run<E>(self, mut f: impl FnMut(i32, usize) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::I32(values, indices) => indices.for_each_run(|idx, n| f(values[idx], n)),
+            Self::I8(values, indices) => indices.for_each_run(|idx, n| f(values[idx] as i32, n)),
+            Self::I16(values, indices) => indices.for_each_run(|idx, n| f(values[idx] as i32, n)),
+            Self::U8(values, indices) => indices.for_each_run(|idx, n| f(values[idx] as i32, n)),
+            Self::U16(values, indices) => indices.for_each_run(|idx, n| f(values[idx] as i32, n)),
+            Self::Date64Days(values, indices) => {
+                indices.for_each_run(|idx, n| f((values[idx] / 86_400_000) as i32, n))
+            }
+            Self::I64Cast(values, indices) => {
+                indices.for_each_run(|idx, n| f(values[idx] as i32, n))
+            }
+            Self::I128Cast(values, indices) => {
+                indices.for_each_run(|idx, n| f(values[idx] as i32, n))
+            }
+            Self::I256Cast(values, indices) => {
+                indices.for_each_run(|idx, n| f(values[idx].as_i128() as i32, n))
+            }
+        }
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -801,6 +1028,19 @@ impl<'a> ValueStream<'a, i64> for Int64Values<'a> {
             }
         }
     }
+
+    #[inline]
+    fn for_each_run<E>(self, mut f: impl FnMut(i64, usize) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::I64(values, indices) => indices.for_each_run(|idx, n| f(values[idx], n)),
+            Self::I128Cast(values, indices) => {
+                indices.for_each_run(|idx, n| f(values[idx] as i64, n))
+            }
+            Self::I256Cast(values, indices) => {
+                indices.for_each_run(|idx, n| f(values[idx].as_i128() as i64, n))
+            }
+        }
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -830,13 +1070,21 @@ impl<'a> ValueStream<'a, f32> for FloatValues<'a> {
     fn bulk(self) -> Option<&'a [f32]> {
         match self.indices {
             ValueIndices::Dense { offset, len } => Some(&self.values[offset..offset + len]),
-            ValueIndices::Empty | ValueIndices::Sparse(_) | ValueIndices::Dictionary(_) => None,
+            ValueIndices::Empty
+            | ValueIndices::Sparse(_)
+            | ValueIndices::Dictionary(_)
+            | ValueIndices::RunEnd(_) => None,
         }
     }
 
     #[inline]
     fn try_for_each<E>(self, mut f: impl FnMut(f32) -> Result<(), E>) -> Result<(), E> {
         self.indices.try_for_each(|idx| f(self.values[idx]))
+    }
+
+    #[inline]
+    fn for_each_run<E>(self, mut f: impl FnMut(f32, usize) -> Result<(), E>) -> Result<(), E> {
+        self.indices.for_each_run(|idx, n| f(self.values[idx], n))
     }
 }
 
@@ -867,13 +1115,21 @@ impl<'a> ValueStream<'a, f64> for DoubleValues<'a> {
     fn bulk(self) -> Option<&'a [f64]> {
         match self.indices {
             ValueIndices::Dense { offset, len } => Some(&self.values[offset..offset + len]),
-            ValueIndices::Empty | ValueIndices::Sparse(_) | ValueIndices::Dictionary(_) => None,
+            ValueIndices::Empty
+            | ValueIndices::Sparse(_)
+            | ValueIndices::Dictionary(_)
+            | ValueIndices::RunEnd(_) => None,
         }
     }
 
     #[inline]
     fn try_for_each<E>(self, mut f: impl FnMut(f64) -> Result<(), E>) -> Result<(), E> {
         self.indices.try_for_each(|idx| f(self.values[idx]))
+    }
+
+    #[inline]
+    fn for_each_run<E>(self, mut f: impl FnMut(f64, usize) -> Result<(), E>) -> Result<(), E> {
+        self.indices.for_each_run(|idx, n| f(self.values[idx], n))
     }
 }
 

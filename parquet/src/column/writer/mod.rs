@@ -54,6 +54,10 @@ pub(crate) mod encoder;
 
 pub use crate::column::writer::encoder::ColumnEncoderType;
 
+#[cfg(feature = "arrow")]
+use crate::encodings::encoding::RunEnds;
+#[cfg(feature = "arrow")]
+use arrow_buffer::NullBuffer;
 use byte_budget_chunker::ByteBudgetChunker;
 
 macro_rules! downcast_writer {
@@ -364,7 +368,14 @@ impl<T: Default> ColumnMetrics<T> {
 pub(crate) enum LevelDataRef<'a> {
     Absent,
     Materialized(&'a [i16]),
-    Uniform { value: i16, count: usize },
+    Uniform {
+        value: i16,
+        count: usize,
+    },
+    /// Definition levels of a flat run-end-encoded leaf, derived from the run
+    /// structure rather than a materialized per-row buffer.
+    #[cfg(feature = "arrow")]
+    RunEnd(RunEndLevelsRef<'a>),
 }
 
 impl<'a> From<&'a [i16]> for LevelDataRef<'a> {
@@ -385,6 +396,8 @@ impl<'a> LevelDataRef<'a> {
             Self::Absent => 0,
             Self::Materialized(values) => values.len(),
             Self::Uniform { count, .. } => count,
+            #[cfg(feature = "arrow")]
+            Self::RunEnd(runs) => runs.len(),
         }
     }
 
@@ -393,15 +406,19 @@ impl<'a> LevelDataRef<'a> {
             Self::Absent => None,
             Self::Materialized(values) => values.first().copied(),
             Self::Uniform { value, count } => (count > 0).then_some(value),
+            #[cfg(feature = "arrow")]
+            Self::RunEnd(runs) => runs.value_at(0),
         }
     }
 
     #[cfg(feature = "arrow")]
+    #[inline]
     pub(crate) fn value_at(self, idx: usize) -> Option<i16> {
         match self {
             Self::Absent => None,
             Self::Materialized(values) => values.get(idx).copied(),
             Self::Uniform { value, count } => (idx < count).then_some(value),
+            Self::RunEnd(runs) => runs.value_at(idx),
         }
     }
 
@@ -410,6 +427,8 @@ impl<'a> LevelDataRef<'a> {
             Self::Absent => Self::Absent,
             Self::Materialized(values) => Self::Materialized(&values[offset..offset + len]),
             Self::Uniform { value, .. } => Self::Uniform { value, count: len },
+            #[cfg(feature = "arrow")]
+            Self::RunEnd(runs) => Self::RunEnd(runs.slice(offset, len)),
         }
     }
 
@@ -428,7 +447,134 @@ impl<'a> LevelDataRef<'a> {
                     0
                 }
             }
+            #[cfg(feature = "arrow")]
+            Self::RunEnd(runs) => runs.value_count(max_def),
         }
+    }
+}
+
+/// Definition levels of a flat run-end-encoded leaf, derived directly from the
+/// run structure instead of a materialized per-row buffer.
+///
+/// A run value is null or non-null as a whole, so every physical run maps to a
+/// single definition-level run — `valid_level` (= the column's max definition
+/// level) for a non-null run value, `null_level` (one less) for a null one.
+/// Walking the runs reproduces the exact level sequence in O(runs), never
+/// allocating one level per row.
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunEndLevelsRef<'a> {
+    run_ends: RunEnds<'a>,
+    /// Per-physical-run validity of the run values.
+    run_validity: &'a NullBuffer,
+    /// Definition level for a non-null run value (the column's max def level).
+    valid_level: i16,
+    /// Definition level for a null run value (`valid_level - 1`).
+    null_level: i16,
+    /// Absolute logical offset of the run array (its slice offset).
+    base: usize,
+    /// Window start within the array's logical rows (for chunk slicing).
+    start: usize,
+    /// Window length in logical rows.
+    len: usize,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> RunEndLevelsRef<'a> {
+    pub(crate) fn new(
+        run_ends: RunEnds<'a>,
+        run_validity: &'a NullBuffer,
+        valid_level: i16,
+        base: usize,
+        len: usize,
+    ) -> Self {
+        Self {
+            run_ends,
+            run_validity,
+            valid_level,
+            null_level: valid_level - 1,
+            base,
+            start: 0,
+            len,
+        }
+    }
+
+    fn len(self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn level_of(self, run: usize) -> i16 {
+        if self.run_validity.is_null(run) {
+            self.null_level
+        } else {
+            self.valid_level
+        }
+    }
+
+    #[inline]
+    fn level_at(self, idx: usize) -> i16 {
+        self.level_of(self.run_ends.run_of(self.base + self.start + idx))
+    }
+
+    // Out-of-line backing for `LevelDataRef::value_at`'s `RunEnd` arm. Deriving
+    // a level requires a binary search over the run ends (`run_of`); keeping it
+    // `#[inline(never)]` ensures that search never expands into the small,
+    // hot `LevelDataRef::value_at` accessor, which must stay inlinable.
+    #[inline(never)]
+    fn value_at(self, idx: usize) -> Option<i16> {
+        (idx < self.len).then(|| self.level_at(idx))
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        debug_assert!(offset + len <= self.len);
+        Self {
+            start: self.start + offset,
+            len,
+            ..self
+        }
+    }
+
+    /// Walk the window's runs in order, coalescing adjacent runs that share a
+    /// definition level (e.g. two consecutive non-null runs), invoking
+    /// `f(level, count)` once per coalesced level run.
+    #[inline]
+    pub(crate) fn for_each_run(self, mut f: impl FnMut(i16, usize)) {
+        if self.len == 0 {
+            return;
+        }
+        let lo = self.base + self.start;
+        let hi = lo + self.len;
+        let mut run = self.run_ends.run_of(lo);
+        let mut pos = lo;
+        let mut pending_level = self.level_of(run);
+        let mut pending_count = 0usize;
+        while pos < hi {
+            let run_end = self.run_ends.end_of(run).min(hi);
+            let level = self.level_of(run);
+            if level == pending_level {
+                pending_count += run_end - pos;
+            } else {
+                f(pending_level, pending_count);
+                pending_level = level;
+                pending_count = run_end - pos;
+            }
+            pos = run_end;
+            run += 1;
+        }
+        f(pending_level, pending_count);
+    }
+
+    /// Count of rows in the window whose definition level equals `max_def`
+    /// (i.e. that carry a value).
+    fn value_count(self, max_def: i16) -> usize {
+        let mut count = 0;
+        self.for_each_run(|level, run_len| {
+            if level == max_def {
+                count += run_len;
+            }
+        });
+        count
     }
 }
 
@@ -449,7 +595,18 @@ pub(crate) trait ColumnValueSource<E: ColumnValueEncoder>: Copy {
     /// available (the caller then treats the whole selection as fitting).
     ///
     /// Used by [`ByteBudgetChunker`] to bound a mini-batch by page byte size.
-    fn count_within_byte_budget(self, budget: usize) -> Option<usize>;
+    fn count_within_byte_budget(self, budget: usize, target: ByteBudgetTarget) -> Option<usize>;
+}
+
+/// Which accumulating page byte budget [`ByteBudgetChunker`] is sizing for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ByteBudgetTarget {
+    /// The encoded data page. This is the active budget after dictionary
+    /// fallback or when dictionary encoding is disabled.
+    DataPage,
+    /// The dictionary page. While dictionary encoding is active, value bytes are
+    /// accumulated here instead of in the data page.
+    DictionaryPage,
 }
 
 pub(crate) trait SliceColumnValueEncoder: ColumnValueEncoder {
@@ -461,6 +618,7 @@ pub(crate) trait SliceColumnValueEncoder: ColumnValueEncoder {
     fn count_slice_source_within_byte_budget(
         source: SliceColumnValueSource<'_, Self::Values>,
         budget: usize,
+        target: ByteBudgetTarget,
     ) -> Option<usize>;
 }
 
@@ -474,6 +632,10 @@ pub(crate) enum ValueSelection<'a> {
         len: usize,
     },
     Sparse(&'a [usize]),
+    /// The non-null logical rows of a flat run-end-encoded leaf, enumerated from
+    /// the run structure rather than a materialized index list.
+    #[cfg(feature = "arrow")]
+    RunEnd(RunEndSelectionRef<'a>),
 }
 
 impl<'a> ValueSelection<'a> {
@@ -483,6 +645,8 @@ impl<'a> ValueSelection<'a> {
             Self::Empty => 0,
             Self::Dense { len, .. } => len,
             Self::Sparse(indices) => indices.len(),
+            #[cfg(feature = "arrow")]
+            Self::RunEnd(sel) => sel.len(),
         }
     }
 
@@ -502,6 +666,8 @@ impl<'a> ValueSelection<'a> {
                 len,
             },
             Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
+            #[cfg(feature = "arrow")]
+            Self::RunEnd(sel) => Self::RunEnd(sel.slice(offset, len)),
         }
     }
 
@@ -513,6 +679,7 @@ impl<'a> ValueSelection<'a> {
             Self::Empty => unreachable!("empty value selection has no values"),
             Self::Dense { offset, .. } => offset + idx,
             Self::Sparse(indices) => indices[idx],
+            Self::RunEnd(sel) => sel.index_at(idx),
         }
     }
 
@@ -536,7 +703,174 @@ impl<'a> ValueSelection<'a> {
                 }
                 Ok(())
             }
+            Self::RunEnd(sel) => sel.try_for_each(f),
         }
+    }
+
+    /// Walk selected logical positions as contiguous ranges `(start, len)`.
+    /// Dense and run-end selections can expose long ranges without enumerating
+    /// every row; sparse selections coalesce adjacent indices when present.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    pub(crate) fn try_for_each_range<E>(
+        self,
+        mut f: impl FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Dense { offset, len } => {
+                if len != 0 {
+                    f(offset, len)?;
+                }
+                Ok(())
+            }
+            Self::Sparse(indices) => {
+                let Some((&first, rest)) = indices.split_first() else {
+                    return Ok(());
+                };
+                let mut start = first;
+                let mut len = 1usize;
+                for &idx in rest {
+                    if idx == start + len {
+                        len += 1;
+                    } else {
+                        f(start, len)?;
+                        start = idx;
+                        len = 1;
+                    }
+                }
+                f(start, len)
+            }
+            Self::RunEnd(sel) => sel.try_for_each_range(f),
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[inline]
+    pub(crate) fn for_each(self, mut f: impl FnMut(usize)) {
+        let _ = self.try_for_each(|idx| -> Result<(), ()> {
+            f(idx);
+            Ok(())
+        });
+    }
+}
+
+/// The non-null logical rows of a flat run-end-encoded leaf, enumerated from the
+/// run structure. A run value is null or non-null as a whole, so the non-null
+/// rows are exactly the rows covered by non-null runs; this yields their 0-based
+/// logical positions (in order) without materializing an index list. The window
+/// `[val_offset, val_offset + val_len)` is in value space (counting only
+/// non-null rows) so it slices in O(1).
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunEndSelectionRef<'a> {
+    run_ends: RunEnds<'a>,
+    /// Per-physical-run validity of the run values.
+    run_validity: &'a NullBuffer,
+    /// Absolute logical offset of the run array (its slice offset).
+    base: usize,
+    /// Value-space window start (count of non-null rows skipped).
+    val_offset: usize,
+    /// Value-space window length (count of non-null rows enumerated).
+    val_len: usize,
+}
+
+#[cfg(feature = "arrow")]
+impl<'a> RunEndSelectionRef<'a> {
+    pub(crate) fn new(
+        run_ends: RunEnds<'a>,
+        run_validity: &'a NullBuffer,
+        base: usize,
+        val_len: usize,
+    ) -> Self {
+        Self {
+            run_ends,
+            run_validity,
+            base,
+            val_offset: 0,
+            val_len,
+        }
+    }
+
+    fn len(self) -> usize {
+        self.val_len
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        debug_assert!(offset + len <= self.val_len);
+        Self {
+            val_offset: self.val_offset + offset,
+            val_len: len,
+            ..self
+        }
+    }
+
+    /// 0-based logical position of the `idx`-th row in the window (the
+    /// `(val_offset + idx)`-th non-null row of the array).
+    fn index_at(self, idx: usize) -> usize {
+        debug_assert!(idx < self.val_len);
+        let target = self.val_offset + idx;
+        let mut run = self.run_ends.run_of(self.base);
+        let mut abs = self.base;
+        let mut seen = 0usize;
+        // Bounded by the run count: an in-range `idx` returns before the runs are
+        // exhausted, and an out-of-range one falls through to `unreachable!`
+        // rather than indexing past `run_ends` (a panic deep in `end_of`) or
+        // looping forever.
+        while run < self.run_ends.num_runs() {
+            let run_end = self.run_ends.end_of(run);
+            let run_rows = run_end - abs;
+            if !self.run_validity.is_null(run) {
+                if target < seen + run_rows {
+                    return (abs - self.base) + (target - seen);
+                }
+                seen += run_rows;
+            }
+            abs = run_end;
+            run += 1;
+        }
+        unreachable!("index_at called with idx out of range for the run-end selection window")
+    }
+
+    #[inline]
+    pub(crate) fn try_for_each_range<E>(
+        self,
+        mut f: impl FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        // Walk runs in order; skip `val_offset` non-null rows, then emit
+        // contiguous logical ranges covering the next `val_len` non-null rows.
+        // `val_len` is exact, so the walk stays in bounds.
+        let mut run = self.run_ends.run_of(self.base);
+        let mut abs = self.base;
+        let mut to_skip = self.val_offset;
+        let mut to_emit = self.val_len;
+        while to_emit > 0 {
+            let run_end = self.run_ends.end_of(run);
+            let run_rows = run_end - abs;
+            if !self.run_validity.is_null(run) {
+                let start_in_run = to_skip.min(run_rows);
+                to_skip -= start_in_run;
+                if start_in_run < run_rows {
+                    let emit = (run_rows - start_in_run).min(to_emit);
+                    let pos0 = abs - self.base + start_in_run;
+                    f(pos0, emit)?;
+                    to_emit -= emit;
+                }
+            }
+            abs = run_end;
+            run += 1;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(usize) -> Result<(), E>) -> Result<(), E> {
+        self.try_for_each_range(|pos0, len| {
+            for p in pos0..pos0 + len {
+                f(p)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -592,8 +926,8 @@ where
         encoder.write_slice_source(self)
     }
 
-    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
-        E::count_slice_source_within_byte_budget(self, budget)
+    fn count_within_byte_budget(self, budget: usize, target: ByteBudgetTarget) -> Option<usize> {
+        E::count_slice_source_within_byte_budget(self, budget, target)
     }
 }
 /// Typed column writer for a primitive column.
@@ -1113,6 +1447,28 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                     self.page_metrics.num_page_nulls += (count - values_to_write) as u64;
                     values_to_write
                 }
+                #[cfg(feature = "arrow")]
+                LevelDataRef::RunEnd(runs) => {
+                    // Flat run-end leaf: emit one definition-level run per
+                    // (coalesced) run, never materializing a per-row buffer.
+                    let num_levels = runs.len();
+                    let mut values_to_write = 0usize;
+                    let encoder = &mut self.def_levels_encoder;
+                    match self.page_metrics.definition_level_histogram.as_mut() {
+                        Some(histogram) => runs.for_each_run(|level, run_len| {
+                            encoder.put_n_with_observer(level, run_len, |lvl, n| {
+                                histogram.increment_by(lvl, n as i64);
+                            });
+                            values_to_write += run_len * (level == max_def) as usize;
+                        }),
+                        None => runs.for_each_run(|level, run_len| {
+                            encoder.put_n_with_observer(level, run_len, |_, _| {});
+                            values_to_write += run_len * (level == max_def) as usize;
+                        }),
+                    };
+                    self.page_metrics.num_page_nulls += (num_levels - values_to_write) as u64;
+                    values_to_write
+                }
             }
         } else {
             num_levels
@@ -1163,6 +1519,10 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
                             new_rows += (run_len as u32) * (level == 0) as u32;
                         }),
                     };
+                }
+                #[cfg(feature = "arrow")]
+                LevelDataRef::RunEnd(_) => {
+                    unreachable!("repetition levels are never run-sourced")
                 }
             }
             self.page_metrics.num_buffered_rows += new_rows;

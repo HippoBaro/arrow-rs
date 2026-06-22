@@ -20,9 +20,11 @@ use crate::bloom_filter::Sbbf;
 use crate::column::writer::encoder::{
     ColumnValueEncoder, DataPageValues, DictionaryPage, create_bloom_filter,
 };
-use crate::column::writer::{ColumnValueSource, Selected, ValueSelection};
+use crate::column::writer::{ByteBudgetTarget, ColumnValueSource, Selected, ValueSelection};
 use crate::data_type::{AsBytes, ByteArray, Int32Type};
-use crate::encodings::encoding::{ChunkSink, DeltaBitPackEncoder, Encoder, ValueStream};
+use crate::encodings::encoding::{
+    ChunkSink, DeltaBitPackEncoder, Encoder, RunEndValueIndices, RunEnds, ValueStream,
+};
 use crate::encodings::rle::RleEncoder;
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
@@ -39,7 +41,7 @@ use arrow_array::{
     Array, BinaryArray, BinaryViewArray, DictionaryArray, FixedSizeBinaryArray, GenericByteArray,
     LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
 };
-use arrow_buffer::{ArrowNativeType, Buffer};
+use arrow_buffer::{ArrowNativeType, Buffer, NullBuffer};
 use arrow_schema::DataType;
 
 macro_rules! with_dictionary_key_type {
@@ -339,11 +341,20 @@ impl Storage for ByteArrayStorage {
 struct DictEncoder {
     interner: Interner<ByteArrayStorage>,
     indices: Vec<u64>,
+    /// Run-buffered indices `(index, count)` for run-end-encoded input — a run
+    /// of `count` identical values shares one dictionary entry, so the index
+    /// buffer is O(runs) not O(rows). Kept separate from `indices` so REE-only
+    /// chunks stay compact; if dense values are appended later, the pending runs
+    /// are materialized first.
+    index_runs: Vec<(u64, u64)>,
+    /// Logical value count buffered in `index_runs` (sum of run lengths).
+    run_value_count: usize,
     variable_length_bytes: i64,
 }
 
 impl DictEncoder {
     fn reserve(&mut self, len: usize) {
+        self.materialize_index_runs();
         self.indices.reserve(len);
     }
 
@@ -354,14 +365,51 @@ impl DictEncoder {
         self.variable_length_bytes += value.len() as i64;
     }
 
+    /// Intern `value` and append it as a run of `count` repetitions — the
+    /// run-end fast path, recording one `(index, count)` entry instead of
+    /// `count` indices. `variable_length_bytes` still counts every logical
+    /// occurrence so the page-size estimate matches the decoded payload.
+    #[inline]
+    fn encode_value_run(&mut self, value: &[u8], count: usize) {
+        if count == 0 {
+            return;
+        }
+        let interned = self.interner.intern(value);
+        self.index_runs.push((interned, count as u64));
+        self.run_value_count += count;
+        self.variable_length_bytes += value.len() as i64 * count as i64;
+    }
+
+    /// Materialize pending run-buffered indices into the dense index buffer.
+    /// This preserves append order when REE and dense batches are mixed in a
+    /// column chunk. `variable_length_bytes` is already tracked when values are
+    /// accepted, so only the index representation changes here.
+    fn materialize_index_runs(&mut self) {
+        if self.index_runs.is_empty() {
+            return;
+        }
+
+        self.indices.reserve(self.run_value_count);
+        for &(index, count) in &self.index_runs {
+            self.indices
+                .extend(std::iter::repeat_n(index, count as usize));
+        }
+        self.index_runs.clear();
+        self.run_value_count = 0;
+    }
+
     /// Intern one tile of values, keeping the hashing loop out of the caller's
     /// chunk-dispatch path.
     #[inline(never)]
     fn encode_values(&mut self, values: &[&[u8]]) {
-        self.indices.reserve(values.len());
+        self.reserve(values.len());
         for &value in values {
             self.encode_value(value);
         }
+    }
+
+    fn num_values(&self) -> usize {
+        self.indices.len() + self.run_value_count
     }
 
     fn bit_width(&self) -> u8 {
@@ -370,12 +418,14 @@ impl DictEncoder {
     }
 
     fn estimated_memory_size(&self) -> usize {
-        self.interner.estimated_memory_size() + self.indices.capacity() * std::mem::size_of::<u64>()
+        self.interner.estimated_memory_size()
+            + self.indices.capacity() * std::mem::size_of::<u64>()
+            + self.index_runs.capacity() * std::mem::size_of::<(u64, u64)>()
     }
 
     fn estimated_data_page_size(&self) -> usize {
         let bit_width = self.bit_width();
-        1 + RleEncoder::max_buffer_size(bit_width, self.indices.len())
+        1 + RleEncoder::max_buffer_size(bit_width, self.num_values())
     }
 
     fn estimated_dict_page_size(&self) -> usize {
@@ -397,7 +447,7 @@ impl DictEncoder {
         min_value: Option<ByteArray>,
         max_value: Option<ByteArray>,
     ) -> DataPageValues<ByteArray> {
-        let num_values = self.indices.len();
+        let num_values = self.num_values();
         let buffer_len = self.estimated_data_page_size();
         let mut buffer = Vec::with_capacity(buffer_len);
         buffer.push(self.bit_width());
@@ -406,8 +456,15 @@ impl DictEncoder {
         for index in &self.indices {
             encoder.put(*index)
         }
+        // Run-buffered indices: each run emits its index `count` times, which the
+        // RLE encoder collapses back to one run in O(1).
+        for &(index, count) in &self.index_runs {
+            encoder.put_run(index, count as usize);
+        }
 
         self.indices.clear();
+        self.index_runs.clear();
+        self.run_value_count = 0;
 
         // Capture value of variable_length_bytes and reset for next page
         let variable_length_bytes = Some(self.variable_length_bytes);
@@ -486,6 +543,9 @@ impl<'a, T: ByteArrayType> ValueStream<'a, &'a [u8]> for OffsetByteValues<'a, T>
                 }
                 Ok(())
             }
+            ValueSelection::RunEnd(_) => {
+                unreachable!("run-end byte columns are written via write_run_end")
+            }
         }
     }
 }
@@ -530,6 +590,39 @@ where
     #[inline]
     fn try_for_each<E>(self, mut f: impl FnMut(&'a [u8]) -> Result<(), E>) -> Result<(), E> {
         self.selection.try_for_each(|idx| f((self.get)(idx)))
+    }
+}
+
+/// A [`ValueStream`] of `&[u8]` over a run-end-encoded column's selected rows.
+/// Drives the [`RunEndValueIndices`] cursor (O(rows + runs)) and maps each row's
+/// physical run through `value_of`. Used by the non-dictionary run-end byte path
+/// so it reuses the single run cursor instead of a `run_of` binary search per row.
+#[derive(Clone, Copy)]
+struct RunEndByteValues<'a, F> {
+    runs: RunEndValueIndices<'a>,
+    value_of: F,
+}
+
+impl<'a, F> ValueStream<'a, &'a [u8]> for RunEndByteValues<'a, F>
+where
+    F: Fn(usize) -> &'a [u8] + Copy + 'a,
+{
+    type Bulk = [&'a [u8]];
+
+    #[inline]
+    fn len(self) -> usize {
+        self.runs.len()
+    }
+
+    #[inline]
+    fn bulk(self) -> Option<&'a [&'a [u8]]> {
+        None
+    }
+
+    #[inline]
+    fn try_for_each<E>(self, mut f: impl FnMut(&'a [u8]) -> Result<(), E>) -> Result<(), E> {
+        let value_of = self.value_of;
+        self.runs.try_for_each(|run| f(value_of(run)))
     }
 }
 
@@ -631,6 +724,12 @@ impl ByteArrayEncoder {
             (sink.min, sink.max)
         };
 
+        self.merge_page_minmax(min, max);
+    }
+
+    /// Merge a page's observed min/max byte values into the running column
+    /// min/max. Shared by the per-value byte path and the run-end fast path.
+    fn merge_page_minmax(&mut self, min: Option<&[u8]>, max: Option<&[u8]>) {
         if let Some(min) = min {
             let min = ByteArray::from(min.to_vec());
             if self.min_value.as_ref().is_none_or(|m| m > &min) {
@@ -643,6 +742,55 @@ impl ByteArrayEncoder {
                 self.max_value = Some(max);
             }
         }
+    }
+
+    /// Run-end fast path for the dictionary case: intern each run's byte value
+    /// once and buffer one `(index, count)` entry, folding page min/max and the
+    /// bloom filter per run. Returns `false` when not eligible — no dictionary
+    /// (PLAIN/DELTA writes every value, so the run structure saves nothing), or
+    /// a geospatial accumulator is active (it needs a per-value WKB update) — so
+    /// the caller falls back to the per-value path.
+    fn write_run_end_dict<'a>(
+        &mut self,
+        runs: RunEndValueIndices<'a>,
+        value_of: impl Fn(usize) -> &'a [u8] + Copy,
+    ) -> bool {
+        if self.dict_encoder.is_none() || self.geo_stats_accumulator.is_some() {
+            return false;
+        }
+        let collect_stats = self.statistics_enabled != EnabledStatistics::None;
+        let (min, max) = {
+            // `dict_encoder` and `bloom_filter` are disjoint fields, so both can
+            // be borrowed across the run walk.
+            let dict = self
+                .dict_encoder
+                .as_mut()
+                .expect("dictionary encoder present");
+            let mut bloom = self.bloom_filter.as_mut();
+            let mut min: Option<&[u8]> = None;
+            let mut max: Option<&[u8]> = None;
+            let _: Result<(), ()> = runs.for_each_run(|run, count| {
+                let value = value_of(run);
+                if collect_stats {
+                    if min.is_none_or(|m| m > value) {
+                        min = Some(value);
+                    }
+                    if max.is_none_or(|m| m < value) {
+                        max = Some(value);
+                    }
+                }
+                if let Some(bloom) = bloom.as_deref_mut() {
+                    bloom.insert(value);
+                }
+                dict.encode_value_run(value, count);
+                Ok(())
+            });
+            // `min`/`max` borrow the run-values array (lifetime `'a`), not the
+            // sink, so they outlive the walk — no eager copy needed here.
+            (min, max)
+        };
+        self.merge_page_minmax(min, max);
+        true
     }
 
     fn count_sparse_within_byte_budget(
@@ -756,7 +904,7 @@ impl ColumnValueEncoder for ByteArrayEncoder {
 
     fn num_values(&self) -> usize {
         match &self.dict_encoder {
-            Some(encoder) => encoder.indices.len(),
+            Some(encoder) => encoder.num_values(),
             None => self.fallback.num_values,
         }
     }
@@ -803,7 +951,7 @@ impl ColumnValueEncoder for ByteArrayEncoder {
     fn flush_dict_page(&mut self) -> Result<Option<DictionaryPage>> {
         match self.dict_encoder.take() {
             Some(encoder) => {
-                if !encoder.indices.is_empty() {
+                if encoder.num_values() != 0 {
                     return Err(general_err!(
                         "Must flush data pages before flushing dictionary"
                     ));
@@ -855,6 +1003,10 @@ impl<'a> ColumnValueSource<ByteArrayEncoder> for Selected<'a, ByteArraySourceSto
     fn write_to(self, encoder: &mut ByteArrayEncoder) -> Result<()> {
         let values = self.storage().values;
         let selection = self.selection();
+        if write_run_end(values, selection, encoder)? {
+            return Ok(());
+        }
+
         match selection {
             ValueSelection::Empty => Ok(()),
             // Dense and sparse both flow through the one chunked path. The
@@ -863,11 +1015,17 @@ impl<'a> ColumnValueSource<ByteArrayEncoder> for Selected<'a, ByteArraySourceSto
             ValueSelection::Dense { .. } | ValueSelection::Sparse(_) => {
                 write_selection(values, selection, encoder)
             }
+            ValueSelection::RunEnd(_) => {
+                unreachable!("run-end byte columns return early via write_run_end above")
+            }
         }
     }
 
-    fn count_within_byte_budget(self, budget: usize) -> Option<usize> {
+    fn count_within_byte_budget(self, budget: usize, target: ByteBudgetTarget) -> Option<usize> {
         let values = self.storage().values;
+        if matches!(values.data_type(), DataType::RunEndEncoded(_, _)) {
+            return count_run_end_within_byte_budget(values, self.selection(), budget, target);
+        }
         match self.selection() {
             ValueSelection::Empty => None,
             // Mirror the dense/sparse split in `write_to` so the byte-budget
@@ -878,6 +1036,8 @@ impl<'a> ColumnValueSource<ByteArrayEncoder> for Selected<'a, ByteArraySourceSto
             ValueSelection::Sparse(indices) => {
                 ByteArrayEncoder::count_sparse_within_byte_budget(values, indices, budget)
             }
+            // The run-end guard above returned before this match.
+            ValueSelection::RunEnd(_) => None,
         }
     }
 }
@@ -1003,6 +1163,129 @@ where
 {
     encoder.write_byte_values(OffsetByteValues::<T>::new(values, selection));
     Ok(())
+}
+
+/// If `values` is run-end encoded, stream its run values through the byte
+/// dictionary path: each selected logical row maps to its physical run's value,
+/// so the run values are interned into a dictionary (one RLE run per run)
+/// and no dense byte array is materialized. Returns `true` when handled. The
+/// non-null `selection` only references non-null run values, so the null check
+/// in the mapping closure is defensive.
+fn write_run_end<'a>(
+    values: &'a dyn Array,
+    selection: ValueSelection<'a>,
+    encoder: &mut ByteArrayEncoder,
+) -> Result<bool> {
+    if !matches!(values.data_type(), DataType::RunEndEncoded(_, _)) {
+        return Ok(false);
+    }
+    // Single source of truth for the RunArray<Int16/32/64> downcast (shared with
+    // the numeric dispatch and level computation).
+    let (run_ends, offset, run_values) = super::run_ends_of(values)?;
+
+    match run_values.data_type() {
+        DataType::Utf8 => {
+            write_run_end_generic::<Utf8Type>(run_ends, offset, run_values, selection, encoder)
+        }
+        DataType::LargeUtf8 => {
+            write_run_end_generic::<LargeUtf8Type>(run_ends, offset, run_values, selection, encoder)
+        }
+        DataType::Binary => {
+            write_run_end_generic::<BinaryType>(run_ends, offset, run_values, selection, encoder)
+        }
+        DataType::LargeBinary => write_run_end_generic::<LargeBinaryType>(
+            run_ends, offset, run_values, selection, encoder,
+        ),
+        DataType::Utf8View => {
+            let arr = run_values
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            emit_run_end_byte_values(encoder, run_ends, offset, selection, move |run| {
+                if arr.is_null(run) {
+                    &[]
+                } else {
+                    arr.value(run).as_bytes()
+                }
+            });
+        }
+        DataType::BinaryView => {
+            let arr = run_values
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap();
+            emit_run_end_byte_values(encoder, run_ends, offset, selection, move |run| {
+                if arr.is_null(run) {
+                    &[]
+                } else {
+                    arr.value(run)
+                }
+            });
+        }
+        DataType::FixedSizeBinary(_) => {
+            let arr = run_values
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            emit_run_end_byte_values(encoder, run_ends, offset, selection, move |run| {
+                if arr.is_null(run) {
+                    &[]
+                } else {
+                    arr.value(run)
+                }
+            });
+        }
+        d => {
+            return Err(ParquetError::NYI(format!(
+                "Run-end column with {d} run values is not supported"
+            )));
+        }
+    }
+    Ok(true)
+}
+
+/// Emit a run-end-encoded byte column from a per-run value accessor
+/// `value_of(run) -> &[u8]`. Dictionary-encoded columns intern one entry per
+/// run ([`ByteArrayEncoder::write_run_end_dict`]); otherwise each selected row
+/// maps through its run via a [`RunEndByteValues`] cursor.
+fn emit_run_end_byte_values<'a>(
+    encoder: &mut ByteArrayEncoder,
+    run_ends: RunEnds<'a>,
+    offset: usize,
+    selection: ValueSelection<'a>,
+    value_of: impl Fn(usize) -> &'a [u8] + Copy + 'a,
+) {
+    let runs = RunEndValueIndices::new(run_ends, offset, selection);
+    if encoder.write_run_end_dict(runs, value_of) {
+        return;
+    }
+    // Non-dictionary fall-through (PLAIN/DELTA, or geo stats active): reuse the
+    // same single run cursor instead of a `run_of` binary search per row.
+    encoder.write_byte_values(RunEndByteValues { runs, value_of });
+}
+
+fn write_run_end_generic<'a, T>(
+    run_ends: RunEnds<'a>,
+    offset: usize,
+    run_values: &'a dyn Array,
+    selection: ValueSelection<'a>,
+    encoder: &mut ByteArrayEncoder,
+) where
+    T: ByteArrayType,
+{
+    let arr = run_values
+        .as_any()
+        .downcast_ref::<GenericByteArray<T>>()
+        .unwrap();
+    let offsets = arr.value_offsets();
+    let data = arr.value_data();
+    emit_run_end_byte_values(encoder, run_ends, offset, selection, move |run| {
+        if arr.is_null(run) {
+            &[]
+        } else {
+            dense_byte_value::<T>(offsets, data, run)
+        }
+    });
 }
 
 fn write_string_view_indices(
@@ -1155,6 +1438,116 @@ where
         }
     }));
     Ok(())
+}
+
+fn count_run_end_within_byte_budget(
+    values: &dyn Array,
+    selection: ValueSelection<'_>,
+    byte_budget: usize,
+    target: ByteBudgetTarget,
+) -> Option<usize> {
+    // While dictionary encoding is active, REE byte values are interned once per
+    // run, so logical decoded bytes are the wrong budget. Preserve the existing
+    // dictionary-page behavior; after dictionary fallback or with dictionaries
+    // disabled, `target` is DataPage and every logical value is written out.
+    if target == ByteBudgetTarget::DictionaryPage {
+        return None;
+    }
+
+    let Ok((run_ends, offset, run_values)) = super::run_ends_of(values) else {
+        return None;
+    };
+    let runs = RunEndValueIndices::new(run_ends, offset, selection);
+    match run_values.data_type() {
+        DataType::Utf8 => {
+            let array = run_values.as_any().downcast_ref::<StringArray>().unwrap();
+            Some(count_run_end_with_lengths(runs, byte_budget, |run| {
+                generic_byte_value_len(array, run)
+            }))
+        }
+        DataType::LargeUtf8 => {
+            let array = run_values
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .unwrap();
+            Some(count_run_end_with_lengths(runs, byte_budget, |run| {
+                generic_byte_value_len(array, run)
+            }))
+        }
+        DataType::Binary => {
+            let array = run_values.as_any().downcast_ref::<BinaryArray>().unwrap();
+            Some(count_run_end_with_lengths(runs, byte_budget, |run| {
+                generic_byte_value_len(array, run)
+            }))
+        }
+        DataType::LargeBinary => {
+            let array = run_values
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            Some(count_run_end_with_lengths(runs, byte_budget, |run| {
+                generic_byte_value_len(array, run)
+            }))
+        }
+        DataType::Utf8View => {
+            let array = run_values
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            Some(count_run_end_with_lengths(runs, byte_budget, |run| {
+                view_byte_value_len(array.views(), array.nulls(), run)
+            }))
+        }
+        DataType::BinaryView => {
+            let array = run_values
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap();
+            Some(count_run_end_with_lengths(runs, byte_budget, |run| {
+                view_byte_value_len(array.views(), array.nulls(), run)
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn count_run_end_with_lengths<'a>(
+    runs: RunEndValueIndices<'a>,
+    byte_budget: usize,
+    value_len: impl Fn(usize) -> usize,
+) -> usize {
+    let mut count = 0usize;
+    let mut cum = 0usize;
+    let _: std::result::Result<(), ()> = runs.for_each_run(|run, run_count| {
+        let per_value = value_len(run).saturating_add(std::mem::size_of::<u32>());
+        let run_bytes = per_value.saturating_mul(run_count);
+        if cum.saturating_add(run_bytes) > byte_budget {
+            let remaining = byte_budget.saturating_sub(cum);
+            count += ((remaining / per_value) + 1).min(run_count);
+            return Err(());
+        }
+        cum += run_bytes;
+        count += run_count;
+        Ok(())
+    });
+    count
+}
+
+fn generic_byte_value_len<T: ByteArrayType>(array: &GenericByteArray<T>, idx: usize) -> usize {
+    if array.is_null(idx) {
+        0
+    } else {
+        let offsets = array.value_offsets();
+        (offsets[idx + 1] - offsets[idx]).as_usize()
+    }
+}
+
+fn view_byte_value_len(views: &[u128], nulls: Option<&NullBuffer>, idx: usize) -> usize {
+    if nulls.is_some_and(|n| n.is_null(idx)) {
+        0
+    } else {
+        (views[idx] as u32) as usize
+    }
 }
 
 /// Upper bound on any single value's byte length in a view array.

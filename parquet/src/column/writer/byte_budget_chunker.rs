@@ -19,7 +19,7 @@
 
 use crate::basic::Type;
 use crate::column::writer::encoder::ColumnValueEncoder;
-use crate::column::writer::{ColumnValueSource, LevelDataRef};
+use crate::column::writer::{ByteBudgetTarget, ColumnValueSource, LevelDataRef};
 use crate::file::properties::WriterProperties;
 use crate::schema::types::ColumnDescriptor;
 
@@ -123,21 +123,24 @@ impl ByteBudgetChunker {
         if chunk_size == 0 {
             return chunk_size;
         }
-        let budget = if encoder.has_dictionary() {
+        let (budget, target) = if encoder.has_dictionary() {
             if self.static_dict_always_fits {
                 return chunk_size;
             }
             // Bound the mini-batch by the dictionary page's *remaining*
             // budget (it accumulates across mini-batches until it spills).
             match encoder.estimated_dict_page_size() {
-                Some(used) => self.dict_page_byte_limit.saturating_sub(used),
+                Some(used) => (
+                    self.dict_page_byte_limit.saturating_sub(used),
+                    ByteBudgetTarget::DictionaryPage,
+                ),
                 None => return chunk_size,
             }
         } else {
             if self.static_always_fits {
                 return chunk_size;
             }
-            self.page_byte_limit
+            (self.page_byte_limit, ByteBudgetTarget::DataPage)
         };
         self.byte_budget_sub_batch_size::<E, S>(
             source,
@@ -145,6 +148,7 @@ impl ByteBudgetChunker {
             values_offset,
             chunk_size,
             budget,
+            target,
         )
     }
 
@@ -161,6 +165,7 @@ impl ByteBudgetChunker {
         values_offset: usize,
         chunk_size: usize,
         budget: usize,
+        target: ByteBudgetTarget,
     ) -> usize
     where
         E: ColumnValueEncoder,
@@ -183,7 +188,7 @@ impl ByteBudgetChunker {
         let take = vals_in_chunk.min(remaining);
         let fit = source
             .slice(values_offset, take)
-            .count_within_byte_budget(budget);
+            .count_within_byte_budget(budget, target);
         match fit {
             None => chunk_size,
             Some(values_per_subbatch) => {

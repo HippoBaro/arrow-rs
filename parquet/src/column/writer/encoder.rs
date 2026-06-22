@@ -21,7 +21,8 @@ use half::f16;
 use crate::basic::{ConvertedType, Encoding, LogicalType, Type};
 use crate::bloom_filter::Sbbf;
 use crate::column::writer::{
-    ColumnWriter, ColumnWriterImpl, SliceColumnValueEncoder, SliceColumnValueSource, ValueSelection,
+    ByteBudgetTarget, ColumnWriter, ColumnWriterImpl, SliceColumnValueEncoder,
+    SliceColumnValueSource, ValueSelection,
 };
 use crate::column::writer::{
     compare_greater, fallback_encoding, has_dictionary_support, is_nan, update_max, update_min,
@@ -326,6 +327,57 @@ where
         }
         Ok(())
     }
+
+    /// Dictionary-encode a run-end-encoded value stream: intern each run's value
+    /// once and buffer one `(index, count)` entry per run, so the index buffer is
+    /// O(runs) not O(rows). Stats and the bloom filter see each run value once,
+    /// which is sufficient for min/max and set membership. Falls back to the
+    /// per-value path when the column is not dictionary-encoded (PLAIN gains
+    /// nothing from the run structure — it writes every value out).
+    #[inline]
+    pub(crate) fn fold_run_end_value_stream<'a, S: ValueStream<'a, T::T, Bulk = [T::T]>>(
+        &mut self,
+        values: S,
+    ) -> Result<()>
+    where
+        T::T: 'a,
+    {
+        if self.dict_encoder.is_none() {
+            return self.fold_value_stream(values);
+        }
+        let should_update_stats = self.statistics_enabled != EnabledStatistics::None
+            && self.descr.converted_type() != ConvertedType::INTERVAL;
+        let ctx = <T::T as StatFold>::ctx(&self.descr);
+        self.num_values += values.len();
+
+        let mut min: Option<T::T> = None;
+        let mut max: Option<T::T> = None;
+        {
+            let dict = self
+                .dict_encoder
+                .as_mut()
+                .expect("dictionary encoder present");
+            let mut bloom = self.bloom_filter.as_mut();
+            values.for_each_run(|value, count| -> Result<()> {
+                if should_update_stats {
+                    <T::T as StatFold>::observe(ctx, value, &mut min, &mut max);
+                }
+                if let Some(bloom) = bloom.as_deref_mut() {
+                    bloom.insert(&value);
+                }
+                dict.put_value_run(&value, count);
+                Ok(())
+            })?;
+        }
+
+        if let Some(min) = min {
+            update_min_normalized(&self.descr, &min, &mut self.min_value);
+        }
+        if let Some(max) = max {
+            update_max_normalized(&self.descr, &max, &mut self.max_value);
+        }
+        Ok(())
+    }
 }
 
 impl ColumnValueEncoderImpl<BoolType, BoolEncoderObject> {
@@ -397,9 +449,28 @@ impl ColumnValueEncoderImpl<FixedLenByteArrayType, FixedLenByteArrayEncoderObjec
     /// computed values stream one at a time through [`FlbaSink::consume_value`].
     #[cfg(feature = "arrow")]
     pub(crate) fn fixed_len_sink(&mut self, len: usize) -> FlbaSink<'_> {
+        self.fixed_len_sink_inner(len, true)
+    }
+
+    /// Open a run-aware FLBA sink. This intentionally skips reserving `len`
+    /// dense dictionary indices because run-end input records `(index, count)`
+    /// pairs instead.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn fixed_len_run_sink(&mut self, len: usize) -> FlbaSink<'_> {
+        self.fixed_len_sink_inner(len, false)
+    }
+
+    #[cfg(feature = "arrow")]
+    fn fixed_len_sink_inner(
+        &mut self,
+        len: usize,
+        reserve_dictionary_indices: bool,
+    ) -> FlbaSink<'_> {
         self.num_values += len;
-        if let Some(dict_encoder) = self.dict_encoder.as_mut() {
-            dict_encoder.reserve(len);
+        if reserve_dictionary_indices {
+            if let Some(dict_encoder) = self.dict_encoder.as_mut() {
+                dict_encoder.reserve(len);
+            }
         }
         let should_update_stats = self.statistics_enabled != EnabledStatistics::None
             && self.descr.converted_type() != ConvertedType::INTERVAL;
@@ -456,9 +527,8 @@ impl FlbaSink<'_> {
         self.bulk_ok
     }
 
-    /// Fold one value into page stats and bloom state, then intern or append it.
     #[inline]
-    pub(crate) fn consume_value(&mut self, value: &[u8]) -> Result<()> {
+    fn reserve_value_width(&mut self, width: usize) {
         if !self.reserved {
             // Size the (append-encoder) page buffer once from the known value count
             // and observed width, so the per-value appends never reallocate. No-op
@@ -466,9 +536,13 @@ impl FlbaSink<'_> {
             self.reserved = true;
             if self.dict.is_none() {
                 self.encoder
-                    .reserve_fixed_len(value.len().saturating_mul(self.len));
+                    .reserve_fixed_len(width.saturating_mul(self.len));
             }
         }
+    }
+
+    #[inline]
+    fn observe_value(&mut self, value: &[u8]) {
         if self.should_update_stats && !is_nan_byte_array(self.descr, value) {
             if !self.has_min || compare_greater_byte_array(self.descr, &self.min, value) {
                 self.min.clear();
@@ -484,6 +558,13 @@ impl FlbaSink<'_> {
         if let Some(bloom) = self.bloom.as_deref_mut() {
             bloom.insert(value);
         }
+    }
+
+    /// Fold one value into page stats and bloom state, then intern or append it.
+    #[inline]
+    pub(crate) fn consume_value(&mut self, value: &[u8]) -> Result<()> {
+        self.reserve_value_width(value.len());
+        self.observe_value(value);
         match self.dict.as_deref_mut() {
             Some(dict) => {
                 dict.put_value_bytes(value, || {
@@ -492,6 +573,31 @@ impl FlbaSink<'_> {
                 Ok(())
             }
             None => self.encoder.append_fixed_len_value(value),
+        }
+    }
+
+    /// Consume a run of identical logical FLBA values without buffering one
+    /// dictionary index per value.
+    #[inline]
+    pub(crate) fn consume_value_run(&mut self, value: &[u8], count: usize) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.reserve_value_width(value.len());
+        self.observe_value(value);
+        match self.dict.as_deref_mut() {
+            Some(dict) => {
+                dict.put_value_bytes_run(value, count, || {
+                    FixedLenByteArray::from(ByteArray::from(value.to_vec()))
+                });
+                Ok(())
+            }
+            None => {
+                for _ in 0..count {
+                    self.encoder.append_fixed_len_value(value)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -641,8 +747,10 @@ where
         }
         match &mut self.target {
             NumericSinkTarget::Dict(dict) => {
+                #[cfg(feature = "arrow")]
+                dict.materialize_index_runs();
                 for &value in chunk {
-                    dict.put_value(&value);
+                    dict.put_one(&value);
                 }
                 Ok(())
             }
@@ -847,12 +955,17 @@ impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> SliceColumnValueEncode
                 }
                 Ok(())
             }
+            #[cfg(feature = "arrow")]
+            ValueSelection::RunEnd(_) => {
+                unreachable!("run-end columns do not use the slice value source")
+            }
         }
     }
 
     fn count_slice_source_within_byte_budget(
         source: SliceColumnValueSource<'_, Self::Values>,
         byte_budget: usize,
+        _target: ByteBudgetTarget,
     ) -> Option<usize> {
         match source.selection() {
             #[cfg(feature = "arrow")]
@@ -874,6 +987,10 @@ impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> SliceColumnValueEncode
                     byte_budget,
                     indices.iter().map(|&i| values.get(i)),
                 )
+            }
+            #[cfg(feature = "arrow")]
+            ValueSelection::RunEnd(_) => {
+                unreachable!("run-end columns do not use the slice value source")
             }
         }
     }

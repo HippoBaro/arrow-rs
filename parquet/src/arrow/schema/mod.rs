@@ -858,11 +858,18 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             let dict_field = field.clone().with_data_type(value.as_ref().clone());
             arrow_to_parquet_type(&dict_field, coerce_types)
         }
-        DataType::RunEndEncoded(_, value_field) => {
-            let ree_value_field = field
+        DataType::RunEndEncoded(_, value) => {
+            // Run-end encoding is a physical layout: the parquet column carries
+            // the run *value* type and is optional if either the run array or
+            // its run values can be null. Leaf value types are written natively
+            // (compact RLE_DICTIONARY) and non-leaf value types are hydrated to
+            // their dense equivalent at write time, so every value type recurses
+            // here rather than erroring.
+            let leaf = field
                 .clone()
-                .with_data_type(value_field.data_type().clone());
-            arrow_to_parquet_type(&ree_value_field, coerce_types)
+                .with_data_type(value.data_type().clone())
+                .with_nullable(field.is_nullable() || value.is_nullable());
+            arrow_to_parquet_type(&leaf, coerce_types)
         }
     }
 }
@@ -1986,6 +1993,64 @@ mod tests {
             .convert(&arrow_schema);
 
         converted_arrow_schema.unwrap();
+    }
+
+    #[test]
+    fn test_run_end_schema_conversion_recurses_into_value_type() {
+        fn run_end_type(value_type: DataType, nullable_values: bool) -> DataType {
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", value_type, nullable_values)),
+            )
+        }
+
+        // Leaf value type: the parquet column carries the value's physical type
+        // (written natively as compact RLE_DICTIONARY).
+        let leaf_schema = Schema::new(vec![Field::new(
+            "ree",
+            run_end_type(DataType::Int32, true),
+            false,
+        )]);
+        let converted = ArrowSchemaConverter::new().convert(&leaf_schema).unwrap();
+        assert_eq!(converted.columns().len(), 1);
+        assert_eq!(converted.column(0).name(), "ree");
+        assert_eq!(converted.column(0).physical_type(), PhysicalType::INT32);
+        assert_eq!(converted.column(0).max_def_level(), 1);
+
+        // Non-leaf value types recurse into the value type (hydrated to their
+        // dense equivalent at write time) rather than erroring.
+        let list_schema = Schema::new(vec![Field::new(
+            "ree_list",
+            run_end_type(
+                DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
+                true,
+            ),
+            true,
+        )]);
+        let converted = ArrowSchemaConverter::new().convert(&list_schema).unwrap();
+        assert_eq!(converted.columns().len(), 1);
+        assert_eq!(converted.column(0).physical_type(), PhysicalType::INT32);
+        assert!(
+            converted.column(0).max_rep_level() >= 1,
+            "list element should be repeated"
+        );
+
+        let dictionary_schema = Schema::new(vec![Field::new(
+            "ree_dictionary",
+            run_end_type(
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+            ),
+            true,
+        )]);
+        let converted = ArrowSchemaConverter::new()
+            .convert(&dictionary_schema)
+            .unwrap();
+        assert_eq!(converted.columns().len(), 1);
+        assert_eq!(
+            converted.column(0).physical_type(),
+            PhysicalType::BYTE_ARRAY
+        );
     }
 
     #[test]

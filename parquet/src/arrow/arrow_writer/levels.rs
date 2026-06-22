@@ -41,7 +41,8 @@
 //! \[1\] [parquet-format#nested-encoding](https://github.com/apache/parquet-format#nested-encoding)
 
 use crate::column::chunker::CdcChunk;
-use crate::column::writer::{LevelDataRef, ValueSelection};
+use crate::column::writer::{LevelDataRef, RunEndLevelsRef, RunEndSelectionRef, ValueSelection};
+use crate::encodings::encoding::RunEnds;
 use crate::errors::{ParquetError, Result};
 use arrow_array::cast::AsArray;
 use arrow_array::types::RunEndIndexType;
@@ -198,17 +199,55 @@ impl LevelInfoBuilder {
         }
 
         let is_nullable = field.is_nullable();
+        let leaf_nullable = Self::leaf_nullable(field);
 
         match array.data_type() {
             d if is_leaf(d) => {
-                let levels = ArrayLevels::new(parent_ctx, is_nullable, array.clone());
+                let levels = ArrayLevels::new(parent_ctx, leaf_nullable, array.clone());
                 Ok(Self::Primitive(levels))
             }
             DataType::Dictionary(_, v) if is_leaf(v.as_ref()) => {
-                let levels = ArrayLevels::new(parent_ctx, is_nullable, array.clone());
+                let levels = ArrayLevels::new(parent_ctx, leaf_nullable, array.clone());
                 Ok(Self::Primitive(levels))
             }
+            DataType::RunEndEncoded(_, v) if is_leaf(v.data_type()) => {
+                let run_null_count = run_end_logical_null_count(array);
+                if !leaf_nullable && run_null_count > 0 {
+                    return Err(arrow_err!(
+                        "Field '{}' is non-nullable but run-end encoded array contains null values",
+                        field.name()
+                    ));
+                }
+                // A *flat* run-end leaf — no nullable/repeated ancestor — whose
+                // window contains null run values has definition levels that are
+                // piecewise-constant across runs (`max_def` for a non-null run,
+                // `max_def - 1` for a null run). Emit them, and the value
+                // selection, straight from the run structure in O(runs) — without
+                // materializing the O(rows) logical null buffer. With a composing
+                // ancestor (`def_level`/`rep_level > 0`) the levels are no longer
+                // run-aligned, and a flat leaf with no null run values is already a
+                // single uniform run, so both keep the standard materialized path.
+                if parent_ctx.def_level == 0 && parent_ctx.rep_level == 0 && run_null_count > 0 {
+                    let mut levels =
+                        ArrayLevels::new_run_end(parent_ctx, leaf_nullable, array.clone());
+                    levels.def_levels = LevelData::RunEnd(RunEndLevels::for_array(
+                        array.clone(),
+                        levels.max_def_level,
+                        array.len() - run_null_count,
+                    ));
+                    return Ok(Self::Primitive(levels));
+                }
+                Ok(Self::Primitive(ArrayLevels::new(
+                    parent_ctx,
+                    leaf_nullable,
+                    array.clone(),
+                )))
+            }
             DataType::RunEndEncoded(_, value_field) => {
+                // Non-leaf run-end value type (e.g. REE of List/Struct/Dictionary):
+                // the native run-sourced path only covers leaf value types, so
+                // hydrate to the dense equivalent and write through the normal
+                // path (upstream's correctness-first fallback).
                 let flat = expand_ree_array(array)?;
                 let flat_field = Field::new(
                     field.name(),
@@ -309,6 +348,15 @@ impl LevelInfoBuilder {
                 })
             }
             d => Err(nyi_err!("Datatype {} is not yet supported", d)),
+        }
+    }
+
+    fn leaf_nullable(field: &Field) -> bool {
+        match field.data_type() {
+            DataType::RunEndEncoded(_, value_field) => {
+                field.is_nullable() || value_field.is_nullable()
+            }
+            _ => field.is_nullable(),
         }
     }
 
@@ -887,6 +935,15 @@ impl LevelInfoBuilder {
     fn write_leaf(info: &mut ArrayLevels, range: Range<usize>) {
         let len = range.end - range.start;
 
+        // Flat run-end leaf: definition levels were set from the run structure
+        // at construction (`try_new`), so only the value selection is recorded
+        // here. (Checked first: an all-null run array would otherwise hit the
+        // append-based fast paths below, which a run-sourced def rejects.)
+        if matches!(info.def_levels, LevelData::RunEnd(_)) {
+            Self::write_run_end_leaf_values(info, range);
+            return;
+        }
+
         // Fast path: entire leaf array is null
         if let Some(nulls) = &info.logical_nulls {
             if info.max_def_level > 0 && nulls.null_count() == nulls.len() {
@@ -961,6 +1018,28 @@ impl LevelInfoBuilder {
         }
     }
 
+    /// Record the value selection (the non-null logical rows) for a flat
+    /// run-end leaf whose definition levels are run-sourced. The selection is
+    /// enumerated from the run structure too — no per-row index list. A flat
+    /// run-end leaf has no level-composing ancestor, so it is visited once over
+    /// its whole logical extent, and there are no repetition levels to emit.
+    fn write_run_end_leaf_values(info: &mut ArrayLevels, range: Range<usize>) {
+        debug_assert_eq!(range.start, 0);
+        debug_assert_eq!(range.end, info.array.len());
+        // The non-null row count was computed once in `try_new` (from the run
+        // structure, O(runs)) and threaded onto the run-sourced definition
+        // levels; reuse it instead of re-walking the runs. This path is only
+        // reached when `def_levels` is `RunEnd` (see the dispatch in `write_leaf`).
+        let val_len = match &info.def_levels {
+            LevelData::RunEnd(levels) => levels.val_len,
+            _ => unreachable!("flat run-end leaf values require run-sourced definition levels"),
+        };
+        info.values = OwnedValueSelection::RunEnd(RunEndSelection {
+            array: info.array.clone(),
+            val_len,
+        });
+    }
+
     /// Visits all children of this node in depth first order
     fn visit_leaves(&mut self, visit: impl Fn(&mut ArrayLevels) + Copy) {
         match self {
@@ -980,27 +1059,19 @@ impl LevelInfoBuilder {
 
     /// Determine if the fields are compatible for purposes of constructing `LevelBuilderInfo`.
     ///
-    /// Fields are compatible if they're the same type. Otherwise if one of them is a dictionary
-    /// and the other is a native array, the dictionary values must have the same type as the
-    /// native array
+    /// Fields are compatible if they're the same type. Otherwise, dictionary and
+    /// run-end encoded wrappers are compared by logical value type.
     fn types_compatible(a: &DataType, b: &DataType) -> bool {
         // if the Arrow data types are equal, the types are deemed compatible
         if a.equals_datatype(b) {
             return true;
         }
 
-        // get the values out of the dictionaries
-        let (a, b) = match (a, b) {
-            (DataType::Dictionary(_, va), DataType::Dictionary(_, vb)) => {
-                (va.as_ref(), vb.as_ref())
-            }
-            (DataType::Dictionary(_, v), b) => (v.as_ref(), b),
-            (a, DataType::Dictionary(_, v)) => (a, v.as_ref()),
-            _ => (a, b),
-        };
+        let a = Self::logical_value_type(a);
+        let b = Self::logical_value_type(b);
 
-        // now that we've got the values from one/both dictionaries, if the values
-        // have the same Arrow data type, they're compatible
+        // now that we've got the values from dictionaries / run-end encodings, if
+        // the values have the same Arrow data type, they're compatible
         if a == b {
             return true;
         }
@@ -1022,6 +1093,18 @@ impl LevelInfoBuilder {
             _ => false,
         }
     }
+
+    fn logical_value_type(mut data_type: &DataType) -> &DataType {
+        loop {
+            match data_type {
+                DataType::Dictionary(_, value_type) => data_type = value_type.as_ref(),
+                DataType::RunEndEncoded(_, value_field) => {
+                    data_type = value_field.data_type();
+                }
+                _ => return data_type,
+            }
+        }
+    }
 }
 
 /// The data necessary to write a primitive Arrow array to parquet, taking into account
@@ -1030,7 +1113,96 @@ impl LevelInfoBuilder {
 pub(crate) enum LevelData {
     Absent,
     Materialized(Vec<i16>),
-    Uniform { value: i16, count: usize },
+    Uniform {
+        value: i16,
+        count: usize,
+    },
+    /// Definition levels of a flat run-end-encoded leaf, kept as the run
+    /// structure itself (no per-row materialization). Set once at construction;
+    /// see [`LevelInfoBuilder::try_new`].
+    RunEnd(RunEndLevels),
+}
+
+/// Owned handle to a run-end-encoded array whose run structure drives a leaf's
+/// definition levels. Holds a cheap `Arc` clone of the array; the borrowed
+/// [`RunEndLevelsRef`] used by the column writer is reconstructed on demand.
+#[derive(Debug, Clone)]
+pub(crate) struct RunEndLevels {
+    /// The run-end-encoded leaf array.
+    array: ArrayRef,
+    /// The column's maximum definition level (= the non-null run def level).
+    max_def_level: i16,
+    /// Count of non-null logical rows (`array.len() - run_null_count`). Computed
+    /// once in [`LevelInfoBuilder::try_new`] from the run structure (where the
+    /// null count is already in hand) and reused by `write_run_end_leaf_values`
+    /// to size the value selection without re-walking the runs.
+    val_len: usize,
+}
+
+impl RunEndLevels {
+    fn for_array(array: ArrayRef, max_def_level: i16, val_len: usize) -> Self {
+        Self {
+            array,
+            max_def_level,
+            val_len,
+        }
+    }
+
+    fn as_level_ref(&self) -> LevelDataRef<'_> {
+        let (run_ends, base, run_validity) = run_ends_and_validity(&self.array);
+        LevelDataRef::RunEnd(RunEndLevelsRef::new(
+            run_ends,
+            run_validity,
+            self.max_def_level,
+            base,
+            self.array.len(),
+        ))
+    }
+}
+
+/// Extract the borrowed run boundaries, slice offset, and per-run validity of a
+/// run-end-encoded array. Only reached for flat REE leaves with null run values
+/// (see the gate in [`LevelInfoBuilder::try_new`]), so the run values always
+/// carry a null buffer.
+fn run_ends_and_validity(array: &ArrayRef) -> (RunEnds<'_>, usize, &NullBuffer) {
+    // Run-end def-levels are only set when the run values contain nulls, so the
+    // run-values child always carries a null buffer.
+    const NULLS_EXPECT: &str = "run-end definition levels imply null run values";
+    // Reuse the single run-array downcast (shared with the numeric dispatch and
+    // the byte-array run-end path); this path is only reached for validated REE
+    // leaves, so an unsupported index type is unreachable here.
+    let (run_ends, offset, run_values) = super::run_ends_of(array.as_ref())
+        .expect("run-end definition levels require a run-end-encoded array");
+    (run_ends, offset, run_values.nulls().expect(NULLS_EXPECT))
+}
+
+/// Logical null count of a (possibly sliced) run-end-encoded array, computed in
+/// O(runs) by walking the run boundaries within the array's window — the same
+/// walk as `RunEndLevelsRef::for_each_run` — instead of materializing the
+/// O(rows) `Array::logical_nulls` buffer just to count its nulls. Returns 0 when
+/// the run values carry no null buffer.
+fn run_end_logical_null_count(array: &ArrayRef) -> usize {
+    let (run_ends, base, run_values) =
+        super::run_ends_of(array.as_ref()).expect("run-end-encoded array");
+    let Some(validity) = run_values.nulls() else {
+        return 0;
+    };
+    if validity.null_count() == 0 {
+        return 0;
+    }
+    let hi = base + array.len();
+    let mut run = run_ends.run_of(base);
+    let mut pos = base;
+    let mut nulls = 0;
+    while pos < hi {
+        let run_end = run_ends.end_of(run).min(hi);
+        if validity.is_null(run) {
+            nulls += run_end - pos;
+        }
+        pos = run_end;
+        run += 1;
+    }
+    nulls
 }
 
 // Compare logical level contents rather than physical representation, so a
@@ -1054,6 +1226,9 @@ impl PartialEq for LevelData {
                     count: n2,
                 },
             ) => v1 == v2 && n1 == n2,
+            (Self::RunEnd(a), Self::RunEnd(b)) => {
+                a.max_def_level == b.max_def_level && a.array.as_ref() == b.array.as_ref()
+            }
             _ => false,
         }
     }
@@ -1077,6 +1252,7 @@ impl LevelData {
                 value: *value,
                 count: *count,
             },
+            Self::RunEnd(runs) => runs.as_level_ref(),
         }
     }
 
@@ -1110,6 +1286,11 @@ impl LevelData {
                 let values = self.materialize_mut().unwrap();
                 values.extend(std::iter::repeat_n(value, count));
             }
+            // Run-end definition levels are set once at construction and never
+            // appended to (the leaf has no level-composing ancestor).
+            Self::RunEnd(_) => {
+                unreachable!("run-end definition levels are not built incrementally")
+            }
         }
     }
 
@@ -1136,6 +1317,9 @@ impl LevelData {
                     _ => unreachable!(),
                 }
             }
+            Self::RunEnd(_) => {
+                unreachable!("run-end definition levels are not materialized")
+            }
         }
     }
 }
@@ -1143,8 +1327,37 @@ impl LevelData {
 #[derive(Debug, Clone)]
 pub(crate) enum OwnedValueSelection {
     Empty,
-    Dense { offset: usize, len: usize },
+    Dense {
+        offset: usize,
+        len: usize,
+    },
     Sparse(Vec<usize>),
+    /// The non-null logical rows of a flat run-end-encoded leaf, enumerated from
+    /// the run structure (no materialized index list). Paired with the
+    /// run-sourced definition levels (see [`LevelData::RunEnd`]).
+    RunEnd(RunEndSelection),
+}
+
+/// Owned handle backing [`OwnedValueSelection::RunEnd`]: a cheap `Arc` clone of
+/// the run array plus the count of non-null rows. The borrowed
+/// [`RunEndSelectionRef`] is reconstructed on demand.
+#[derive(Debug, Clone)]
+pub(crate) struct RunEndSelection {
+    array: ArrayRef,
+    /// Number of non-null logical rows (the value-space length).
+    val_len: usize,
+}
+
+impl RunEndSelection {
+    fn as_ref(&self) -> ValueSelection<'_> {
+        let (run_ends, base, run_validity) = run_ends_and_validity(&self.array);
+        ValueSelection::RunEnd(RunEndSelectionRef::new(
+            run_ends,
+            run_validity,
+            base,
+            self.val_len,
+        ))
+    }
 }
 
 impl PartialEq for OwnedValueSelection {
@@ -1170,6 +1383,9 @@ impl PartialEq for OwnedValueSelection {
                     && indices.first().copied() == Some(*offset)
                     && indices.windows(2).all(|w| w[1] == w[0] + 1)
             }
+            (Self::RunEnd(a), Self::RunEnd(b)) => {
+                a.val_len == b.val_len && a.array.as_ref() == b.array.as_ref()
+            }
             _ => false,
         }
     }
@@ -1186,6 +1402,7 @@ impl OwnedValueSelection {
                 len: *len,
             },
             Self::Sparse(indices) => ValueSelection::Sparse(indices),
+            Self::RunEnd(sel) => sel.as_ref(),
         }
     }
 
@@ -1245,6 +1462,7 @@ impl OwnedValueSelection {
                 *self = Self::Sparse(indices);
             }
             Self::Sparse(indices) => indices.extend(range),
+            Self::RunEnd(_) => unreachable!("run-end value selection is not built incrementally"),
         }
     }
 
@@ -1280,6 +1498,7 @@ impl OwnedValueSelection {
                 indices.reserve(value_count);
                 indices.extend(iter);
             }
+            Self::RunEnd(_) => unreachable!("run-end value selection is not built incrementally"),
         }
     }
 
@@ -1288,6 +1507,11 @@ impl OwnedValueSelection {
             Self::Empty => Vec::new(),
             Self::Dense { offset, len } => (*offset..*offset + *len).collect(),
             Self::Sparse(indices) => indices.clone(),
+            Self::RunEnd(sel) => {
+                let mut indices = Vec::with_capacity(sel.val_len);
+                sel.as_ref().for_each(|idx| indices.push(idx));
+                indices
+            }
         }
     }
 }
@@ -1362,13 +1586,29 @@ impl Eq for ArrayLevels {}
 
 impl ArrayLevels {
     fn new(ctx: LevelContext, is_nullable: bool, array: ArrayRef) -> Self {
+        let logical_nulls = array.logical_nulls();
+        Self::with_logical_nulls(ctx, is_nullable, array, logical_nulls)
+    }
+
+    /// Like [`Self::new`] but for a flat run-end leaf whose definition levels and
+    /// value selection are sourced from the run structure: skips materializing the
+    /// O(rows) `logical_nulls` buffer, which those run-sourced paths never read
+    /// (the null count they need is derived from the runs in O(runs)).
+    fn new_run_end(ctx: LevelContext, is_nullable: bool, array: ArrayRef) -> Self {
+        Self::with_logical_nulls(ctx, is_nullable, array, None)
+    }
+
+    fn with_logical_nulls(
+        ctx: LevelContext,
+        is_nullable: bool,
+        array: ArrayRef,
+        logical_nulls: Option<NullBuffer>,
+    ) -> Self {
         let max_rep_level = ctx.rep_level;
         let max_def_level = match is_nullable {
             true => ctx.def_level + 1,
             false => ctx.def_level,
         };
-
-        let logical_nulls = array.logical_nulls();
 
         Self {
             def_levels: LevelData::new(max_def_level != 0),
@@ -1459,11 +1699,7 @@ impl ArrayLevels {
 
     #[cfg(test)]
     fn materialized_indices(&self) -> Vec<usize> {
-        match &self.values {
-            OwnedValueSelection::Empty => Vec::new(),
-            OwnedValueSelection::Dense { offset, len } => (*offset..*offset + *len).collect(),
-            OwnedValueSelection::Sparse(indices) => indices.clone(),
-        }
+        self.values.materialized_indices()
     }
 }
 

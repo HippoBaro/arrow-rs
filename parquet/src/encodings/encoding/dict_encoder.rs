@@ -87,8 +87,20 @@ impl<T: DataType> Storage for KeyStorage<T> {
 pub struct DictEncoder<T: DataType> {
     interner: Interner<KeyStorage<T>>,
 
-    /// The buffered indices
+    /// The buffered indices, one per value (the dense path).
     indices: Vec<u64>,
+
+    /// Run-buffered indices `(index, count)` for run-end-encoded input, where a
+    /// run of `count` identical logical values shares one dictionary entry. Kept
+    /// separate from `indices` so REE-only chunks stay O(runs); if dense values
+    /// are appended later, the pending runs are materialized first.
+    #[cfg(feature = "arrow")]
+    index_runs: Vec<(u64, u64)>,
+
+    /// Logical value count buffered in `index_runs` (the sum of its run lengths),
+    /// tracked so size/length queries stay O(1).
+    #[cfg(feature = "arrow")]
+    run_value_count: usize,
 }
 
 impl<T: DataType> DictEncoder<T> {
@@ -103,6 +115,10 @@ impl<T: DataType> DictEncoder<T> {
         Self {
             interner: Interner::new(storage),
             indices: vec![],
+            #[cfg(feature = "arrow")]
+            index_runs: vec![],
+            #[cfg(feature = "arrow")]
+            run_value_count: 0,
         }
     }
 
@@ -142,17 +158,86 @@ impl<T: DataType> DictEncoder<T> {
         for index in &self.indices {
             encoder.put(*index)
         }
+        #[cfg(feature = "arrow")]
+        {
+            // Run-buffered indices: each run emits its index `count` times, which
+            // the RLE encoder collapses back to one run in O(1).
+            for &(index, count) in &self.index_runs {
+                encoder.put_run(index, count as usize);
+            }
+            self.index_runs.clear();
+            self.run_value_count = 0;
+        }
         self.indices.clear();
         Ok(encoder.consume().into())
     }
 
+    /// Append a run of `count` identical logical values sharing dictionary
+    /// `index`, without materializing one index per value. Used by the
+    /// run-end-encoded write path so the index buffer is O(runs), not O(rows).
+    #[cfg(feature = "arrow")]
     #[inline]
-    fn put_one(&mut self, value: &T::T) {
+    pub(crate) fn push_index_run(&mut self, index: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.index_runs.push((index, count as u64));
+        self.run_value_count += count;
+    }
+
+    /// Materialize pending run-buffered indices into the dense index buffer.
+    /// This preserves append order when a column chunk mixes REE and dense
+    /// batches while keeping the REE-only path run-buffered.
+    ///
+    /// The emptiness check is `#[inline]` so dense callers pay only a
+    /// load-and-branch (essentially always not taken: `index_runs` is empty
+    /// unless a prior run-end batch buffered runs). The actual O(runs) expansion
+    /// is kept `#[cold]` and out of line so it never bloats the hot intern loop.
+    /// Hot per-value loops call this once up front — hoisted out of the loop —
+    /// and then use `put_one` directly.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    pub(crate) fn materialize_index_runs(&mut self) {
+        if !self.index_runs.is_empty() {
+            self.materialize_index_runs_cold();
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[cold]
+    #[inline(never)]
+    fn materialize_index_runs_cold(&mut self) {
+        self.indices.reserve(self.run_value_count);
+        for &(index, count) in &self.index_runs {
+            self.indices
+                .extend(std::iter::repeat_n(index, count as usize));
+        }
+        self.index_runs.clear();
+        self.run_value_count = 0;
+    }
+
+    /// Intern `value` and append it as a run of `count` repetitions.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    pub(crate) fn put_value_run(&mut self, value: &T::T, count: usize) {
+        let index = self.interner.intern(value);
+        self.push_index_run(index, count);
+    }
+
+    /// Intern `value` and append its dictionary index to the dense `indices`
+    /// buffer. Precondition: any run-buffered indices have already been flushed
+    /// (see `materialize_index_runs`); dense per-value hot loops hoist that flush
+    /// out of the loop and call this directly, while `put_value` is the guarded
+    /// entry point for callers that cannot guarantee the precondition.
+    #[inline]
+    pub(crate) fn put_one(&mut self, value: &T::T) {
         self.indices.push(self.interner.intern(value));
     }
 
     #[inline]
     pub(crate) fn put_value(&mut self, value: &T::T) {
+        #[cfg(feature = "arrow")]
+        self.materialize_index_runs();
         self.put_one(value);
     }
 
@@ -163,7 +248,21 @@ impl<T: DataType> DictEncoder<T> {
     #[cfg(feature = "arrow")]
     #[inline]
     pub(crate) fn put_value_bytes(&mut self, bytes: &[u8], make: impl FnOnce() -> T::T) {
+        self.materialize_index_runs();
         self.indices.push(self.interner.intern_bytes(bytes, make));
+    }
+
+    /// Intern a byte-backed value and append it as a run of `count` repetitions.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    pub(crate) fn put_value_bytes_run(
+        &mut self,
+        bytes: &[u8],
+        count: usize,
+        make: impl FnOnce() -> T::T,
+    ) {
+        let index = self.interner.intern_bytes(bytes, make);
+        self.push_index_run(index, count);
     }
 
     /// Reserve capacity for `additional` more dictionary indices, so the
@@ -171,6 +270,7 @@ impl<T: DataType> DictEncoder<T> {
     /// amortize their growth (matching the bulk [`Encoder::put`] reserve).
     #[cfg(feature = "arrow")]
     pub(crate) fn reserve(&mut self, additional: usize) {
+        self.materialize_index_runs();
         self.indices.reserve(additional);
     }
 
@@ -182,6 +282,8 @@ impl<T: DataType> DictEncoder<T> {
 
 impl<T: DataType> Encoder<T> for DictEncoder<T> {
     fn put(&mut self, values: &[T::T]) -> Result<()> {
+        #[cfg(feature = "arrow")]
+        self.materialize_index_runs();
         self.indices.reserve(values.len());
         for i in values {
             self.put_one(i)
@@ -202,7 +304,11 @@ impl<T: DataType> Encoder<T> for DictEncoder<T> {
     /// <already_written_encoded_byte_size> + <estimated_encoded_size_of_unflushed_bytes>
     fn estimated_data_encoded_size(&self) -> usize {
         let bit_width = self.bit_width();
-        RleEncoder::max_buffer_size(bit_width, self.indices.len())
+        #[cfg(feature = "arrow")]
+        let num_values = self.indices.len() + self.run_value_count;
+        #[cfg(not(feature = "arrow"))]
+        let num_values = self.indices.len();
+        RleEncoder::max_buffer_size(bit_width, num_values)
     }
 
     fn flush_buffer(&mut self) -> Result<Bytes> {
@@ -213,7 +319,11 @@ impl<T: DataType> Encoder<T> for DictEncoder<T> {
     ///
     /// For this encoder, the indices are unencoded bytes (refer to [`Self::write_indices`]).
     fn estimated_memory_size(&self) -> usize {
-        self.interner.estimated_memory_size() + self.indices.capacity() * std::mem::size_of::<u64>()
+        let size = self.interner.estimated_memory_size()
+            + self.indices.capacity() * std::mem::size_of::<u64>();
+        #[cfg(feature = "arrow")]
+        let size = size + self.index_runs.capacity() * std::mem::size_of::<(u64, u64)>();
+        size
     }
 }
 
