@@ -106,6 +106,22 @@ pub fn get_encoder<T: DataType>(
     Ok(encoder)
 }
 
+/// Builds the encoder trait object held by a `ColumnValueEncoderImpl`.
+///
+/// The blanket implementation for `dyn Encoder<T>` defers to [`get_encoder`],
+/// giving the existing dynamic-dispatch behavior. Physical-type-specialized
+/// implementations override it where a faster path is available.
+#[doc(hidden)]
+pub trait EncoderFactory<T: DataType>: Encoder<T> {
+    fn get_encoder(encoding: Encoding, descr: &ColumnDescPtr) -> Result<Box<Self>>;
+}
+
+impl<T: DataType> EncoderFactory<T> for dyn Encoder<T> {
+    fn get_encoder(encoding: Encoding, descr: &ColumnDescPtr) -> Result<Box<Self>> {
+        get_encoder::<T>(encoding, descr)
+    }
+}
+
 // ----------------------------------------------------------------------
 // Plain encoding
 

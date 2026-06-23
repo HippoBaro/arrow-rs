@@ -20,12 +20,16 @@ use half::f16;
 
 use crate::basic::{ConvertedType, Encoding, LogicalType, Type};
 use crate::bloom_filter::Sbbf;
+use crate::column::writer::{ColumnWriter, ColumnWriterImpl};
 use crate::column::writer::{
     compare_greater, fallback_encoding, has_dictionary_support, is_nan, update_max, update_min,
 };
-use crate::data_type::DataType;
 use crate::data_type::private::ParquetValueType;
-use crate::encodings::encoding::{DictEncoder, Encoder, get_encoder};
+use crate::data_type::{
+    BoolType, ByteArrayType, DataType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type,
+    Int64Type, Int96Type,
+};
+use crate::encodings::encoding::{DictEncoder, Encoder, EncoderFactory};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
@@ -165,8 +169,80 @@ pub trait ColumnValueEncoder {
     fn flush_geospatial_statistics(&mut self) -> Option<Box<GeospatialStatistics>>;
 }
 
-pub struct ColumnValueEncoderImpl<T: DataType> {
-    encoder: Box<dyn Encoder<T>>,
+/// Selects the encoder trait object used by `ColumnValueEncoderImpl` for a
+/// Parquet physical type.
+pub trait ColumnEncoderType: DataType + Sized {
+    /// The trait object used to encode values of this physical type.
+    type Encoder: EncoderFactory<Self> + ?Sized;
+
+    /// Returns the underlying [`ColumnWriterImpl`] for the given [`ColumnWriter`].
+    fn get_column_writer(column_writer: ColumnWriter<'_>) -> Option<ColumnWriterImpl<'_, Self>>;
+
+    /// Returns a reference to the underlying [`ColumnWriterImpl`] for the given [`ColumnWriter`].
+    fn get_column_writer_ref<'a, 'b: 'a>(
+        column_writer: &'b ColumnWriter<'a>,
+    ) -> Option<&'b ColumnWriterImpl<'a, Self>>;
+
+    /// Returns a mutable reference to the underlying [`ColumnWriterImpl`] for the given
+    /// [`ColumnWriter`].
+    fn get_column_writer_mut<'a, 'b: 'a>(
+        column_writer: &'a mut ColumnWriter<'b>,
+    ) -> Option<&'a mut ColumnWriterImpl<'b, Self>>;
+}
+
+macro_rules! make_encoder_type {
+    ($name:ident, $writer_ident:ident, $encoder:ty) => {
+        impl ColumnEncoderType for $name {
+            type Encoder = $encoder;
+
+            fn get_column_writer(
+                column_writer: ColumnWriter<'_>,
+            ) -> Option<ColumnWriterImpl<'_, Self>> {
+                match column_writer {
+                    ColumnWriter::$writer_ident(w) => Some(w),
+                    _ => None,
+                }
+            }
+
+            fn get_column_writer_ref<'a, 'b: 'a>(
+                column_writer: &'b ColumnWriter<'a>,
+            ) -> Option<&'b ColumnWriterImpl<'a, Self>> {
+                match column_writer {
+                    ColumnWriter::$writer_ident(w) => Some(w),
+                    _ => None,
+                }
+            }
+
+            fn get_column_writer_mut<'a, 'b: 'a>(
+                column_writer: &'a mut ColumnWriter<'b>,
+            ) -> Option<&'a mut ColumnWriterImpl<'b, Self>> {
+                match column_writer {
+                    ColumnWriter::$writer_ident(w) => Some(w),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+make_encoder_type!(BoolType, BoolColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(Int32Type, Int32ColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(Int64Type, Int64ColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(
+    FixedLenByteArrayType,
+    FixedLenByteArrayColumnWriter,
+    dyn Encoder<Self>
+);
+make_encoder_type!(Int96Type, Int96ColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(FloatType, FloatColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(DoubleType, DoubleColumnWriter, dyn Encoder<Self>);
+make_encoder_type!(ByteArrayType, ByteArrayColumnWriter, dyn Encoder<Self>);
+
+pub struct ColumnValueEncoderImpl<
+    T: ColumnEncoderType,
+    E: ?Sized = <T as ColumnEncoderType>::Encoder,
+> {
+    encoder: Box<E>,
     dict_encoder: Option<DictEncoder<T>>,
     descr: ColumnDescPtr,
     num_values: usize,
@@ -179,7 +255,7 @@ pub struct ColumnValueEncoderImpl<T: DataType> {
     geo_stats_accumulator: Option<Box<dyn GeoStatsAccumulator>>,
 }
 
-impl<T: DataType> ColumnValueEncoderImpl<T> {
+impl<T: ColumnEncoderType, E: Encoder<T> + ?Sized> ColumnValueEncoderImpl<T, E> {
     fn min_max(&self, values: &[T::T], value_indices: Option<&[usize]>) -> Option<(T::T, T::T)> {
         match value_indices {
             Some(indices) => get_min_max(&self.descr, indices.iter().map(|x| &values[*x])),
@@ -218,7 +294,9 @@ impl<T: DataType> ColumnValueEncoderImpl<T> {
     }
 }
 
-impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
+impl<T: ColumnEncoderType, E: EncoderFactory<T> + ?Sized> ColumnValueEncoder
+    for ColumnValueEncoderImpl<T, E>
+{
     type T = T::T;
 
     type Values = [T::T];
@@ -235,7 +313,7 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
         let dict_encoder = dict_supported.then(|| DictEncoder::new(descr.clone()));
 
         // Set either main encoder or fallback encoder.
-        let encoder = get_encoder(
+        let encoder = E::get_encoder(
             props
                 .encoding(descr.path())
                 .unwrap_or_else(|| fallback_encoding(T::get_physical_type(), props)),

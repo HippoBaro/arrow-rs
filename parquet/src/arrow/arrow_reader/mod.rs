@@ -1600,6 +1600,7 @@ pub(crate) mod tests {
     use crate::arrow::{ArrowWriter, ProjectionMask};
     use crate::basic::{ConvertedType, Encoding, LogicalType, Repetition, Type as PhysicalType};
     use crate::column::reader::decoder::REPETITION_LEVELS_BATCH_SIZE;
+    use crate::column::writer::ColumnEncoderType;
     use crate::data_type::{
         BoolType, ByteArray, ByteArrayType, DataType, DoubleType, FixedLenByteArray,
         FixedLenByteArrayType, FloatType, Int32Type, Int64Type, Int96, Int96Type,
@@ -3168,7 +3169,7 @@ pub(crate) mod tests {
         converter: F,
         encodings: &[Encoding],
     ) where
-        T: DataType,
+        T: ColumnEncoderType,
         G: RandGen<T>,
         F: Fn(&[Option<T::T>]) -> ArrayRef,
     {
@@ -3317,7 +3318,7 @@ pub(crate) mod tests {
         arrow_type: Option<ArrowDataType>,
         converter: F,
     ) where
-        T: DataType,
+        T: ColumnEncoderType,
         G: RandGen<T>,
         F: Fn(&[Option<T::T>]) -> ArrayRef,
     {
@@ -3525,7 +3526,7 @@ pub(crate) mod tests {
         data
     }
 
-    fn generate_single_column_file_with_data<T: DataType>(
+    fn generate_single_column_file_with_data<T: ColumnEncoderType>(
         values: &[Vec<T::T>],
         def_levels: Option<&Vec<Vec<i16>>>,
         file: File,
@@ -3710,7 +3711,9 @@ pub(crate) mod tests {
 
         let mut row_group_writer = writer.next_row_group().unwrap();
 
-        fn write_nulls<T: DataType>(row_group_writer: &mut SerializedRowGroupWriter<'_, File>) {
+        fn write_nulls<T: ColumnEncoderType>(
+            row_group_writer: &mut SerializedRowGroupWriter<'_, File>,
+        ) {
             let mut column_writer = row_group_writer.next_column().unwrap().unwrap();
             // write out a bunch of nulls
             column_writer

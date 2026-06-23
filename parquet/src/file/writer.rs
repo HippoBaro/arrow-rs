@@ -27,12 +27,13 @@ use std::io::{BufWriter, IoSlice, Read};
 use std::{io::Write, sync::Arc};
 
 use crate::column::page_encryption::PageEncryptor;
-use crate::column::writer::{ColumnCloseResult, ColumnWriterImpl, get_typed_column_writer_mut};
+use crate::column::writer::{
+    ColumnCloseResult, ColumnEncoderType, ColumnWriterImpl, get_typed_column_writer_mut,
+};
 use crate::column::{
     page::{CompressedPage, PageWriteSpec, PageWriter},
     writer::{ColumnWriter, get_column_writer},
 };
-use crate::data_type::DataType;
 #[cfg(feature = "encryption")]
 use crate::encryption::encrypt::{
     FileEncryptionProperties, FileEncryptor, get_column_crypto_metadata,
@@ -920,7 +921,7 @@ impl<'a> SerializedColumnWriter<'a> {
     }
 
     /// Returns a reference to a typed [`ColumnWriterImpl`]
-    pub fn typed<T: DataType>(&mut self) -> &mut ColumnWriterImpl<'a, T> {
+    pub fn typed<T: ColumnEncoderType>(&mut self) -> &mut ColumnWriterImpl<'a, T> {
         get_typed_column_writer_mut(&mut self.inner)
     }
 
@@ -1695,7 +1696,7 @@ mod tests {
     where
         W: Write + Send,
         R: ChunkReader + From<W> + 'static,
-        D: DataType,
+        D: ColumnEncoderType,
         F: Fn(Row) -> D::T,
     {
         let schema = Arc::new(

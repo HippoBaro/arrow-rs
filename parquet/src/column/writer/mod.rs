@@ -52,6 +52,8 @@ use crate::schema::types::{ColumnDescPtr, ColumnDescriptor};
 mod byte_budget_chunker;
 pub(crate) mod encoder;
 
+pub use crate::column::writer::encoder::ColumnEncoderType;
+
 use byte_budget_chunker::ByteBudgetChunker;
 
 macro_rules! downcast_writer {
@@ -157,7 +159,9 @@ pub fn get_column_writer<'a>(
 /// non-generic type to a generic column writer type `ColumnWriterImpl`.
 ///
 /// Panics if actual enum value for `col_writer` does not match the type `T`.
-pub fn get_typed_column_writer<T: DataType>(col_writer: ColumnWriter) -> ColumnWriterImpl<T> {
+pub fn get_typed_column_writer<T: ColumnEncoderType>(
+    col_writer: ColumnWriter,
+) -> ColumnWriterImpl<T> {
     T::get_column_writer(col_writer).unwrap_or_else(|| {
         panic!(
             "Failed to convert column writer into a typed column writer for `{}` type",
@@ -167,7 +171,7 @@ pub fn get_typed_column_writer<T: DataType>(col_writer: ColumnWriter) -> ColumnW
 }
 
 /// Similar to `get_typed_column_writer` but returns a reference.
-pub fn get_typed_column_writer_ref<'a, 'b: 'a, T: DataType>(
+pub fn get_typed_column_writer_ref<'a, 'b: 'a, T: ColumnEncoderType>(
     col_writer: &'b ColumnWriter<'a>,
 ) -> &'b ColumnWriterImpl<'a, T> {
     T::get_column_writer_ref(col_writer).unwrap_or_else(|| {
@@ -179,7 +183,7 @@ pub fn get_typed_column_writer_ref<'a, 'b: 'a, T: DataType>(
 }
 
 /// Similar to `get_typed_column_writer` but returns a reference.
-pub fn get_typed_column_writer_mut<'a, 'b: 'a, T: DataType>(
+pub fn get_typed_column_writer_mut<'a, 'b: 'a, T: ColumnEncoderType>(
     col_writer: &'a mut ColumnWriter<'b>,
 ) -> &'a mut ColumnWriterImpl<'b, T> {
     T::get_column_writer_mut(col_writer).unwrap_or_else(|| {
@@ -4743,7 +4747,7 @@ mod tests {
         assert_eq!(size_with_two_pages, 20 + 21);
     }
 
-    fn write_multiple_pages<T: DataType>(
+    fn write_multiple_pages<T: ColumnEncoderType>(
         column_descr: &Arc<ColumnDescriptor>,
         pages: &[&[Option<T::T>]],
     ) -> Result<ColumnCloseResult> {
@@ -4770,7 +4774,7 @@ mod tests {
     /// Performs write-read roundtrip with randomly generated values and levels.
     /// `max_size` is maximum number of values or levels (if `max_def_level` > 0) to write
     /// for a column.
-    fn column_roundtrip_random<T: DataType>(
+    fn column_roundtrip_random<T: ColumnEncoderType>(
         props: WriterProperties,
         max_size: usize,
         min_value: T::T,
@@ -4812,7 +4816,7 @@ mod tests {
     }
 
     /// Performs write-read roundtrip and asserts written values and levels.
-    fn column_roundtrip<T: DataType>(
+    fn column_roundtrip<T: ColumnEncoderType>(
         props: WriterProperties,
         values: &[T::T],
         def_levels: Option<&[i16]>,
@@ -4908,7 +4912,7 @@ mod tests {
 
     /// Performs write of provided values and returns column metadata of those values.
     /// Used to test encoding support for column writer.
-    fn column_write_and_get_metadata<T: DataType>(
+    fn column_write_and_get_metadata<T: ColumnEncoderType>(
         props: WriterProperties,
         values: &[T::T],
     ) -> ColumnChunkMetaData {
@@ -4931,7 +4935,7 @@ mod tests {
     // Function to use in tests for EncodingWriteSupport. This checks that dictionary
     // offset and encodings to make sure that column writer uses provided by trait
     // encodings.
-    fn check_encoding_write_support<T: DataType>(
+    fn check_encoding_write_support<T: ColumnEncoderType>(
         version: WriterVersion,
         dict_enabled: bool,
         data: &[T::T],
@@ -4950,7 +4954,7 @@ mod tests {
     }
 
     /// Returns column writer.
-    fn get_test_column_writer<'a, T: DataType>(
+    fn get_test_column_writer<'a, T: ColumnEncoderType>(
         page_writer: Box<dyn PageWriter + 'a>,
         max_def_level: i16,
         max_rep_level: i16,
@@ -4961,7 +4965,7 @@ mod tests {
         get_typed_column_writer::<T>(column_writer)
     }
 
-    fn get_test_column_writer_with_path<'a, T: DataType>(
+    fn get_test_column_writer_with_path<'a, T: ColumnEncoderType>(
         page_writer: Box<dyn PageWriter + 'a>,
         max_def_level: i16,
         max_rep_level: i16,
@@ -4989,7 +4993,7 @@ mod tests {
     /// `ColumnWriterImpl` configured by `props`, then re-reads the file and
     /// returns its page layout. Shared by the page-size regression tests so
     /// each only has to express its props, input, and assertions.
-    fn write_and_collect_pages<T: DataType>(
+    fn write_and_collect_pages<T: ColumnEncoderType>(
         props: WriterProperties,
         max_def_level: i16,
         max_rep_level: i16,
@@ -5144,7 +5148,7 @@ mod tests {
     }
 
     /// Write data into parquet using [`get_test_page_writer`] and [`get_test_column_writer`] and returns generated statistics.
-    fn statistics_roundtrip<T: DataType>(values: &[<T as DataType>::T]) -> Statistics {
+    fn statistics_roundtrip<T: ColumnEncoderType>(values: &[<T as DataType>::T]) -> Statistics {
         let page_writer = get_test_page_writer();
         let props = Default::default();
         let mut writer = get_test_column_writer::<T>(page_writer, 0, 0, props);
@@ -5159,7 +5163,7 @@ mod tests {
     }
 
     /// Returns Decimals column writer.
-    fn get_test_decimals_column_writer<T: DataType>(
+    fn get_test_decimals_column_writer<T: ColumnEncoderType>(
         page_writer: Box<dyn PageWriter>,
         max_def_level: i16,
         max_rep_level: i16,
@@ -5244,7 +5248,7 @@ mod tests {
     }
 
     /// Returns column writer for UINT32 Column provided as ConvertedType only
-    fn get_test_unsigned_int_given_as_converted_column_writer<'a, T: DataType>(
+    fn get_test_unsigned_int_given_as_converted_column_writer<'a, T: ColumnEncoderType>(
         page_writer: Box<dyn PageWriter + 'a>,
         max_def_level: i16,
         max_rep_level: i16,
@@ -5300,7 +5304,7 @@ mod tests {
         );
     }
 
-    struct ColumnRoundTripUniform<'a, T: DataType> {
+    struct ColumnRoundTripUniform<'a, T: ColumnEncoderType> {
         props: WriterProperties,
         values: &'a [T::T],
         def_levels: LevelDataRef<'a>,
@@ -5312,7 +5316,7 @@ mod tests {
         expected_rep_levels: Option<&'a [i16]>,
     }
 
-    impl<'a, T: DataType> ColumnRoundTripUniform<'a, T>
+    impl<'a, T: ColumnEncoderType> ColumnRoundTripUniform<'a, T>
     where
         T::T: PartialEq + std::fmt::Debug,
     {

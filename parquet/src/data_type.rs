@@ -27,7 +27,6 @@ use std::str::from_utf8;
 
 use crate::basic::Type;
 use crate::column::reader::{ColumnReader, ColumnReaderImpl};
-use crate::column::writer::{ColumnWriter, ColumnWriterImpl};
 use crate::errors::{ParquetError, Result};
 use crate::util::bit_util::FromBytes;
 
@@ -1217,25 +1216,6 @@ pub trait DataType: 'static + Send {
     fn get_column_reader(column_writer: ColumnReader) -> Option<ColumnReaderImpl<Self>>
     where
         Self: Sized;
-
-    /// Returns the underlying [`ColumnWriterImpl`] for the given [`ColumnWriter`].
-    fn get_column_writer(column_writer: ColumnWriter<'_>) -> Option<ColumnWriterImpl<'_, Self>>
-    where
-        Self: Sized;
-
-    /// Returns a reference to the underlying [`ColumnWriterImpl`] for the given [`ColumnWriter`].
-    fn get_column_writer_ref<'a, 'b: 'a>(
-        column_writer: &'b ColumnWriter<'a>,
-    ) -> Option<&'b ColumnWriterImpl<'a, Self>>
-    where
-        Self: Sized;
-
-    /// Returns a mutable reference to the underlying [`ColumnWriterImpl`] for the given
-    fn get_column_writer_mut<'a, 'b: 'a>(
-        column_writer: &'a mut ColumnWriter<'b>,
-    ) -> Option<&'a mut ColumnWriterImpl<'b, Self>>
-    where
-        Self: Sized;
 }
 
 macro_rules! make_type {
@@ -1254,33 +1234,6 @@ macro_rules! make_type {
             fn get_column_reader(column_reader: ColumnReader) -> Option<ColumnReaderImpl<Self>> {
                 match column_reader {
                     ColumnReader::$reader_ident(w) => Some(w),
-                    _ => None,
-                }
-            }
-
-            fn get_column_writer(
-                column_writer: ColumnWriter<'_>,
-            ) -> Option<ColumnWriterImpl<'_, Self>> {
-                match column_writer {
-                    ColumnWriter::$writer_ident(w) => Some(w),
-                    _ => None,
-                }
-            }
-
-            fn get_column_writer_ref<'a, 'b: 'a>(
-                column_writer: &'a ColumnWriter<'b>,
-            ) -> Option<&'a ColumnWriterImpl<'b, Self>> {
-                match column_writer {
-                    ColumnWriter::$writer_ident(w) => Some(w),
-                    _ => None,
-                }
-            }
-
-            fn get_column_writer_mut<'a, 'b: 'a>(
-                column_writer: &'a mut ColumnWriter<'b>,
-            ) -> Option<&'a mut ColumnWriterImpl<'b, Self>> {
-                match column_writer {
-                    ColumnWriter::$writer_ident(w) => Some(w),
                     _ => None,
                 }
             }
