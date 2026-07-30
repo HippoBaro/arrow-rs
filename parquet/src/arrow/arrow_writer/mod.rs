@@ -2159,32 +2159,43 @@ impl<'a> ArrowPhysicalBridge<'a> for FixedLenByteArrayStorage<'a> {
             encoder.begin_flba(plan.len());
         }
 
-        // A raw FSB range can cross without gathering. Repeats retain their
-        // compact shape, and mixed plans need only this one span traversal.
+        // Producer-provided FSB ranges can cross without gathering.
         if let Self::Fixed(array) = self {
             if !plan.is_grouped() && encoder.flba_accepts_dense_batch() {
                 let bytes = array.value_data();
                 let width = array.value_size();
-                plan.try_for_each_span(|span| match span {
-                    IndexSpan::Range { start, len } => {
-                        let byte_start = start * width;
-                        let byte_end = byte_start + len * width;
-                        encoder.commit(FlbaBatch::Dense {
-                            bytes: &bytes[byte_start..byte_end],
-                            width,
-                            count: len,
-                        })
-                    }
-                    IndexSpan::Repeat { index, count } => {
-                        let values = [array.value(index)];
-                        encoder.commit(FlbaBatch::RunGroups {
-                            values: &values,
-                            counts: &[count],
-                        })
-                    }
-                })?;
-                encoder.finish_flba();
-                return Ok(());
+                if let Some(range) = plan.direct_physical_range() {
+                    let byte_start = range.start * width;
+                    let byte_end = byte_start + range.len() * width;
+                    encoder.commit(FlbaBatch::Dense {
+                        bytes: &bytes[byte_start..byte_end],
+                        width,
+                        count: range.len(),
+                    })?;
+                    encoder.finish_flba();
+                    return Ok(());
+                }
+                if matches!(
+                    plan.unmapped_selection(),
+                    Some(ValueSelectionRef::Empty | ValueSelectionRef::Ranges(_))
+                ) {
+                    plan.try_for_each_span(|span| match span {
+                        IndexSpan::Range { start, len } => {
+                            let byte_start = start * width;
+                            let byte_end = byte_start + len * width;
+                            encoder.commit(FlbaBatch::Dense {
+                                bytes: &bytes[byte_start..byte_end],
+                                width,
+                                count: len,
+                            })
+                        }
+                        IndexSpan::Repeat { .. } => {
+                            unreachable!("ungrouped identity ranges cannot repeat")
+                        }
+                    })?;
+                    encoder.finish_flba();
+                    return Ok(());
+                }
             }
         }
 
@@ -4008,7 +4019,7 @@ mod tests {
     }
 
     #[test]
-    fn arrow_writer_flba_physical_plan_preserves_ranges_repeats_and_cursor_roundtrip() {
+    fn arrow_writer_flba_physical_plan_preserves_cursor_roundtrip() {
         let mut values = FixedSizeBinaryBuilder::new(2);
         values.append_value([1, 2]).unwrap();
         values.append_value([3, 4]).unwrap();
@@ -4025,20 +4036,7 @@ mod tests {
             ValueSelectionRef::Dense { offset: 0, len: 6 },
         );
         assert_eq!(physical.data_type(), values.data_type());
-        let mut spans = Vec::new();
-        plan.try_for_each_span(|span| -> Result<()> {
-            spans.push(span);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            spans,
-            [
-                IndexSpan::Range { start: 0, len: 1 },
-                IndexSpan::Repeat { index: 1, count: 2 },
-                IndexSpan::Range { start: 2, len: 3 },
-            ]
-        );
+        assert_eq!(plan.len(), 6);
 
         let run_keys = Int32Array::from(vec![0, 1, 2]);
         let run_dictionary: ArrayRef =

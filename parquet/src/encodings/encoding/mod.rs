@@ -411,18 +411,7 @@ where
         return sink.commit(NumericBatch::Flat(&values[range]));
     }
 
-    plan.try_for_each_span(|span| match span {
-        IndexSpan::Range { start, len } => {
-            if len != 0 {
-                sink.commit(NumericBatch::Flat(&values[start..start + len]))?;
-            }
-            Ok(())
-        }
-        IndexSpan::Repeat { index, count } => sink.commit(NumericBatch::RunGroups {
-            values: &values[index..index + 1],
-            counts: &[count],
-        }),
-    })
+    emit_physical_cast(sink, values, plan, |value| value)
 }
 
 /// Cast one recursively lowered Arrow physical-index plan. Run-backed input is
@@ -1835,7 +1824,7 @@ mod tests {
 
     #[cfg(feature = "arrow")]
     #[test]
-    fn physical_numeric_spans_preserve_ranges_and_repeats() {
+    fn physical_numeric_mappings_use_bounded_gathers() {
         let values = [10_i32, 20, 30, 40, 50];
 
         let sparse_values = (0..260).collect::<Vec<_>>();
@@ -1865,14 +1854,7 @@ mod tests {
 
         let output = collect(|sink| emit_physical_identity(sink, &values, plan));
         assert_eq!(output.got, [10, 20, 20, 30, 40, 50]);
-        assert_eq!(
-            output.batches,
-            [
-                CollectedBatch::Flat(1),
-                CollectedBatch::RunGroups(1),
-                CollectedBatch::Flat(3),
-            ]
-        );
+        assert_eq!(output.batches, [CollectedBatch::Flat(6)]);
 
         let cast = collect(|sink| emit_physical_cast(sink, &values, plan, i64::from));
         assert_eq!(cast.got, [10_i64, 20, 20, 30, 40, 50]);

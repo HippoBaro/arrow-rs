@@ -659,6 +659,18 @@ pub(crate) enum IndexSpan {
 
 #[cfg(feature = "arrow")]
 impl IndexSpan {
+    #[inline]
+    fn from_group(index: usize, count: usize) -> Self {
+        debug_assert_ne!(count, 0);
+        match count {
+            1 => Self::Range {
+                start: index,
+                len: 1,
+            },
+            _ => Self::Repeat { index, count },
+        }
+    }
+
     #[cfg(test)]
     #[inline]
     pub(crate) fn len(self) -> usize {
@@ -737,8 +749,7 @@ impl<'a> PhysicalIndexPlan<'a> {
         }
     }
 
-    /// Visit maximally useful compact spans in output order. Equal adjacent
-    /// indices become `Repeat`; singleton consecutive indices become `Range`.
+    /// Visit producer-provided ranges and groups in output order.
     pub(crate) fn try_for_each_span<E>(
         self,
         mut f: impl FnMut(IndexSpan) -> Result<(), E>,
@@ -755,24 +766,18 @@ impl<'a> PhysicalIndexPlan<'a> {
                 ValueSelectionRef::Ranges(ranges) => {
                     ranges.try_for_each_range(|start, len| f(IndexSpan::Range { start, len }))
                 }
-                ValueSelectionRef::Sparse(indices) => {
-                    let mut spans = IndexSpanCoalescer::new(&mut f);
-                    for &index in indices {
-                        spans.push(index, 1)?;
-                    }
-                    spans.finish()
-                }
-                ValueSelectionRef::Grouped(grouped) => {
-                    let mut spans = IndexSpanCoalescer::new(&mut f);
-                    grouped.try_for_each_group(|index, count| spans.push(index, count))?;
-                    spans.finish()
-                }
+                ValueSelectionRef::Sparse(indices) => indices.iter().try_for_each(|&index| {
+                    f(IndexSpan::Range {
+                        start: index,
+                        len: 1,
+                    })
+                }),
+                ValueSelectionRef::Grouped(grouped) => grouped
+                    .try_for_each_group(|index, count| f(IndexSpan::from_group(index, count))),
             },
-            Some(keys) => {
-                let mut spans = IndexSpanCoalescer::new(&mut f);
-                keys.try_for_each_group(self.selection, |index, count| spans.push(index, count))?;
-                spans.finish()
-            }
+            Some(keys) => keys.try_for_each_group(self.selection, |index, count| {
+                f(IndexSpan::from_group(index, count))
+            }),
         }
     }
 
@@ -790,101 +795,13 @@ impl<'a> PhysicalIndexPlan<'a> {
         self,
         mut f: impl FnMut(usize, usize) -> Result<(), E>,
     ) -> Result<(), E> {
-        if let (None, ValueSelectionRef::Grouped(grouped)) = (self.dictionary, self.selection) {
-            return grouped.try_for_each_group(f);
-        }
-        self.try_for_each_span(|span| match span {
-            IndexSpan::Range { start, len } => {
-                for index in start..start + len {
-                    f(index, 1)?;
-                }
-                Ok(())
-            }
-            IndexSpan::Repeat { index, count } => f(index, count),
-        })
-    }
-}
-
-/// Groups equal mapped indices and consecutive singletons.
-#[cfg(feature = "arrow")]
-struct IndexSpanCoalescer<F> {
-    f: F,
-    pending: Option<IndexSpan>,
-}
-
-#[cfg(feature = "arrow")]
-impl<F> IndexSpanCoalescer<F> {
-    fn new(f: F) -> Self {
-        Self { f, pending: None }
-    }
-
-    fn push<E>(&mut self, index: usize, count: usize) -> Result<(), E>
-    where
-        F: FnMut(IndexSpan) -> Result<(), E>,
-    {
-        use IndexSpan::{Range, Repeat};
-
-        debug_assert_ne!(count, 0);
-        let next = Repeat { index, count };
-        let pending = match self.pending.take() {
-            None => next,
-            Some(Repeat { index: i, count: n }) if i == index => Repeat {
-                index,
-                count: n + count,
+        match self.dictionary {
+            Some(keys) => keys.try_for_each_group(self.selection, f),
+            None => match self.selection {
+                ValueSelectionRef::Grouped(grouped) => grouped.try_for_each_group(f),
+                selection => selection.try_for_each(|index| f(index, 1)),
             },
-            Some(Repeat { index: i, count: 1 })
-                if count == 1 && i.checked_add(1) == Some(index) =>
-            {
-                Range { start: i, len: 2 }
-            }
-            Some(Range { start, len }) if count == 1 && start.checked_add(len) == Some(index) => {
-                Range {
-                    start,
-                    len: len + 1,
-                }
-            }
-            Some(Range { start, len }) if start.checked_add(len - 1) == Some(index) => {
-                (self.f)(Range {
-                    start,
-                    len: len - 1,
-                })?;
-                Repeat {
-                    index,
-                    count: count + 1,
-                }
-            }
-            Some(pending) => {
-                self.emit(pending)?;
-                next
-            }
-        };
-        self.pending = Some(pending);
-        Ok(())
-    }
-
-    fn finish<E>(mut self) -> Result<(), E>
-    where
-        F: FnMut(IndexSpan) -> Result<(), E>,
-    {
-        match self.pending.take() {
-            Some(pending) => self.emit(pending),
-            None => Ok(()),
         }
-    }
-
-    fn emit<E>(&mut self, span: IndexSpan) -> Result<(), E>
-    where
-        F: FnMut(IndexSpan) -> Result<(), E>,
-    {
-        use IndexSpan::{Range, Repeat};
-
-        (self.f)(match span {
-            Repeat {
-                index: start,
-                count: 1,
-            } => Range { start, len: 1 },
-            span => span,
-        })
     }
 }
 
@@ -1184,17 +1101,7 @@ mod tests {
 
         let sparse_values = [3, 4, 4, 5, 9, 9, 8, 1, 2];
         let sparse = PhysicalIndexPlan::identity(ValueSelectionRef::Sparse(&sparse_values));
-        assert_eq!(
-            physical_spans(sparse),
-            [
-                range(3, 1),
-                repeat(4, 2),
-                range(5, 1),
-                repeat(9, 2),
-                range(8, 1),
-                range(1, 2),
-            ]
-        );
+        assert_span_plan(sparse, &sparse_values);
         assert_span_plan(sparse.slice(1, 7), &sparse_values[1..8]);
     }
 
@@ -1214,7 +1121,7 @@ mod tests {
         );
         assert_eq!(
             physical_spans(grouped.slice(1, 4)),
-            [repeat(7, 2), range(2, 2)]
+            [repeat(7, 2), range(2, 1), range(3, 1)]
         );
 
         let expanded = [7, 7, 7, 2, 3, 3];
@@ -1242,7 +1149,7 @@ mod tests {
 
     #[cfg(feature = "arrow")]
     #[test]
-    fn physical_sparse_span_coalescing_matches_exhaustive_flat_oracle() {
+    fn physical_sparse_spans_match_exhaustive_flat_oracle() {
         // Every reordered/duplicated sequence over 0..3 up to length six.
         for len in 0..=6 {
             for encoded in 0..3usize.pow(len as u32) {
@@ -1260,7 +1167,7 @@ mod tests {
 
     #[cfg(feature = "arrow")]
     #[test]
-    fn physical_dictionary_widths_coalesce_ranges_and_repeats() {
+    fn physical_dictionary_widths_preserve_mapped_order() {
         macro_rules! assert_widths {
             ($($width:ty => $variant:ident),+ $(,)?) => {
                 $({
@@ -1296,10 +1203,6 @@ mod tests {
         assert_eq!(plan.unmapped_selection(), None);
         assert!(plan.has_dictionary_mapping());
         assert!(!plan.is_grouped());
-        assert_eq!(
-            physical_spans(plan),
-            [range(4, 2), repeat(6, 2), range(7, 1)]
-        );
         assert_span_plan(plan, &[4, 5, 6, 6, 7]);
         let present = plan.slice(0, 4);
         assert_eq!(present.direct_physical_range(), None);

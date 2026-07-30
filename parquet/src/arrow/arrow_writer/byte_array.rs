@@ -225,9 +225,8 @@ where
     }
 }
 
-/// Byte-value cursor driven by compact physical-index spans. PLAIN and DELTA
-/// expand repeats through `try_for_each`; dictionary encoding can retain them as
-/// run groups through `for_each_run_group`.
+/// Byte-value cursor driven by a physical-index plan. Grouped dictionary input
+/// remains compact through `for_each_run_group`.
 #[derive(Clone, Copy)]
 struct PhysicalByteValues<'a, A> {
     plan: PhysicalIndexPlan<'a>,
@@ -245,9 +244,10 @@ where
 
     #[inline]
     fn try_for_each<E>(self, mut f: impl FnMut(&'a [u8]) -> Result<(), E>) -> Result<(), E> {
-        if let Some(selection @ ValueSelectionRef::Sparse(_)) = self.plan.unmapped_selection() {
-            selection.try_for_each(|index| f(self.values.value(index)))?;
-            return Ok(());
+        if !self.plan.is_grouped() {
+            return self
+                .plan
+                .try_for_each_index(|index| f(self.values.value(index)));
         }
 
         self.plan.try_for_each_span(|span| match span {
