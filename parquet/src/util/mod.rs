@@ -26,7 +26,7 @@ pub mod push_buffers;
 pub(crate) mod test_common;
 pub mod utf8;
 
+#[cfg(all(feature = "arrow", any(test, feature = "test_common")))]
+pub use self::test_common::page_util::InMemoryPageIterator;
 #[cfg(any(test, feature = "test_common"))]
-pub use self::test_common::page_util::{
-    DataPageBuilder, DataPageBuilderImpl, InMemoryPageIterator,
-};
+pub use self::test_common::page_util::{DataPageBuilder, DataPageBuilderImpl};

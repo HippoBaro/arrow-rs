@@ -213,7 +213,7 @@ impl LevelInfoBuilder {
                 let flat_field = Field::new(
                     field.name(),
                     value_field.data_type().clone(),
-                    field.is_nullable(),
+                    field.is_nullable() || value_field.is_nullable(),
                 );
                 Self::try_new(&flat_field, parent_ctx, &flat)
             }
