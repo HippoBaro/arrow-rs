@@ -19,7 +19,7 @@
 
 use crate::basic::Type;
 use crate::column::writer::LevelDataRef;
-use crate::column::writer::encoder::ColumnValueEncoder;
+use crate::column::writer::encoder::ColumnChunkEncoder;
 use crate::file::properties::WriterProperties;
 use crate::schema::types::ColumnDescriptor;
 
@@ -108,7 +108,7 @@ impl ByteBudgetChunker {
     /// `#[inline]`: this is a tiny per-chunk dispatcher; the actual byte
     /// inspection lives in the out-of-line `byte_budget_sub_batch_size`.
     #[inline]
-    pub(crate) fn pick_sub_batch_size<E: ColumnValueEncoder>(
+    pub(crate) fn pick_sub_batch_size<E: ColumnChunkEncoder>(
         &self,
         encoder: &E,
         values: &E::Values,
@@ -152,7 +152,7 @@ impl ByteBudgetChunker {
     /// `#[inline(never)]` keeps this slow path out of the hot
     /// `write_batch_internal` loop; numeric and bool columns never reach it.
     #[inline(never)]
-    fn byte_budget_sub_batch_size<E: ColumnValueEncoder>(
+    fn byte_budget_sub_batch_size<E: ColumnChunkEncoder>(
         &self,
         values: &E::Values,
         value_indices: Option<&[usize]>,
