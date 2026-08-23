@@ -931,10 +931,8 @@ where
 
 /// Delta length byte array decoder.
 ///
-/// Only applied to byte arrays to separate the length values and the data, the lengths
-/// are encoded using DELTA_BINARY_PACKED encoding.
-/// See [`DeltaLengthByteArrayEncoder`](crate::encoding::DeltaLengthByteArrayEncoder)
-/// for more information.
+/// Separates byte-array lengths from their concatenated data and encodes the
+/// lengths with `DELTA_BINARY_PACKED`.
 pub struct DeltaLengthByteArrayDecoder<T: DataType> {
     // Lengths for each byte array in `data`
     // TODO: add memory tracker to this
@@ -1062,8 +1060,6 @@ impl<T: DataType> Decoder<T> for DeltaLengthByteArrayDecoder<T> {
 ///
 /// Prefix lengths are encoded using `DELTA_BINARY_PACKED` encoding, Suffixes are stored
 /// using `DELTA_LENGTH_BYTE_ARRAY` encoding.
-/// See [`DeltaByteArrayEncoder`](crate::encoding::DeltaByteArrayEncoder) for more
-/// information.
 pub struct DeltaByteArrayDecoder<T: DataType> {
     // Prefix lengths for each byte array
     // TODO: add memory tracker to this
