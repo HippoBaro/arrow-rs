@@ -247,6 +247,22 @@ impl FixedLenByteArrayEncoder for VariableWidthByteStreamSplitEncoder<FixedLenBy
         self.buffer.extend_from_slice(values.bytes);
         Ok(())
     }
+
+    /// BYTE_STREAM_SPLIT accumulates the raw value bytes contiguously and transposes
+    /// them into byte-streams at `flush_buffer`, so a streamed value is simply
+    /// appended — no intermediate buffer.
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn reserve_fixed_len(&mut self, additional_bytes: usize) {
+        self.buffer.reserve(additional_bytes);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[inline]
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(value);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

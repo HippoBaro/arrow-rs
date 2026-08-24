@@ -33,7 +33,9 @@ use crate::basic::{
 };
 use crate::column::page::{CompressedPage, Page, PageWriteSpec, PageWriter};
 use crate::column::writer::encoder::byte_array::ByteMinMaxOrder;
-use crate::column::writer::encoder::{ColumnChunkEncoder, ColumnValues, TypedColumnChunkEncoder};
+use crate::column::writer::encoder::{
+    ColumnChunkEncoder, ColumnWriterValue, TypedColumnChunkEncoder, count_within_budget,
+};
 use crate::compression::{Codec, CodecOptionsBuilder, create_codec};
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::*;
@@ -55,6 +57,23 @@ mod byte_budget_chunker;
 pub(crate) mod encoder;
 
 use byte_budget_chunker::ByteBudgetChunker;
+
+/// Page value counts are serialized as signed Thrift `i32` fields.
+const MAX_DATA_PAGE_VALUE_COUNT: u32 = i32::MAX as u32;
+
+/// Checked page value-count increment: the page format cannot represent more
+/// than `i32::MAX` values in one data page.
+fn checked_page_value_increment(buffered: u32, additional: usize) -> Result<u32> {
+    if additional > MAX_DATA_PAGE_VALUE_COUNT.saturating_sub(buffered) as usize {
+        return Err(general_err!(
+            "Adding {} values to a data page with {} values would exceed the Parquet page limit of {}",
+            additional,
+            buffered,
+            MAX_DATA_PAGE_VALUE_COUNT
+        ));
+    }
+    Ok(additional as u32)
+}
 
 macro_rules! downcast_writer {
     ($e:expr, $i:ident, $b:expr) => {
@@ -435,6 +454,145 @@ impl<'a> LevelDataRef<'a> {
     }
 }
 
+fn encode_level_data(
+    encoder: &mut LevelEncoder,
+    levels: LevelDataRef<'_>,
+    histogram: Option<&mut LevelHistogram>,
+    mut observe: impl FnMut(i16, usize),
+) {
+    match histogram {
+        Some(histogram) => encode_level_data_with(encoder, levels, |level, count| {
+            observe(level, count);
+            histogram.increment_by(level, count as i64);
+        }),
+        None => encode_level_data_with(encoder, levels, observe),
+    }
+}
+
+#[inline]
+fn encode_level_data_with(
+    encoder: &mut LevelEncoder,
+    levels: LevelDataRef<'_>,
+    put: impl FnMut(i16, usize),
+) {
+    match levels {
+        LevelDataRef::Absent => unreachable!("level data must be present"),
+        LevelDataRef::Materialized(levels) => {
+            encoder.put_with_observer(levels, put);
+        }
+        LevelDataRef::Uniform { value, count } => encoder.put_n_with_observer(value, count, put),
+    }
+}
+
+#[inline]
+fn extend_to_record_boundary(
+    rep_levels: LevelDataRef<'_>,
+    mut end_offset: usize,
+    limit: usize,
+) -> usize {
+    if matches!(rep_levels, LevelDataRef::Absent) {
+        return end_offset;
+    }
+    let limit = limit.min(rep_levels.len());
+    match rep_levels {
+        LevelDataRef::Absent => unreachable!(),
+        LevelDataRef::Materialized(levels) => {
+            while end_offset < limit && levels[end_offset] != 0 {
+                end_offset += 1;
+            }
+            end_offset
+        }
+        LevelDataRef::Uniform { value, .. } => {
+            if value == 0 {
+                end_offset
+            } else {
+                limit
+            }
+        }
+    }
+}
+
+/// Sliceable values presented to [`GenericColumnWriter`] for page planning and
+/// column-chunk encoding.
+///
+/// The writer slices this source alongside its level window and passes each
+/// resulting value window to [`Self::write_to`].
+pub(crate) trait ColumnWriteSource<E: ColumnChunkEncoder>: Copy {
+    fn len(self) -> usize;
+
+    fn slice(self, offset: usize, len: usize) -> Self;
+
+    fn write_to(self, encoder: &mut E) -> Result<()>;
+
+    /// Returns how many variable-width values fit in `budget` bytes. Fixed-width
+    /// columns are handled centrally by [`ByteBudgetChunker`].
+    fn count_variable_width_within_byte_budget(
+        self,
+        _encoder: &E,
+        _budget: usize,
+        _target: ByteBudgetTarget,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+/// Which accumulating page byte budget [`ByteBudgetChunker`] is sizing for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ByteBudgetTarget {
+    /// The encoded data page. This is the active budget after dictionary
+    /// fallback or when dictionary encoding is disabled.
+    DataPage,
+    /// The dictionary page. While dictionary encoding is active, value bytes are
+    /// accumulated here instead of in the data page.
+    DictionaryPage,
+}
+
+#[derive(Clone, Copy)]
+struct LevelWindow<'a> {
+    len: usize,
+    def: LevelDataRef<'a>,
+    rep: LevelDataRef<'a>,
+}
+
+impl<'a> LevelWindow<'a> {
+    fn new(len: usize, def: LevelDataRef<'a>, rep: LevelDataRef<'a>) -> Self {
+        Self { len, def, rep }
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        Self {
+            len,
+            def: self.def.slice(offset, len),
+            rep: self.rep.slice(offset, len),
+        }
+    }
+}
+
+/// The low-level slice API is a dense stream of physical values, and that
+/// representation reaches the shared physical encoder unchanged.
+impl<D: DataType> ColumnWriteSource<TypedColumnChunkEncoder<D>> for &[D::T] {
+    fn len(self) -> usize {
+        <[D::T]>::len(self)
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        &self[offset..offset + len]
+    }
+
+    fn write_to(self, encoder: &mut TypedColumnChunkEncoder<D>) -> Result<()> {
+        <D::T as ColumnWriterValue>::encode_slice(encoder, self)
+    }
+
+    fn count_variable_width_within_byte_budget(
+        self,
+        _encoder: &TypedColumnChunkEncoder<D>,
+        budget: usize,
+        _target: ByteBudgetTarget,
+    ) -> Option<usize> {
+        Some(count_within_budget::<D>(budget, self.iter()))
+    }
+}
+
 /// Typed column writer for a primitive column.
 pub type ColumnWriterImpl<'a, T> = GenericColumnWriter<'a, TypedColumnChunkEncoder<T>>;
 
@@ -540,17 +698,18 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn write_batch_internal(
+    pub(crate) fn write_batch_internal<S>(
         &mut self,
-        values: &E::Values,
-        value_indices: Option<&[usize]>,
+        source: S,
         def_levels: LevelDataRef<'_>,
         rep_levels: LevelDataRef<'_>,
         min: Option<&E::Value>,
         max: Option<&E::Value>,
         distinct_count: Option<u64>,
-    ) -> Result<usize> {
+    ) -> Result<usize>
+    where
+        S: ColumnWriteSource<E>,
+    {
         // Check if number of definition levels is the same as number of repetition levels.
         if def_levels.len() != 0 && rep_levels.len() != 0 && def_levels.len() != rep_levels.len() {
             return Err(general_err!(
@@ -573,7 +732,7 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
         let num_levels = if num_levels > 0 {
             num_levels
         } else {
-            value_indices.map_or_else(|| values.len(), |i| i.len())
+            source.len()
         };
 
         if let Some(min) = min {
@@ -583,12 +742,11 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
             update_max(&self.descr, max, &mut self.column_metrics.max_column_value);
         }
 
-        // We can only set the distinct count if there are no other writes
-        if self.encoder.num_values() == 0 {
-            self.column_metrics.column_distinct_count = distinct_count;
-        } else {
-            self.column_metrics.column_distinct_count = None;
-        }
+        // Encoder counts reset per page; row metrics retain column-wide history.
+        let has_prior_data = self.column_metrics.total_rows_written != 0
+            || self.page_metrics.num_buffered_values != 0;
+        self.column_metrics.column_distinct_count =
+            if has_prior_data { None } else { distinct_count };
 
         let mut values_offset = 0;
         let mut levels_offset = 0;
@@ -596,7 +754,6 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
             && !matches!(rep_levels, LevelDataRef::Materialized(_));
         let has_levels = !matches!(def_levels, LevelDataRef::Absent)
             || !matches!(rep_levels, LevelDataRef::Absent);
-
         // When both level vectors are compact (Uniform or Absent), there is no
         // materialized slice to split and the per-mini-batch work is O(1), so we
         // can safely use a much larger batch size.
@@ -604,120 +761,62 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
             self.props.data_page_row_count_limit()
         } else {
             self.props.write_batch_size()
-        };
-        debug_assert!(base_batch_size > 0);
-
+        }
+        .min(MAX_DATA_PAGE_VALUE_COUNT as usize);
         let chunker = ByteBudgetChunker::new(&self.descr, &self.props, base_batch_size);
         while levels_offset < num_levels {
-            let mut end_offset = num_levels.min(levels_offset + base_batch_size);
+            let page_remaining =
+                (MAX_DATA_PAGE_VALUE_COUNT - self.page_metrics.num_buffered_values) as usize;
+            debug_assert!(
+                page_remaining > 0,
+                "a full data page must have been flushed"
+            );
+            let candidate =
+                num_levels.min(levels_offset.saturating_add(base_batch_size.min(page_remaining)));
+            // Extend a candidate ending inside a repeated record to the next
+            // record start, regardless of the rep-level representation.
+            let end_offset = extend_to_record_boundary(rep_levels, candidate, num_levels);
 
-            // Split at record boundary
-            if let LevelDataRef::Materialized(levels) = rep_levels {
-                while end_offset < levels.len() && levels[end_offset] != 0 {
-                    end_offset += 1;
+            // The configured limits are best-effort at record boundaries, but the
+            // page-format count is a hard limit. Flush and retry when the next record
+            // fits on an empty page, and reject a single record that does not.
+            if end_offset - levels_offset > page_remaining {
+                if self.page_metrics.num_buffered_values != 0 {
+                    self.add_data_page()?;
+                    continue;
                 }
+                return Err(general_err!(
+                    "Record contains more than {} values and cannot fit in a Parquet data page",
+                    MAX_DATA_PAGE_VALUE_COUNT
+                ));
             }
 
-            let chunk_size = end_offset - levels_offset;
-            let chunk_def = def_levels.slice(levels_offset, chunk_size);
-            let chunk_rep = rep_levels.slice(levels_offset, chunk_size);
+            let chunk = LevelWindow::new(
+                end_offset - levels_offset,
+                def_levels.slice(levels_offset, end_offset - levels_offset),
+                rep_levels.slice(levels_offset, end_offset - levels_offset),
+            );
 
             // Key decision point: can we write this whole chunk as one
             // mini-batch (the common case — small or fixed-width values, no
             // further page-size accounting needed), or must we fall back to
             // byte-budget-aware sub-batching to keep a page from overshooting
             // `data_page_size_limit`? `pick_sub_batch_size` returns
-            // `chunk_size` for the former.
-            let sub_batch_size = chunker.pick_sub_batch_size(
-                &self.encoder,
-                values,
-                value_indices,
-                chunk_def,
-                values_offset,
-                chunk_size,
-            );
+            // `chunk.len` for the former.
+            let sub_batch_size =
+                chunker.pick_sub_batch_size(&self.encoder, source, chunk, values_offset);
 
-            if sub_batch_size >= chunk_size {
-                values_offset += self.write_mini_batch(
-                    values,
-                    values_offset,
-                    value_indices,
-                    chunk_size,
-                    chunk_def,
-                    chunk_rep,
-                )?;
+            if sub_batch_size >= chunk.len {
+                values_offset += self.write_mini_batch(source, values_offset, chunk)?;
             } else {
-                values_offset += self.write_granular_chunk(
-                    values,
-                    values_offset,
-                    value_indices,
-                    chunk_size,
-                    chunk_def,
-                    chunk_rep,
-                    sub_batch_size,
-                )?;
+                values_offset +=
+                    self.write_granular_chunk(source, values_offset, chunk, sub_batch_size)?;
             }
             levels_offset = end_offset;
         }
 
         // Return total number of values processed.
         Ok(values_offset)
-    }
-
-    /// Writes batch of values, definition levels and repetition levels.
-    /// Returns number of values processed (written).
-    ///
-    /// If definition and repetition levels are provided, we write fully those levels and
-    /// select how many values to write (this number will be returned), since number of
-    /// actual written values may be smaller than provided values.
-    ///
-    /// If only values are provided, then all values are written and the length of
-    /// of the values buffer is returned.
-    ///
-    /// Definition and/or repetition levels can be omitted, if values are
-    /// non-nullable and/or non-repeated.
-    pub fn write_batch(
-        &mut self,
-        values: &E::Values,
-        def_levels: Option<&[i16]>,
-        rep_levels: Option<&[i16]>,
-    ) -> Result<usize> {
-        self.write_batch_internal(
-            values,
-            None,
-            LevelDataRef::from(def_levels),
-            LevelDataRef::from(rep_levels),
-            None,
-            None,
-            None,
-        )
-    }
-
-    /// Writer may optionally provide pre-calculated statistics for use when computing
-    /// chunk-level statistics
-    ///
-    /// NB: [`WriterProperties::statistics_enabled`] must be set to [`EnabledStatistics::Chunk`]
-    /// for these statistics to take effect. If [`EnabledStatistics::None`] they will be ignored,
-    /// and if [`EnabledStatistics::Page`] the chunk statistics will instead be computed from the
-    /// computed page statistics
-    pub fn write_batch_with_statistics(
-        &mut self,
-        values: &E::Values,
-        def_levels: Option<&[i16]>,
-        rep_levels: Option<&[i16]>,
-        min: Option<&E::Value>,
-        max: Option<&E::Value>,
-        distinct_count: Option<u64>,
-    ) -> Result<usize> {
-        self.write_batch_internal(
-            values,
-            None,
-            LevelDataRef::from(def_levels),
-            LevelDataRef::from(rep_levels),
-            min,
-            max,
-            distinct_count,
-        )
     }
 
     /// Returns the estimated total memory usage.
@@ -831,49 +930,28 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
     /// `#[inline(never)]` keeps this slow path — only reached for
     /// variable-width columns whose values need page splitting — out of
     /// the hot `write_batch_internal` loop.
-    #[expect(clippy::too_many_arguments)]
     #[inline(never)]
-    fn write_granular_chunk(
+    fn write_granular_chunk<S>(
         &mut self,
-        values: &E::Values,
+        source: S,
         values_offset: usize,
-        value_indices: Option<&[usize]>,
-        chunk_size: usize,
-        chunk_def: LevelDataRef<'_>,
-        chunk_rep: LevelDataRef<'_>,
+        chunk: LevelWindow<'_>,
         sub_batch_size: usize,
-    ) -> Result<usize> {
-        // The chunker always sizes a sub-batch to at least one level, so each
-        // iteration below makes progress (`sub_end > sub_start`).
+    ) -> Result<usize>
+    where
+        S: ColumnWriteSource<E>,
+    {
         debug_assert!(sub_batch_size >= 1, "chunker must size at least one level");
         let mut values_consumed = 0;
         let mut sub_start = 0;
-        while sub_start < chunk_size {
-            let sub_end = match chunk_rep {
-                LevelDataRef::Materialized(levels) => {
-                    // Pack up to `sub_batch_size` levels per mini-batch, then
-                    // extend to the next record boundary (rep == 0) so a
-                    // record never spans data pages. Packing whole records
-                    // rather than stepping one record at a time avoids
-                    // calling `write_mini_batch` per record: records average
-                    // only a handful of levels, so a record-at-a-time step
-                    // would issue many more mini-batches than necessary.
-                    let mut e = (sub_start + sub_batch_size).min(chunk_size);
-                    while e < chunk_size && levels[e] != 0 {
-                        e += 1;
-                    }
-                    e
-                }
-                _ => (sub_start + sub_batch_size).min(chunk_size),
-            };
+        while sub_start < chunk.len {
+            let candidate = (sub_start + sub_batch_size).min(chunk.len);
+            let sub_end = extend_to_record_boundary(chunk.rep, candidate, chunk.len);
             let sub_len = sub_end - sub_start;
             let written = self.write_mini_batch(
-                values,
+                source,
                 values_offset + values_consumed,
-                value_indices,
-                sub_len,
-                chunk_def.slice(sub_start, sub_len),
-                chunk_rep.slice(sub_start, sub_len),
+                chunk.slice(sub_start, sub_len),
             )?;
             values_consumed += written;
             sub_start = sub_end;
@@ -892,67 +970,49 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
     /// Writes mini batch of values, definition and repetition levels.
     /// This allows fine-grained processing of values and maintaining a reasonable
     /// page size.
-    fn write_mini_batch(
+    fn write_mini_batch<S>(
         &mut self,
-        values: &E::Values,
+        source: S,
         values_offset: usize,
-        value_indices: Option<&[usize]>,
-        num_levels: usize,
-        def_levels: LevelDataRef<'_>,
-        rep_levels: LevelDataRef<'_>,
-    ) -> Result<usize> {
+        levels: LevelWindow<'_>,
+    ) -> Result<usize>
+    where
+        S: ColumnWriteSource<E>,
+    {
+        let level_count =
+            checked_page_value_increment(self.page_metrics.num_buffered_values, levels.len)?;
+
         // Process definition levels and determine how many values to write.
         let values_to_write = if self.descr.max_def_level() > 0 {
             let max_def = self.descr.max_def_level();
-            match def_levels {
+            match levels.def {
                 LevelDataRef::Absent => {
                     return Err(general_err!(
                         "Definition levels are required, because max definition level = {}",
                         self.descr.max_def_level()
                     ));
                 }
-                LevelDataRef::Materialized(levels) => {
-                    // General path for caller-provided or already-materialized
-                    // level buffers.
+                _ => {
                     let mut values_to_write = 0usize;
-                    let encoder = &mut self.def_levels_encoder;
-                    match self.page_metrics.definition_level_histogram.as_mut() {
-                        Some(histogram) => encoder.put_with_observer(levels, |level, count| {
-                            values_to_write += count * (level == max_def) as usize;
-                            histogram.increment_by(level, count as i64);
-                        }),
-                        None => encoder.put_with_observer(levels, |level, count| {
-                            values_to_write += count * (level == max_def) as usize;
-                        }),
-                    };
-                    self.page_metrics.num_page_nulls += (levels.len() - values_to_write) as u64;
-                    values_to_write
-                }
-                LevelDataRef::Uniform { value, count } => {
-                    // Fast path for all-null, all-valid, or otherwise uniform
-                    // definition levels without materializing a level buffer.
-                    let encoder = &mut self.def_levels_encoder;
-                    match self.page_metrics.definition_level_histogram.as_mut() {
-                        Some(histogram) => {
-                            encoder.put_n_with_observer(value, count, |level, run_len| {
-                                histogram.increment_by(level, run_len as i64);
-                            })
-                        }
-                        None => encoder.put_n_with_observer(value, count, |_, _| {}),
-                    };
-                    let values_to_write = count * (value == max_def) as usize;
-                    self.page_metrics.num_page_nulls += (count - values_to_write) as u64;
+                    let num_levels = levels.def.len();
+                    encode_level_data(
+                        &mut self.def_levels_encoder,
+                        levels.def,
+                        self.page_metrics.definition_level_histogram.as_mut(),
+                        |level, count| values_to_write += count * (level == max_def) as usize,
+                    );
+                    self.page_metrics.num_page_nulls += (num_levels - values_to_write) as u64;
                     values_to_write
                 }
             }
         } else {
-            num_levels
+            levels.len
         };
 
         // Process repetition levels and determine how many rows we are about to process.
         if self.descr.max_rep_level() > 0 {
             // A row could contain more than one value.
-            let first_level = rep_levels.first().ok_or_else(|| {
+            let first_level = levels.rep.first().ok_or_else(|| {
                 general_err!(
                     "Repetition levels are required, because max repetition level = {}",
                     self.descr.max_rep_level()
@@ -967,61 +1027,55 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
             }
 
             let mut new_rows = 0u32;
-            match rep_levels {
-                LevelDataRef::Absent => unreachable!(),
-                LevelDataRef::Materialized(levels) => {
-                    let encoder = &mut self.rep_levels_encoder;
-                    match self.page_metrics.repetition_level_histogram.as_mut() {
-                        Some(histogram) => encoder.put_with_observer(levels, |level, count| {
-                            new_rows += (count as u32) * (level == 0) as u32;
-                            histogram.increment_by(level, count as i64);
-                        }),
-                        None => encoder.put_with_observer(levels, |level, count| {
-                            new_rows += (count as u32) * (level == 0) as u32;
-                        }),
-                    };
-                }
-                LevelDataRef::Uniform { value, count } => {
-                    let encoder = &mut self.rep_levels_encoder;
-                    match self.page_metrics.repetition_level_histogram.as_mut() {
-                        Some(histogram) => {
-                            encoder.put_n_with_observer(value, count, |level, run_len| {
-                                new_rows += (run_len as u32) * (level == 0) as u32;
-                                histogram.increment_by(level, run_len as i64);
-                            })
-                        }
-                        None => encoder.put_n_with_observer(value, count, |level, run_len| {
-                            new_rows += (run_len as u32) * (level == 0) as u32;
-                        }),
-                    };
-                }
-            }
+            encode_level_data(
+                &mut self.rep_levels_encoder,
+                levels.rep,
+                self.page_metrics.repetition_level_histogram.as_mut(),
+                |level, count| new_rows += (count as u32) * (level == 0) as u32,
+            );
             self.page_metrics.num_buffered_rows += new_rows;
         } else {
             // Each value is exactly one row.
             // Equals to the number of values, we count nulls as well.
-            self.page_metrics.num_buffered_rows += num_levels as u32;
+            self.page_metrics.num_buffered_rows += level_count;
         }
 
-        match value_indices {
-            Some(indices) => {
-                let indices = &indices[values_offset..values_offset + values_to_write];
-                self.encoder.write_gather(values, indices)?;
-            }
-            None => self.encoder.write(values, values_offset, values_to_write)?,
+        let available_values = source.len().saturating_sub(values_offset);
+        if values_to_write > available_values {
+            return Err(general_err!(
+                "Expected to write {} values, but have only {}",
+                values_to_write,
+                available_values
+            ));
         }
 
-        self.page_metrics.num_buffered_values += num_levels as u32;
+        source
+            .slice(values_offset, values_to_write)
+            .write_to(&mut self.encoder)?;
 
-        if self.should_add_data_page() {
-            self.add_data_page()?;
-        }
+        self.page_metrics.num_buffered_values += level_count;
 
-        if self.should_dict_fallback() {
-            self.dict_fallback()?;
-        }
+        self.enforce_page_limits()?;
 
         Ok(values_to_write)
+    }
+
+    /// Apply the post-write page and dictionary transitions.
+    #[inline]
+    fn enforce_page_limits(&mut self) -> Result<bool> {
+        let page_flushed = if self.should_add_data_page() {
+            self.add_data_page()?;
+            true
+        } else {
+            false
+        };
+        let dictionary_flushed = if self.should_dict_fallback() {
+            self.dict_fallback()?;
+            true
+        } else {
+            false
+        };
+        Ok(page_flushed || dictionary_flushed)
     }
 
     /// Returns true if we need to fall back to non-dictionary encoding.
@@ -1051,7 +1105,9 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
             return false;
         }
 
-        self.page_metrics.num_buffered_rows as usize >= self.props.data_page_row_count_limit()
+        self.page_metrics.num_buffered_values >= MAX_DATA_PAGE_VALUE_COUNT
+            || self.page_metrics.num_buffered_rows as usize
+                >= self.props.data_page_row_count_limit()
             || self.encoder.estimated_data_page_size()
                 >= self.props.column_data_page_size_limit(self.descr.path())
     }
@@ -1819,6 +1875,55 @@ pub(crate) fn compare_greater_f16(a: &[u8], b: &[u8]) -> bool {
     let a = f16::from_le_bytes(a.try_into().unwrap());
     let b = f16::from_le_bytes(b.try_into().unwrap());
     a.total_cmp(&b) == Ordering::Greater
+}
+
+impl<'a, D: DataType> GenericColumnWriter<'a, TypedColumnChunkEncoder<D>> {
+    /// Writes batch of values, definition levels and repetition levels.
+    /// Returns number of values processed (written).
+    ///
+    /// If definition and repetition levels are provided, write those levels and
+    /// select how many values to write. The returned value count may be smaller
+    /// than the provided value count.
+    ///
+    /// If only values are provided, all values are written and the values buffer
+    /// length is returned.
+    ///
+    /// Definition and/or repetition levels can be omitted, if values are
+    /// non-nullable and/or non-repeated.
+    pub fn write_batch(
+        &mut self,
+        values: &[D::T],
+        def_levels: Option<&[i16]>,
+        rep_levels: Option<&[i16]>,
+    ) -> Result<usize> {
+        self.write_batch_with_statistics(values, def_levels, rep_levels, None, None, None)
+    }
+
+    /// Writer may optionally provide pre-calculated statistics for use when computing
+    /// chunk-level statistics
+    ///
+    /// NB: [`WriterProperties::statistics_enabled`] must be set to [`EnabledStatistics::Chunk`]
+    /// for these statistics to take effect. [`EnabledStatistics::None`] ignores them,
+    /// and [`EnabledStatistics::Page`] computes chunk statistics from the computed page
+    /// statistics.
+    pub fn write_batch_with_statistics(
+        &mut self,
+        values: &[D::T],
+        def_levels: Option<&[i16]>,
+        rep_levels: Option<&[i16]>,
+        min: Option<&D::T>,
+        max: Option<&D::T>,
+        distinct_count: Option<u64>,
+    ) -> Result<usize> {
+        self.write_batch_internal(
+            values,
+            LevelDataRef::from(def_levels),
+            LevelDataRef::from(rep_levels),
+            min,
+            max,
+            distinct_count,
+        )
+    }
 }
 
 /// Signed comparison of bytes arrays
@@ -5399,7 +5504,6 @@ mod tests {
             writer
                 .write_batch_internal(
                     self.values,
-                    None,
                     self.def_levels,
                     self.rep_levels,
                     None,

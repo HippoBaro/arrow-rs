@@ -20,7 +20,17 @@
 use super::*;
 
 /// Arrow packed-Boolean entry point.
-impl TypedColumnChunkEncoder<BoolType> {}
+impl TypedColumnChunkEncoder<BoolType> {
+    #[cfg(feature = "arrow")]
+    pub(crate) fn write_bool_batch(&mut self, values: BoolBatch<'_>) -> Result<()> {
+        debug_assert!(
+            !<BoolEncodingFamily as EncodingFamily<BoolType>>::is_dictionary(&self.encoding_family)
+        );
+        // The packed buffer and its selection cross together, without expanding
+        // bits to Rust `bool`s.
+        self.push_batch(values)
+    }
+}
 
 /// The column-chunk encoder consumes Boolean batches without scalarising packed
 /// input. `push_batch` derives statistics and bloom state from the selection's
