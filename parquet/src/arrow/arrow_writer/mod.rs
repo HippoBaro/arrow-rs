@@ -23,7 +23,6 @@ use bytes::Bytes;
 use half::f16;
 use std::io::Write;
 use std::ops::Range;
-use std::slice::Iter;
 use std::sync::{Arc, Mutex};
 use std::vec::IntoIter;
 
@@ -37,12 +36,12 @@ use arrow_schema::{
 use super::schema::{add_encoded_arrow_schema_to_metadata, decimal_length_from_precision};
 
 use crate::arrow::ArrowSchemaConverter;
-use crate::arrow::arrow_writer::byte_array::ByteArrayEncoder;
+use crate::arrow::arrow_writer::byte_array::ByteArrayStorage;
 use crate::basic::PageType;
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
 use crate::column::value_batch::{BatchSink, map_values};
-use crate::column::value_selection::{PhysicalValueSelection, ValueSelectionRef};
+use crate::column::value_selection::{DictionaryKeys, PhysicalValueSelection, ValueSelectionRef};
 use crate::column::writer::encoder::ColumnChunkEncoder;
 use crate::column::writer::encoder::{
     FixedLenByteArrayBatch, FixedLenByteArrayBatchPacker, FixedLenByteArraySink,
@@ -1087,7 +1086,7 @@ impl ArrowColumnChunk {
 /// assert_eq!(metadata.file_metadata().num_rows(), 3);
 /// ```
 pub struct ArrowColumnWriter {
-    writer: ArrowColumnWriterImpl,
+    writer: ColumnWriter<'static>,
     chunk: SharedColumnChunk,
 }
 
@@ -1095,11 +1094,6 @@ impl std::fmt::Debug for ArrowColumnWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrowColumnWriter").finish_non_exhaustive()
     }
-}
-
-enum ArrowColumnWriterImpl {
-    ByteArray(GenericColumnWriter<'static, ByteArrayEncoder>),
-    Column(ColumnWriter<'static>),
 }
 
 impl ArrowColumnWriter {
@@ -1128,58 +1122,21 @@ impl ArrowColumnWriter {
 
             // Add a page break after each chunk except the last
             if i + 1 < num_chunks {
-                match &mut self.writer {
-                    ArrowColumnWriterImpl::Column(c) => c.add_data_page()?,
-                    ArrowColumnWriterImpl::ByteArray(c) => c.add_data_page()?,
-                }
+                self.writer.add_data_page()?;
             }
         }
         Ok(())
     }
 
     fn write_internal(&mut self, levels: &ArrayLevels) -> Result<()> {
-        match &mut self.writer {
-            ArrowColumnWriterImpl::Column(c) => {
-                let leaf = levels.array();
-                match leaf.as_any_dictionary_opt() {
-                    Some(dictionary) => {
-                        let materialized =
-                            arrow_select::take::take(dictionary.values(), dictionary.keys(), None)?;
-                        let batch = LeafBatch::new(
-                            materialized.as_ref(),
-                            levels.def_level_data().as_ref(),
-                            levels.rep_level_data().as_ref(),
-                            ValueSelectionRef::Sparse(levels.non_null_indices()),
-                        );
-                        write_leaf(c, batch)?
-                    }
-                    None => write_leaf(c, levels.leaf_batch())?,
-                };
-            }
-            ArrowColumnWriterImpl::ByteArray(c) => {
-                let source = byte_array::ByteArrayGatherSource::new(
-                    levels.array().as_ref(),
-                    levels.non_null_indices(),
-                );
-                c.write_batch_internal(
-                    source,
-                    levels.def_level_data().as_ref(),
-                    levels.rep_level_data().as_ref(),
-                    None,
-                    None,
-                    None,
-                )?;
-            }
-        }
+        self.writer.start_arrow_source();
+        write_leaf(&mut self.writer, levels.leaf_batch())?;
         Ok(())
     }
 
     /// Close this column returning the written [`ArrowColumnChunk`]
     pub fn close(self) -> Result<ArrowColumnChunk> {
-        let close = match self.writer {
-            ArrowColumnWriterImpl::ByteArray(c) => c.close()?,
-            ArrowColumnWriterImpl::Column(c) => c.close()?,
-        };
+        let close = self.writer.close()?;
         let chunk = Arc::try_unwrap(self.chunk).ok().unwrap();
         let data = chunk.into_inner().unwrap();
         Ok(ArrowColumnChunk { data, close })
@@ -1196,10 +1153,7 @@ impl ArrowColumnWriter {
     ///
     /// This value should be greater than or equal to [`Self::get_estimated_total_bytes`]
     pub fn memory_size(&self) -> usize {
-        match &self.writer {
-            ArrowColumnWriterImpl::ByteArray(c) => c.memory_size(),
-            ArrowColumnWriterImpl::Column(c) => c.memory_size(),
-        }
+        self.writer.memory_size()
     }
 
     /// Returns the estimated total encoded bytes for this column writer.
@@ -1210,10 +1164,7 @@ impl ArrowColumnWriter {
     ///
     /// This value should be less than or equal to [`Self::memory_size`]
     pub fn get_estimated_total_bytes(&self) -> usize {
-        match &self.writer {
-            ArrowColumnWriterImpl::ByteArray(c) => c.get_estimated_total_bytes() as _,
-            ArrowColumnWriterImpl::Column(c) => c.get_estimated_total_bytes() as _,
-        }
+        self.writer.get_estimated_total_bytes() as _
     }
 }
 
@@ -1474,18 +1425,8 @@ impl ArrowRowGroupWriterFactory {
         row_group_index: usize,
         schema_plan: &ArrowWriteSchemaPlan,
     ) -> Result<Vec<ArrowColumnWriter>> {
-        let mut writers = Vec::with_capacity(schema_plan.leaves.len());
-        let mut leaves = schema_plan.leaves.iter();
-        let column_factory = self.column_writer_factory(row_group_index);
-        for field in &schema_plan.fields {
-            column_factory.get_arrow_column_writer(
-                field.field.data_type(),
-                &self.props,
-                &mut leaves,
-                &mut writers,
-            )?;
-        }
-        Ok(writers)
+        self.column_writer_factory(row_group_index)
+            .create_column_writers(&schema_plan.leaves, &self.props)
     }
 
     #[cfg(feature = "encryption")]
@@ -1573,88 +1514,28 @@ impl ArrowColumnWriterFactory {
         Ok(Box::new(ArrowPageWriter::new(store)))
     }
 
-    /// Gets an [`ArrowColumnWriter`] for the given `data_type`, appending the
-    /// output ColumnDesc to `leaves` and the column writers to `out`
-    fn get_arrow_column_writer(
+    fn create_column_writers(
         &self,
-        data_type: &ArrowDataType,
+        descriptors: &[ColumnDescPtr],
         props: &WriterPropertiesPtr,
-        leaves: &mut Iter<'_, ColumnDescPtr>,
-        out: &mut Vec<ArrowColumnWriter>,
-    ) -> Result<()> {
-        // Instantiate writers for normal columns
-        let col = |desc: &ColumnDescPtr| -> Result<ArrowColumnWriter> {
-            let page_writer = self.create_page_writer(desc, out.len())?;
-            let chunk = page_writer.buffer.clone();
-            let writer = get_column_writer(desc.clone(), props.clone(), page_writer);
-            Ok(ArrowColumnWriter {
-                chunk,
-                writer: ArrowColumnWriterImpl::Column(writer),
-            })
-        };
-
-        // Instantiate writers for byte arrays (e.g. Utf8,  Binary, etc)
-        let bytes = |desc: &ColumnDescPtr| -> Result<ArrowColumnWriter> {
-            let page_writer = self.create_page_writer(desc, out.len())?;
-            let chunk = page_writer.buffer.clone();
-            let writer = GenericColumnWriter::new(desc.clone(), props.clone(), page_writer);
-            Ok(ArrowColumnWriter {
-                chunk,
-                writer: ArrowColumnWriterImpl::ByteArray(writer),
-            })
-        };
-
-        match data_type {
-            _ if data_type.is_primitive() => out.push(col(leaves.next().unwrap())?),
-            ArrowDataType::FixedSizeBinary(_) | ArrowDataType::Boolean | ArrowDataType::Null => {
-                out.push(col(leaves.next().unwrap())?)
-            }
-            ArrowDataType::LargeBinary
-            | ArrowDataType::Binary
-            | ArrowDataType::Utf8
-            | ArrowDataType::LargeUtf8
-            | ArrowDataType::BinaryView
-            | ArrowDataType::Utf8View => out.push(bytes(leaves.next().unwrap())?),
-            ArrowDataType::List(f)
-            | ArrowDataType::LargeList(f)
-            | ArrowDataType::FixedSizeList(f, _)
-            | ArrowDataType::ListView(f)
-            | ArrowDataType::LargeListView(f) => {
-                self.get_arrow_column_writer(f.data_type(), props, leaves, out)?
-            }
-            ArrowDataType::Struct(fields) => {
-                for field in fields {
-                    self.get_arrow_column_writer(field.data_type(), props, leaves, out)?
-                }
-            }
-            ArrowDataType::Map(f, _) => match f.data_type() {
-                ArrowDataType::Struct(f) => {
-                    self.get_arrow_column_writer(f[0].data_type(), props, leaves, out)?;
-                    self.get_arrow_column_writer(f[1].data_type(), props, leaves, out)?
-                }
-                _ => unreachable!("invalid map type"),
-            },
-            ArrowDataType::Dictionary(_, value_type) => match value_type.as_ref() {
-                ArrowDataType::Utf8
-                | ArrowDataType::LargeUtf8
-                | ArrowDataType::Binary
-                | ArrowDataType::LargeBinary => out.push(bytes(leaves.next().unwrap())?),
-                ArrowDataType::Utf8View | ArrowDataType::BinaryView => {
-                    out.push(bytes(leaves.next().unwrap())?)
-                }
-                ArrowDataType::FixedSizeBinary(_) => out.push(bytes(leaves.next().unwrap())?),
-                _ => out.push(col(leaves.next().unwrap())?),
-            },
-            ArrowDataType::RunEndEncoded(_, value_field) => {
-                self.get_arrow_column_writer(value_field.data_type(), props, leaves, out)?
-            }
-            _ => {
-                return Err(ParquetError::NYI(format!(
-                    "Attempting to write an Arrow type {data_type} to parquet that is not yet implemented"
-                )));
-            }
+    ) -> Result<Vec<ArrowColumnWriter>> {
+        let mut out = Vec::with_capacity(descriptors.len());
+        for (column_index, descriptor) in descriptors.iter().enumerate() {
+            out.push(self.create_column_writer(descriptor, props, column_index)?);
         }
-        Ok(())
+        Ok(out)
+    }
+
+    fn create_column_writer(
+        &self,
+        descriptor: &ColumnDescPtr,
+        props: &WriterPropertiesPtr,
+        column_index: usize,
+    ) -> Result<ArrowColumnWriter> {
+        let page_writer = self.create_page_writer(descriptor, column_index)?;
+        let chunk = page_writer.buffer.clone();
+        let writer = get_column_writer(Arc::clone(descriptor), Arc::clone(props), page_writer);
+        Ok(ArrowColumnWriter { writer, chunk })
     }
 }
 
@@ -1824,9 +1705,7 @@ macro_rules! dispatch_leaf_writer {
             }
             ColumnWriter::FloatColumnWriter(typed) => $phys!(Float32Storage<'_>, typed),
             ColumnWriter::DoubleColumnWriter(typed) => $phys!(Float64Storage<'_>, typed),
-            ColumnWriter::ByteArrayColumnWriter(_typed) => {
-                unreachable!("byte arrays are written by ArrowColumnWriterImpl::ByteArray")
-            }
+            ColumnWriter::ByteArrayColumnWriter(typed) => $phys!(ByteArrayStorage<'_>, typed),
             ColumnWriter::FixedLenByteArrayColumnWriter(typed) => {
                 $phys!(FixedLenByteArrayStorage<'_>, typed)
             }
@@ -1834,11 +1713,38 @@ macro_rules! dispatch_leaf_writer {
     };
 }
 
+fn dictionary_keys(keys: &dyn arrow_array::Array) -> DictionaryKeys<'_> {
+    macro_rules! extract {
+        ($ty:ty, $variant:ident) => {
+            DictionaryKeys::$variant(keys.as_primitive::<$ty>().values().as_ref())
+        };
+    }
+    match keys.data_type() {
+        ArrowDataType::UInt8 => extract!(UInt8Type, U8),
+        ArrowDataType::UInt16 => extract!(UInt16Type, U16),
+        ArrowDataType::UInt32 => extract!(UInt32Type, U32),
+        ArrowDataType::UInt64 => extract!(UInt64Type, U64),
+        ArrowDataType::Int8 => extract!(Int8Type, I8),
+        ArrowDataType::Int16 => extract!(Int16Type, I16),
+        ArrowDataType::Int32 => extract!(Int32Type, I32),
+        ArrowDataType::Int64 => extract!(Int64Type, I64),
+        key_type => unreachable!("unsupported dictionary key type {key_type}"),
+    }
+}
+
 fn dispatch_physical_input<'a>(
     column: &'a dyn arrow_array::Array,
     selection: ValueSelectionRef<'a>,
 ) -> (&'a dyn arrow_array::Array, PhysicalValueSelection<'a>) {
-    (column, PhysicalValueSelection::identity(selection))
+    if let Some(dictionary) = column.as_any_dictionary_opt() {
+        let keys = dictionary_keys(dictionary.keys());
+        (
+            dictionary.values().as_ref(),
+            PhysicalValueSelection::dictionary(selection, keys),
+        )
+    } else {
+        (column, PhysicalValueSelection::identity(selection))
+    }
 }
 
 fn primitive_values<T: ArrowPrimitiveType>(column: &dyn arrow_array::Array) -> &[T::Native] {
@@ -1867,6 +1773,7 @@ mod tests {
     use crate::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
     use crate::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use crate::column::page::{Page, PageReader};
+    use crate::column::reader::ColumnReader;
     use crate::file::metadata::thrift::PageHeader;
     use crate::file::page_index::column_index::ColumnIndexMetaData;
     use crate::file::reader::SerializedPageReader;
@@ -3012,13 +2919,27 @@ mod tests {
 
             let data = DictionaryArray::<K>::new(keys, Arc::new(values));
             let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(data)]).unwrap();
-            roundtrip(batch, None);
+            for file in roundtrip(batch, None) {
+                let parquet = SerializedFileReader::new(file).unwrap();
+                let row_group = parquet.get_row_group(0).unwrap();
+                let ColumnReader::FixedLenByteArrayColumnReader(mut reader) =
+                    row_group.get_column_reader(0).unwrap()
+                else {
+                    panic!("dictionary FSB was not written as FIXED_LEN_BYTE_ARRAY")
+                };
+                let mut values = Vec::new();
+                reader.read_records(3, None, None, &mut values).unwrap();
+                assert_eq!(
+                    values.iter().map(|value| value.data()).collect::<Vec<_>>(),
+                    [b"\0\0\0\0".as_slice(), b"\0\0\0\0", b"\x01\x01\x01\x01"]
+                );
+            }
         }
 
         test_fixed_size_binary_in_dict_inner::<UInt8Type>();
         test_fixed_size_binary_in_dict_inner::<UInt16Type>();
         test_fixed_size_binary_in_dict_inner::<UInt32Type>();
-        test_fixed_size_binary_in_dict_inner::<UInt16Type>();
+        test_fixed_size_binary_in_dict_inner::<UInt64Type>();
         test_fixed_size_binary_in_dict_inner::<Int8Type>();
         test_fixed_size_binary_in_dict_inner::<Int16Type>();
         test_fixed_size_binary_in_dict_inner::<Int32Type>();

@@ -128,6 +128,8 @@ mod encoding_family_private {
         fn is_dictionary(&self) -> bool {
             false
         }
+        #[cfg(feature = "arrow")]
+        fn start_arrow_source(&mut self) {}
         /// If dictionary-encoding, serialize the dictionary page as `(buf, num_values,
         /// is_sorted)` and transition in place to the fallback encoding (dictionary
         /// fallback); otherwise `None`.
@@ -230,6 +232,13 @@ macro_rules! impl_dictionary_encoding_family {
 
             fn is_dictionary(&self) -> bool {
                 matches!(self, Self::Dictionary(_))
+            }
+
+            #[cfg(feature = "arrow")]
+            fn start_arrow_source(&mut self) {
+                if let Self::Dictionary(dict) = self {
+                    dict.start_arrow_source()
+                }
             }
 
             fn take_dict_page(

@@ -20,7 +20,7 @@ use crate::arrow::record_reader::buffer::ValuesBuffer;
 use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, GenericByteArray, downcast_integer};
 use arrow_array::{
-    ArrayRef, FixedSizeBinaryArray, OffsetSizeTrait,
+    ArrayRef, FixedSizeBinaryArray, GenericBinaryArray, OffsetSizeTrait,
     builder::{FixedSizeBinaryDictionaryBuilder, GenericByteDictionaryBuilder},
     cast::AsArray,
     make_array,
@@ -186,7 +186,21 @@ impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
                     _ => unreachable!(),
                 };
 
-                let array = values.into_array(null_buffer, value_type);
+                // Plain byte-array pages are decoded into an offset buffer. Convert
+                // this representation explicitly before rebuilding an FSB dictionary,
+                // as FixedSizeBinary arrays have no offsets buffer.
+                let array = match value_type {
+                    ArrowType::FixedSizeBinary(size) => {
+                        let binary =
+                            values.into_array(null_buffer, GenericBinaryArray::<V>::DATA_TYPE);
+                        let binary = binary.as_binary::<V>();
+                        Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                            binary.iter(),
+                            size,
+                        )?) as ArrayRef
+                    }
+                    value_type => values.into_array(null_buffer, value_type),
+                };
                 pack_values(key_type, &array)
             }
         }
