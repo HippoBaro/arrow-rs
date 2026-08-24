@@ -22,9 +22,8 @@ use crate::column::value_selection::DictionaryKeys;
 use crate::column::value_selection::{
     PhysicalValueSelection, PhysicalValueSpan, ValueSelectionRef,
 };
-use crate::column::writer::ByteBudgetTarget;
 use crate::column::writer::encoder::TypedColumnChunkEncoder;
-use crate::column::writer::encoder::{ByteArrayBatch, ByteArraySink, ByteArraySource};
+use crate::column::writer::{ByteArrayBatch, ByteArraySink, ByteArraySource, ByteBudgetTarget};
 use crate::data_type::ByteArrayType as ParquetByteArrayType;
 use crate::errors::{ParquetError, Result};
 
@@ -49,6 +48,19 @@ trait ByteArrayValueAccess<'a>: Copy {
     #[inline]
     fn value_len(self, index: usize) -> usize {
         self.value(index).len()
+    }
+
+    #[inline]
+    fn try_for_each_range<E>(
+        self,
+        start: usize,
+        len: usize,
+        mut f: impl FnMut(&'a [u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        for index in start..start + len {
+            f(self.value(index))?;
+        }
+        Ok(())
     }
 
     /// Exact encoded size of a contiguous range, when the layout has prefix
@@ -137,6 +149,20 @@ impl<'a, O: ByteArrayOffset> ByteArrayValueAccess<'a> for OffsetByteArrayAccess<
     }
 
     #[inline]
+    fn try_for_each_range<E>(
+        self,
+        start: usize,
+        len: usize,
+        mut f: impl FnMut(&'a [u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let data = self.data;
+        for window in self.offsets[start..start + len + 1].windows(2) {
+            f(&data[window[0].as_usize()..window[1].as_usize()])?;
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn exact_range_encoded_size(self, start: usize, len: usize) -> Option<usize> {
         let payload = (self.offsets[start + len] - self.offsets[start]).as_usize();
         Some(payload.saturating_add(len.saturating_mul(std::mem::size_of::<u32>())))
@@ -204,7 +230,8 @@ where
     }
 }
 
-/// Byte-value producer driven by a physical selection.
+/// Byte-value producer driven by a physical selection. Grouped dictionary input
+/// remains compact through `for_each_run_group`.
 #[derive(Clone, Copy)]
 struct PhysicalByteArraySource<'a, A> {
     selection: PhysicalValueSelection<'a>,
@@ -222,8 +249,33 @@ where
 
     #[inline]
     fn try_for_each<E>(self, mut f: impl FnMut(&'a [u8]) -> Result<(), E>) -> Result<(), E> {
+        if !self.selection.is_grouped() {
+            return self
+                .selection
+                .try_for_each_index(|index| f(self.values.value(index)));
+        }
+
+        self.selection.try_for_each_span(|span| match span {
+            PhysicalValueSpan::Range { start, len } => {
+                self.values.try_for_each_range(start, len, &mut f)
+            }
+            PhysicalValueSpan::Repeat { index, count } => {
+                let value = self.values.value(index);
+                for _ in 0..count {
+                    f(value)?;
+                }
+                Ok(())
+            }
+        })
+    }
+
+    #[inline]
+    fn for_each_run_group<E>(
+        self,
+        mut f: impl FnMut(&'a [u8], usize) -> Result<(), E>,
+    ) -> Result<(), E> {
         self.selection
-            .try_for_each_index(|index| f(self.values.value(index)))
+            .try_for_each_index_group(|index, count| f(self.values.value(index), count))
     }
 }
 
@@ -231,6 +283,11 @@ impl<'a, A> ByteArraySource<'a> for PhysicalByteArraySource<'a, A>
 where
     A: ByteArrayValueAccess<'a> + 'a,
 {
+    #[inline]
+    fn is_grouped(self) -> bool {
+        self.selection.is_grouped()
+    }
+
     #[inline]
     fn write_flat_to(self, sink: &mut ByteArraySink<'a, '_>) -> Result<()> {
         // Offset layouts can lend every selected range directly. Other
@@ -251,8 +308,9 @@ where
         // Reuse their already-interned Parquet dictionary indices across the
         // writer windows produced from this bound source.
         if self.selection.should_cache_dictionary(self.values.len()) && sink.is_dictionary() {
-            return sink
-                .push_dictionary_source(self.selection, move |index| self.values.value(index));
+            return sink.push_dictionary_source(self.selection, false, move |index| {
+                self.values.value(index)
+            });
         }
 
         if let Some(views) = self.values.inline_views()
@@ -264,6 +322,15 @@ where
         }
 
         sink.push_source(self)
+    }
+
+    #[inline]
+    fn write_run_groups_to(self, sink: &mut ByteArraySink<'a, '_>) -> Result<()> {
+        if self.selection.should_cache_dictionary(self.values.len()) && sink.is_dictionary() {
+            sink.push_dictionary_source(self.selection, true, move |index| self.values.value(index))
+        } else {
+            self.write_run_groups_fallback_to(sink)
+        }
     }
 }
 
@@ -432,21 +499,22 @@ fn count_dictionary_values_within_byte_budget<'a, A: ByteArrayValueAccess<'a>>(
     let mut seen = vec![false; values.len()];
     let mut remaining = budget;
     let mut count = 0;
-    let _: std::result::Result<(), ()> = selection.try_for_each_index(|index| {
-        if !cached(index) && !seen[index] {
-            seen[index] = true;
-            let encoded = values
-                .value_len(index)
-                .saturating_add(std::mem::size_of::<u32>());
-            if encoded > remaining {
-                count += 1;
-                return Err(());
+    let _: std::result::Result<(), ()> =
+        selection.try_for_each_index_group(|index, occurrences| {
+            if !cached(index) && !seen[index] {
+                seen[index] = true;
+                let encoded = values
+                    .value_len(index)
+                    .saturating_add(std::mem::size_of::<u32>());
+                if encoded > remaining {
+                    count += occurrences;
+                    return Err(());
+                }
+                remaining -= encoded;
             }
-            remaining -= encoded;
-        }
-        count += 1;
-        Ok(())
-    });
+            count += occurrences;
+            Ok(())
+        });
     count
 }
 
@@ -505,6 +573,21 @@ fn count_selection_within_byte_budget<'a, A: ByteArrayValueAccess<'a>>(
             }
             Ok(())
         }
+        PhysicalValueSpan::Repeat {
+            index,
+            count: span_count,
+        } => {
+            let encoded = values.value_len(index).saturating_add(prefix);
+            let span_bytes = encoded.saturating_mul(span_count);
+            if span_bytes <= remaining {
+                remaining -= span_bytes;
+                count += span_count;
+                return Ok(());
+            }
+
+            count += (remaining / encoded).saturating_add(1).min(span_count);
+            Err(())
+        }
     });
     count
 }
@@ -528,8 +611,21 @@ fn max_view_value_len(buffers: &[Buffer]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::column::value_selection::ValueSelectionRef;
+    use crate::column::value_selection::{RangesSelectionRef, SelectionRange, ValueSelectionRef};
     use arrow_array::{LargeStringArray, StringArray};
+
+    fn count_selection(
+        values: &dyn Array,
+        selection: ValueSelectionRef<'_>,
+        budget: usize,
+    ) -> usize {
+        let storage = ByteArrayStorage::bind(values).unwrap();
+        with_byte_array_access!(storage.kind, |values| count_selection_within_byte_budget(
+            PhysicalValueSelection::identity(selection),
+            values,
+            budget,
+        ))
+    }
 
     fn direct_batch<'a>(
         values: &'a dyn Array,
@@ -575,6 +671,33 @@ mod tests {
             .map(|offset| &data[offset[0] as usize..offset[1] as usize])
             .collect();
         assert_eq!(selected, [b"bb".as_slice(), b"ccc".as_slice()]);
+    }
+
+    #[test]
+    fn range_byte_budget_includes_crossing_value() {
+        // Encoded sizes are 5, 6, 8, and 7 bytes for the selected values.
+        // The first value fits exactly and the crossing value is included.
+        let values = StringArray::from(vec!["a", "bb", "cccc", "not selected", "ddd"]);
+        let ranges = [SelectionRange::new(0..3, 3), SelectionRange::new(4..5, 4)];
+        let selection = ValueSelectionRef::Ranges(RangesSelectionRef::new(&ranges, 4));
+        assert_eq!(count_selection(&values, selection, 5), 2);
+
+        // The first range costs 11 bytes. The first value in the second range
+        // costs 7, exactly consuming the 18-byte budget; the following value
+        // does not fit.
+        let values = LargeStringArray::from(vec![
+            "a",
+            "bb",
+            "not selected",
+            "also not selected",
+            "ccc",
+            "dddd",
+            "eeeee",
+        ]);
+        let ranges = [SelectionRange::new(0..2, 2), SelectionRange::new(4..7, 5)];
+        let selection = ValueSelectionRef::Ranges(RangesSelectionRef::new(&ranges, 5));
+
+        assert_eq!(count_selection(&values, selection, 18), 4);
     }
 
     #[test]

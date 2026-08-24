@@ -26,9 +26,14 @@ use super::{
     FieldContract, LevelContext, LevelData, is_leaf, leaf_types_compatible, normalized,
     plan::{LeafBatch, ValueSelection},
 };
+use crate::column::value_selection::{GroupedSelectionRef, ValueSelectionRef};
+use crate::column::writer::LevelDataRef;
 use crate::errors::{ParquetError, Result};
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef};
+use arrow_array::types::{
+    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
+use arrow_array::{Array, ArrayRef, GenericListArray, GenericListViewArray, OffsetSizeTrait};
 use arrow_buffer::{ArrowNativeType, NullBuffer};
 use arrow_schema::{DataType, Field};
 use std::ops::Range;
@@ -46,15 +51,21 @@ pub(crate) struct CursorLeafPlan {
     terminal: ArrayRef,
     max_def_level: i16,
     max_rep_level: i16,
+    indexed_traversal: bool,
 }
 
 impl CursorLeafPlan {
-    pub(crate) fn cursor(&self, target_rows: usize) -> LeafCursor<'_> {
+    pub(crate) fn cursor(&self, target_slots: usize, target_rows: usize) -> LeafCursor<'_> {
         LeafCursor {
             plan: self,
             next_row: 0,
+            target_slots: target_slots.max(1),
             target_rows: target_rows.max(1),
-            tile: LeafTile::new(self.max_def_level, self.max_rep_level),
+            tile: LeafTile::new(
+                self.max_def_level,
+                self.max_rep_level,
+                self.indexed_traversal,
+            ),
         }
     }
 }
@@ -106,10 +117,66 @@ impl ListKind {
             Self::Map => std::sync::Arc::new(array.as_map().entries().clone()),
         }
     }
+
+    #[inline]
+    fn row(self, array: &dyn Array, row: usize) -> (usize, usize, &dyn Array) {
+        match self {
+            Self::List => list_row(array.as_list::<i32>(), row),
+            Self::LargeList => list_row(array.as_list::<i64>(), row),
+            Self::FixedSizeList => {
+                let array = array.as_fixed_size_list();
+                let start = array.value_offset(row) as usize;
+                (
+                    start,
+                    start + array.value_length() as usize,
+                    array.values().as_ref(),
+                )
+            }
+            Self::ListView => list_view_row(array.as_list_view::<i32>(), row),
+            Self::LargeListView => list_view_row(array.as_list_view::<i64>(), row),
+            Self::Map => {
+                let array = array.as_map();
+                let offsets = array.value_offsets();
+                (
+                    offsets[row] as usize,
+                    offsets[row + 1] as usize,
+                    array.entries(),
+                )
+            }
+        }
+    }
+}
+
+#[inline]
+fn list_row<O: OffsetSizeTrait>(
+    array: &GenericListArray<O>,
+    row: usize,
+) -> (usize, usize, &dyn Array) {
+    let offsets = array.value_offsets();
+    (
+        offsets[row].as_usize(),
+        offsets[row + 1].as_usize(),
+        array.values().as_ref(),
+    )
+}
+
+#[inline]
+fn list_view_row<O: OffsetSizeTrait>(
+    array: &GenericListViewArray<O>,
+    row: usize,
+) -> (usize, usize, &dyn Array) {
+    let start = array.value_offset(row).as_usize();
+    (
+        start,
+        start + array.value_size(row).as_usize(),
+        array.values().as_ref(),
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
 enum NodeKind {
+    RunEndEncoded,
+    Dictionary,
     Null,
     Leaf,
     DictionaryLeaf,
@@ -125,12 +192,14 @@ struct PathNode {
 
 fn classify_node(array: &dyn Array, contract: FieldContract<'_>) -> Result<NodeKind> {
     Ok(match array.data_type() {
+        DataType::RunEndEncoded(_, _) => NodeKind::RunEndEncoded,
         DataType::Dictionary(_, value) if is_leaf(value) => {
             if !leaf_types_compatible(contract.data_type, value) {
                 return Err(incompatible(contract, value));
             }
             NodeKind::DictionaryLeaf
         }
+        DataType::Dictionary(_, _) => NodeKind::Dictionary,
         actual if is_leaf(actual) => {
             if !leaf_types_compatible(contract.data_type, actual) {
                 return Err(incompatible(contract, actual));
@@ -182,9 +251,71 @@ pub(crate) fn collect_cursor_leaves(root: &ArrayRef, field: &Field) -> Result<Ve
         &mut path,
         root,
         field,
+        false,
         &mut leaves,
     )?;
     Ok(leaves)
+}
+
+/// Compact level storage for indexed traversal, which appends one slot at a time.
+#[derive(Debug)]
+struct ScalarLevels {
+    enabled: bool,
+    uniform: Option<i16>,
+    len: usize,
+    values: Vec<i16>,
+}
+
+impl ScalarLevels {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            uniform: None,
+            len: 0,
+            values: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.uniform = None;
+        self.len = 0;
+        self.values.clear();
+    }
+
+    #[inline]
+    fn push(&mut self, value: i16) {
+        if !self.enabled {
+            return;
+        }
+        match self.uniform {
+            None if self.len == 0 => self.uniform = Some(value),
+            Some(uniform) if uniform == value => {}
+            Some(uniform) => {
+                self.values.resize(self.len, uniform);
+                self.values.push(value);
+                self.uniform = None;
+            }
+            None => self.values.push(value),
+        }
+        self.len += 1;
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.enabled) * self.len
+    }
+
+    fn as_ref(&self) -> LevelDataRef<'_> {
+        if !self.enabled {
+            LevelDataRef::Absent
+        } else if let Some(value) = self.uniform {
+            LevelDataRef::Uniform {
+                value,
+                count: self.len,
+            }
+        } else {
+            LevelDataRef::Materialized(&self.values)
+        }
+    }
 }
 
 /// One reusable portion of a leaf stream. Indexed traversal accumulates
@@ -194,7 +325,15 @@ pub(crate) fn collect_cursor_leaves(root: &ArrayRef, field: &Field) -> Result<Ve
 #[derive(Debug)]
 pub(crate) struct LeafTile {
     slots: usize,
-    direct: DirectTile,
+    def_levels: ScalarLevels,
+    rep_levels: ScalarLevels,
+    direct: Option<Box<DirectTile>>,
+    indexed_traversal: bool,
+    value_indices: Vec<usize>,
+    value_ends: Vec<usize>,
+    // Last physical run at each REE depth; retained across tile clears.
+    ree_runs: Vec<usize>,
+    ree_depth: usize,
 }
 
 #[derive(Debug)]
@@ -205,51 +344,115 @@ struct DirectTile {
 }
 
 impl LeafTile {
-    fn new(max_def_level: i16, max_rep_level: i16) -> Self {
+    fn new(max_def_level: i16, max_rep_level: i16, indexed_traversal: bool) -> Self {
         Self {
             slots: 0,
-            direct: DirectTile {
-                def_levels: LevelData::new(max_def_level != 0),
-                rep_levels: LevelData::new(max_rep_level != 0),
-                values: ValueSelection::Empty,
-            },
+            def_levels: ScalarLevels::new(indexed_traversal && max_def_level != 0),
+            rep_levels: ScalarLevels::new(indexed_traversal && max_rep_level != 0),
+            direct: (!indexed_traversal).then(|| {
+                Box::new(DirectTile {
+                    def_levels: LevelData::new(max_def_level != 0),
+                    rep_levels: LevelData::new(max_rep_level != 0),
+                    values: ValueSelection::Empty,
+                })
+            }),
+            indexed_traversal,
+            value_indices: Vec::new(),
+            value_ends: Vec::new(),
+            ree_runs: Vec::new(),
+            ree_depth: 0,
         }
     }
 
     fn clear(&mut self) {
         self.slots = 0;
-        self.direct.def_levels.clear();
-        self.direct.rep_levels.clear();
-        self.direct.values.clear();
+        if self.indexed_traversal {
+            self.def_levels.clear();
+            self.rep_levels.clear();
+        } else {
+            let direct = self.direct.as_mut().unwrap();
+            direct.def_levels.clear();
+            direct.rep_levels.clear();
+            direct.values.clear();
+        }
+        self.value_indices.clear();
+        self.value_ends.clear();
+    }
+
+    fn push_level(&mut self, def: i16, rep: i16) {
+        debug_assert!(self.indexed_traversal);
+        self.slots += 1;
+        self.def_levels.push(def);
+        self.rep_levels.push(rep);
     }
 
     fn push_level_run(&mut self, def: i16, rep: i16, count: usize) {
+        debug_assert!(!self.indexed_traversal);
         self.slots += count;
-        self.direct.def_levels.append_run(def, count);
-        self.direct.rep_levels.append_run(rep, count);
+        let direct = self.direct.as_mut().unwrap();
+        direct.def_levels.append_run(def, count);
+        direct.rep_levels.append_run(rep, count);
     }
 
     fn push_value_range(&mut self, def: i16, rep: i16, range: std::ops::Range<usize>) {
+        debug_assert!(!self.indexed_traversal);
         let len = range.len();
         self.push_level_run(def, rep, len);
-        self.direct.values.append_range(range);
+        self.direct.as_mut().unwrap().values.append_range(range);
+    }
+
+    fn push_value(&mut self, def: i16, rep: i16, index: usize) {
+        debug_assert!(self.indexed_traversal);
+        self.push_level(def, rep);
+        self.push_group(index, 1);
+    }
+
+    fn push_group(&mut self, index: usize, len: usize) {
+        let end = self.value_ends.last().copied().unwrap_or(0) + len;
+        if self.value_indices.last() == Some(&index) {
+            *self.value_ends.last_mut().unwrap() = end;
+        } else {
+            self.value_indices.push(index);
+            self.value_ends.push(end);
+        }
     }
 
     pub(crate) fn batch<'a>(&'a self, plan: &'a CursorLeafPlan) -> LeafBatch<'a> {
-        LeafBatch::new(
-            plan.terminal.as_ref(),
-            self.direct.def_levels.as_ref(),
-            self.direct.rep_levels.as_ref(),
-            self.direct.values.as_ref(),
-        )
+        let (def_levels, rep_levels) = if self.indexed_traversal {
+            (self.def_levels.as_ref(), self.rep_levels.as_ref())
+        } else {
+            let direct = self.direct.as_ref().unwrap();
+            (direct.def_levels.as_ref(), direct.rep_levels.as_ref())
+        };
+        let values = if !self.indexed_traversal {
+            self.direct.as_ref().unwrap().values.as_ref()
+        } else if self.value_indices.is_empty() {
+            ValueSelectionRef::Empty
+        } else if self.value_indices.len() == self.value_ends.last().copied().unwrap_or(0) {
+            ValueSelectionRef::Sparse(&self.value_indices)
+        } else {
+            ValueSelectionRef::Grouped(GroupedSelectionRef::new(
+                &self.value_indices,
+                &self.value_ends,
+            ))
+        };
+        LeafBatch::new(plan.terminal.as_ref(), def_levels, rep_levels, values)
     }
 
     fn def_levels_len(&self) -> usize {
-        self.direct.def_levels.len()
+        if self.indexed_traversal {
+            self.def_levels.len()
+        } else {
+            self.direct.as_ref().unwrap().def_levels.len()
+        }
     }
 
     fn rep_levels_len(&self) -> usize {
-        self.direct.rep_levels.len()
+        if self.indexed_traversal {
+            self.rep_levels.len()
+        } else {
+            self.direct.as_ref().unwrap().rep_levels.len()
+        }
     }
 }
 
@@ -257,6 +460,7 @@ impl LeafTile {
 pub(crate) struct LeafCursor<'a> {
     plan: &'a CursorLeafPlan,
     next_row: usize,
+    target_slots: usize,
     target_rows: usize,
     tile: LeafTile,
 }
@@ -272,23 +476,43 @@ impl<'a> LeafCursor<'a> {
         self.tile.clear();
         let contract = normalized(&self.plan.field);
 
-        let end = if self.plan.max_rep_level == 0 {
-            self.plan.root.len()
-        } else {
-            first_row
-                .saturating_add(rows_to_boundary)
-                .min(self.plan.root.len())
-        };
-        visit_range(
-            self.plan.root.as_ref(),
-            first_row..end,
-            contract,
-            LevelContext::default(),
-            0,
-            &self.plan.path,
-            &mut self.tile,
-        )?;
-        self.next_row = end;
+        if !self.plan.indexed_traversal {
+            let end = if self.plan.max_rep_level == 0 {
+                self.plan.root.len()
+            } else {
+                first_row
+                    .saturating_add(rows_to_boundary)
+                    .min(self.plan.root.len())
+            };
+            visit_range(
+                self.plan.root.as_ref(),
+                first_row..end,
+                contract,
+                LevelContext::default(),
+                0,
+                &self.plan.path,
+                &mut self.tile,
+            )?;
+            self.next_row = end;
+            debug_assert!(self.tile.slots != 0);
+            return Ok(Some(&self.tile));
+        }
+
+        while self.next_row < self.plan.root.len()
+            && self.tile.slots < self.target_slots
+            && self.next_row - first_row < rows_to_boundary
+        {
+            visit_node(
+                self.plan.root.as_ref(),
+                self.next_row,
+                contract,
+                LevelContext::default(),
+                0,
+                &self.plan.path,
+                &mut self.tile,
+            )?;
+            self.next_row += 1;
+        }
 
         debug_assert!(self.tile.slots != 0);
         debug_assert_eq!(
@@ -312,6 +536,7 @@ fn visit_range(
     path: &[PathNode],
     out: &mut LeafTile,
 ) -> Result<()> {
+    debug_assert!(!out.indexed_traversal);
     if range.is_empty() {
         return Ok(());
     }
@@ -386,6 +611,9 @@ fn visit_range(
         NodeKind::List(kind) => {
             visit_list_range(kind, array, range, contract, ctx, rep, child_path, out)
         }
+        NodeKind::RunEndEncoded | NodeKind::Dictionary => {
+            unreachable!("indexed node reached direct leaf traversal")
+        }
     }
 }
 
@@ -427,7 +655,7 @@ fn visit_leaf_range(
     }
 
     out.slots += len;
-    let direct = &mut out.direct;
+    let direct = out.direct.as_mut().unwrap();
     direct.rep_levels.append_run(rep, len);
     if len >= super::BULK_FILL_MIN_LEN && nulls.null_count() * 2 >= nulls.len() {
         let mut position = 0;
@@ -731,7 +959,13 @@ fn patch_list_starts(
     if rep == child_rep {
         return;
     }
-    let levels = out.direct.rep_levels.materialize_mut().unwrap();
+    let levels = out
+        .direct
+        .as_mut()
+        .unwrap()
+        .rep_levels
+        .materialize_mut()
+        .unwrap();
     if flat_child {
         for row in rows {
             levels[slot_start + bounds(row).0 - values_start] = rep;
@@ -764,6 +998,7 @@ fn path_has_no_list(path: &[PathNode]) -> bool {
     })
 }
 
+#[expect(clippy::too_many_arguments)]
 fn collect_node(
     array: &ArrayRef,
     contract: FieldContract<'_>,
@@ -771,6 +1006,7 @@ fn collect_node(
     path: &mut Vec<PathNode>,
     root: &ArrayRef,
     root_field: &Field,
+    indexed_traversal: bool,
     leaves: &mut Vec<CursorLeafPlan>,
 ) -> Result<()> {
     let kind = classify_node(array.as_ref(), contract)?;
@@ -779,6 +1015,20 @@ fn collect_node(
         struct_child: 0,
     });
     let result = (|| match kind {
+        NodeKind::RunEndEncoded => {
+            let (_, _, values) = super::super::run_ends_of(array.as_ref())?;
+            collect_node(values, contract, ctx, path, root, root_field, true, leaves)
+        }
+        NodeKind::Dictionary => collect_node(
+            array.as_any_dictionary().values(),
+            contract,
+            ctx,
+            path,
+            root,
+            root_field,
+            true,
+            leaves,
+        ),
         NodeKind::Null | NodeKind::Leaf | NodeKind::DictionaryLeaf => {
             leaves.push(CursorLeafPlan {
                 root: root.clone(),
@@ -787,6 +1037,7 @@ fn collect_node(
                 terminal: array.clone(),
                 max_def_level: ctx.def_level + contract.nullable as i16,
                 max_rep_level: ctx.rep_level,
+                indexed_traversal,
             });
             Ok(())
         }
@@ -810,6 +1061,7 @@ fn collect_node(
                     path,
                     root,
                     root_field,
+                    indexed_traversal,
                     leaves,
                 )?;
             }
@@ -825,6 +1077,7 @@ fn collect_node(
                 path,
                 root,
                 root_field,
+                indexed_traversal,
                 leaves,
             )
         }
@@ -842,6 +1095,7 @@ fn collect_list_child(
     path: &mut Vec<PathNode>,
     root: &ArrayRef,
     root_field: &Field,
+    indexed_traversal: bool,
     leaves: &mut Vec<CursorLeafPlan>,
 ) -> Result<()> {
     collect_node(
@@ -854,8 +1108,210 @@ fn collect_list_child(
         path,
         root,
         root_field,
+        indexed_traversal,
         leaves,
     )
+}
+
+fn visit_node(
+    array: &dyn Array,
+    index: usize,
+    contract: FieldContract<'_>,
+    ctx: LevelContext,
+    rep: i16,
+    path: &[PathNode],
+    out: &mut LeafTile,
+) -> Result<()> {
+    let (&PathNode { kind, struct_child }, child_path) = path.split_first().unwrap();
+    match kind {
+        NodeKind::RunEndEncoded => {
+            let (run_ends, base, values) = super::super::run_ends_of(array)?;
+            let position = base + index;
+            let depth = out.ree_depth;
+            let physical = match out.ree_runs.get(depth).copied() {
+                Some(mut run) if run == 0 || position >= run_ends.end_of(run.saturating_sub(1)) => {
+                    while run_ends.end_of(run) <= position {
+                        run += 1;
+                    }
+                    run
+                }
+                _ => run_ends.run_of(position),
+            };
+            if let Some(run) = out.ree_runs.get_mut(depth) {
+                *run = physical;
+            } else {
+                debug_assert_eq!(out.ree_runs.len(), depth);
+                out.ree_runs.push(physical);
+            }
+            out.ree_depth += 1;
+            let result = visit_node(
+                values.as_ref(),
+                physical,
+                contract,
+                ctx,
+                rep,
+                child_path,
+                out,
+            );
+            out.ree_depth -= 1;
+            result
+        }
+        NodeKind::DictionaryLeaf => {
+            let dictionary = array.as_any_dictionary();
+            if dictionary.keys().is_null(index) {
+                return emit_null(contract, ctx, rep, index, out);
+            }
+            let key = dictionary_key(dictionary.keys(), index)?;
+            if matches!(dictionary.values().data_type(), DataType::Null)
+                || dictionary.values().is_null(key)
+            {
+                return emit_null(contract, ctx, rep, index, out);
+            }
+            out.push_value(ctx.def_level + contract.nullable as i16, rep, index);
+            Ok(())
+        }
+        NodeKind::Dictionary => {
+            let dictionary = array.as_any_dictionary();
+            if dictionary.keys().is_null(index) {
+                return emit_null(contract, ctx, rep, index, out);
+            }
+            let key = dictionary_key(dictionary.keys(), index)?;
+            visit_node(
+                dictionary.values().as_ref(),
+                key,
+                contract,
+                ctx,
+                rep,
+                child_path,
+                out,
+            )
+        }
+        NodeKind::Null => emit_null(contract, ctx, rep, index, out),
+        NodeKind::Leaf => {
+            if array.is_null(index) {
+                emit_null(contract, ctx, rep, index, out)
+            } else {
+                out.push_value(ctx.def_level + contract.nullable as i16, rep, index);
+                Ok(())
+            }
+        }
+        NodeKind::Struct => {
+            if array.is_null(index) {
+                return emit_null(contract, ctx, rep, index, out);
+            }
+            let DataType::Struct(fields) = contract.data_type else {
+                unreachable!("struct contract was validated during planning")
+            };
+            visit_node(
+                array.as_struct().column(struct_child).as_ref(),
+                index,
+                normalized(&fields[struct_child]),
+                LevelContext {
+                    def_level: ctx.def_level + contract.nullable as i16,
+                    ..ctx
+                },
+                rep,
+                child_path,
+                out,
+            )
+        }
+        NodeKind::List(kind) => {
+            let (start, end, child) = kind.row(array, index);
+            visit_list(
+                array,
+                index,
+                start,
+                end,
+                child,
+                kind.field(contract),
+                contract,
+                ctx,
+                rep,
+                child_path,
+                out,
+            )
+        }
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn visit_list(
+    list: &dyn Array,
+    row: usize,
+    start: usize,
+    end: usize,
+    child: &dyn Array,
+    child_field: &Field,
+    contract: FieldContract<'_>,
+    ctx: LevelContext,
+    rep: i16,
+    path: &[PathNode],
+    out: &mut LeafTile,
+) -> Result<()> {
+    if list.is_null(row) {
+        return emit_null(contract, ctx, rep, row, out);
+    }
+
+    let list_def = ctx.def_level + contract.nullable as i16;
+    if start == end {
+        out.push_level(list_def, rep);
+        return Ok(());
+    }
+
+    let child_ctx = LevelContext {
+        def_level: list_def + 1,
+        rep_level: ctx.rep_level + 1,
+    };
+    let child_contract = normalized(child_field);
+    let mut child_rep = rep;
+    for child_index in start..end {
+        visit_node(
+            child,
+            child_index,
+            child_contract,
+            child_ctx,
+            child_rep,
+            path,
+            out,
+        )?;
+        child_rep = child_ctx.rep_level;
+    }
+    Ok(())
+}
+
+fn emit_null(
+    contract: FieldContract<'_>,
+    ctx: LevelContext,
+    rep: i16,
+    index: usize,
+    out: &mut LeafTile,
+) -> Result<()> {
+    if !contract.nullable {
+        return Err(super::required_null(contract.name, index));
+    }
+    out.push_level(ctx.def_level, rep);
+    Ok(())
+}
+
+fn dictionary_key(keys: &dyn Array, index: usize) -> Result<usize> {
+    macro_rules! key {
+        ($ty:ty) => {
+            keys.as_primitive::<$ty>().value(index) as usize
+        };
+    }
+    Ok(match keys.data_type() {
+        DataType::Int8 => key!(Int8Type),
+        DataType::Int16 => key!(Int16Type),
+        DataType::Int32 => key!(Int32Type),
+        DataType::Int64 => key!(Int64Type),
+        DataType::UInt8 => key!(UInt8Type),
+        DataType::UInt16 => key!(UInt16Type),
+        DataType::UInt32 => key!(UInt32Type),
+        DataType::UInt64 => key!(UInt64Type),
+        other => {
+            return Err(nyi_err!(format!("Unsupported dictionary key type {other}")));
+        }
+    })
 }
 
 fn incompatible(contract: FieldContract<'_>, actual: &DataType) -> ParquetError {
@@ -871,10 +1327,27 @@ mod tests {
     use arrow_array::Int32Array;
 
     #[test]
+    fn scalar_levels_guard_and_materialization_paths() {
+        let disabled = ScalarLevels::new(false);
+        assert_eq!(disabled.as_ref(), LevelDataRef::Absent);
+
+        let mut levels = ScalarLevels::new(true);
+        levels.push(1);
+        levels.push(1);
+        assert_eq!(
+            levels.as_ref(),
+            LevelDataRef::Uniform { value: 1, count: 2 }
+        );
+
+        levels.push(2);
+        assert_eq!(levels.as_ref(), LevelDataRef::Materialized(&[1, 1, 2]));
+    }
+
+    #[test]
     fn direct_leaf_empty_required_and_bulk_null_paths() {
         let field = Field::new("a", DataType::Int32, false);
         let array = Int32Array::from(vec![Some(1), None]);
-        let mut tile = LeafTile::new(0, 0);
+        let mut tile = LeafTile::new(0, 0, false);
         let path = [PathNode {
             kind: NodeKind::Leaf,
             struct_child: 0,
@@ -909,7 +1382,7 @@ mod tests {
                 .map(|index| (index % 4 == 0).then_some(index))
                 .collect::<Vec<_>>(),
         );
-        let mut tile = LeafTile::new(1, 0);
+        let mut tile = LeafTile::new(1, 0, false);
         visit_range(
             &array,
             0..array.len(),
@@ -921,6 +1394,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tile.slots, 80);
-        assert_eq!(tile.direct.values.as_ref().len(), 20);
+        assert_eq!(tile.direct.unwrap().values.as_ref().len(), 20);
     }
 }

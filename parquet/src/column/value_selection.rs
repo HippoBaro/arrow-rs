@@ -28,6 +28,40 @@ use arrow_buffer::ArrowNativeType;
 use crate::column::value_batch::ValueProducer;
 use crate::errors::Result;
 
+/// Run boundaries of a run-end-encoded array, type-erased over the run-end
+/// index width. `run_ends[j]` is the logical position one past the end of
+/// physical run `j`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunEnds<'a> {
+    I16(&'a [i16]),
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+}
+
+impl RunEnds<'_> {
+    /// Physical run index containing absolute logical position `pos` — the
+    /// first run whose end is strictly past `pos`. Equivalent to
+    /// `RunEndBuffer::get_physical_index`.
+    #[inline(always)]
+    pub(crate) fn run_of(self, pos: usize) -> usize {
+        match self {
+            Self::I16(ends) => ends.partition_point(|&end| (end as usize) <= pos),
+            Self::I32(ends) => ends.partition_point(|&end| (end as usize) <= pos),
+            Self::I64(ends) => ends.partition_point(|&end| (end as usize) <= pos),
+        }
+    }
+
+    /// Logical end (one past the last row) of physical run `run`.
+    #[inline(always)]
+    pub(crate) fn end_of(self, run: usize) -> usize {
+        match self {
+            Self::I16(ends) => ends[run] as usize,
+            Self::I32(ends) => ends[run] as usize,
+            Self::I64(ends) => ends[run] as usize,
+        }
+    }
+}
+
 /// One contiguous source run in a range-based value selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelectionRange {
@@ -164,6 +198,68 @@ impl<'a> RangesSelectionRef<'a> {
     }
 }
 
+/// Borrowed output-order groups of equal physical indices. `ends[i]` is the
+/// cumulative logical end of `indices[i]`, keeping repeated values O(groups).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupedSelectionRef<'a> {
+    indices: &'a [usize],
+    ends: &'a [usize],
+    offset: usize,
+    len: usize,
+}
+
+impl<'a> GroupedSelectionRef<'a> {
+    pub(crate) fn new(indices: &'a [usize], ends: &'a [usize]) -> Self {
+        debug_assert_eq!(indices.len(), ends.len());
+        debug_assert!(ends.first().is_none_or(|&end| end != 0));
+        debug_assert!(ends.windows(2).all(|ends| ends[0] < ends[1]));
+        debug_assert!(indices.windows(2).all(|indices| indices[0] != indices[1]));
+        Self {
+            indices,
+            ends,
+            offset: 0,
+            len: ends.last().copied().unwrap_or(0),
+        }
+    }
+
+    fn slice(self, offset: usize, len: usize) -> Self {
+        debug_assert!(offset <= self.len && len <= self.len - offset);
+        Self {
+            offset: self.offset + offset,
+            len,
+            ..self
+        }
+    }
+
+    #[inline(always)]
+    fn group(self, position: usize) -> usize {
+        self.ends.partition_point(|&end| end <= position)
+    }
+
+    #[inline(always)]
+    fn index_at(self, index: usize) -> usize {
+        debug_assert!(index < self.len);
+        self.indices[self.group(self.offset + index)]
+    }
+
+    #[inline]
+    fn try_for_each_group<E>(
+        self,
+        mut f: impl FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let end = self.offset + self.len;
+        let mut position = self.offset;
+        let mut group = self.group(position);
+        while position != end {
+            let group_end = self.ends[group].min(end);
+            f(self.indices[group], group_end - position)?;
+            position = group_end;
+            group += 1;
+        }
+        Ok(())
+    }
+}
+
 /// Borrowed view of a selected set of values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueSelectionRef<'a> {
@@ -176,6 +272,7 @@ pub(crate) enum ValueSelectionRef<'a> {
     /// first/last stored range after value-space slicing.
     Ranges(RangesSelectionRef<'a>),
     Sparse(&'a [usize]),
+    Grouped(GroupedSelectionRef<'a>),
 }
 
 impl<'a> ValueSelectionRef<'a> {
@@ -185,6 +282,7 @@ impl<'a> ValueSelectionRef<'a> {
             Self::Dense { len, .. } => len,
             Self::Ranges(ranges) => ranges.len,
             Self::Sparse(indices) => indices.len(),
+            Self::Grouped(grouped) => grouped.len,
         }
     }
 
@@ -210,6 +308,7 @@ impl<'a> ValueSelectionRef<'a> {
             }
             Self::Ranges(ranges) => Self::Ranges(ranges.slice(offset, len)),
             Self::Sparse(indices) => Self::Sparse(&indices[offset..offset + len]),
+            Self::Grouped(grouped) => Self::Grouped(grouped.slice(offset, len)),
         }
     }
 
@@ -221,6 +320,13 @@ impl<'a> ValueSelectionRef<'a> {
                 ValueSelectionCursor::Ranges(RangesSelectionCursor::new(ranges))
             }
             Self::Sparse(indices) => ValueSelectionCursor::Sparse(indices.iter()),
+            Self::Grouped(grouped) => ValueSelectionCursor::Grouped {
+                indices: grouped.indices,
+                ends: grouped.ends,
+                group: grouped.group(grouped.offset),
+                position: grouped.offset,
+                remaining: grouped.len,
+            },
         }
     }
 
@@ -232,6 +338,7 @@ impl<'a> ValueSelectionRef<'a> {
             Self::Dense { offset, .. } => offset + idx,
             Self::Ranges(ranges) => ranges.index_at(idx),
             Self::Sparse(indices) => indices[idx],
+            Self::Grouped(grouped) => grouped.index_at(idx),
         }
     }
 
@@ -260,6 +367,12 @@ impl<'a> ValueSelectionRef<'a> {
                 }
                 Ok(())
             }
+            Self::Grouped(grouped) => grouped.try_for_each_group(|index, count| {
+                for _ in 0..count {
+                    f(index)?;
+                }
+                Ok(())
+            }),
         }
     }
 }
@@ -272,6 +385,13 @@ pub(crate) enum ValueSelectionCursor<'a> {
     Dense(std::ops::Range<usize>),
     Ranges(RangesSelectionCursor<'a>),
     Sparse(slice::Iter<'a, usize>),
+    Grouped {
+        indices: &'a [usize],
+        ends: &'a [usize],
+        group: usize,
+        position: usize,
+        remaining: usize,
+    },
 }
 
 impl Iterator for ValueSelectionCursor<'_> {
@@ -284,6 +404,24 @@ impl Iterator for ValueSelectionCursor<'_> {
             Self::Dense(range) => range.next(),
             Self::Ranges(ranges) => ranges.next(),
             Self::Sparse(indices) => indices.next().copied(),
+            Self::Grouped {
+                indices,
+                ends,
+                group,
+                position,
+                remaining,
+            } => {
+                if *remaining == 0 {
+                    return None;
+                }
+                while *position == ends[*group] {
+                    *group += 1;
+                }
+                let value = indices[*group];
+                *position += 1;
+                *remaining -= 1;
+                Some(value)
+            }
         }
     }
 
@@ -300,6 +438,7 @@ impl ExactSizeIterator for ValueSelectionCursor<'_> {
             Self::Dense(range) => range.len(),
             Self::Ranges(ranges) => ranges.len(),
             Self::Sparse(indices) => indices.len(),
+            Self::Grouped { remaining, .. } => *remaining,
         }
     }
 }
@@ -402,9 +541,30 @@ impl<'a> DictionaryKeys<'a> {
         selection: ValueSelectionRef<'a>,
         mut f: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<(), E> {
+        self.try_for_each_group(selection, |index, count| {
+            for _ in 0..count {
+                f(index)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Visit selected dictionary run groups. Non-grouped selections emit one
+    /// group per value.
+    #[inline]
+    fn try_for_each_group<E>(
+        self,
+        selection: ValueSelectionRef<'a>,
+        mut f: impl FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
         macro_rules! visit {
             ($keys:expr) => {
-                selection.try_for_each(|row| f($keys[row].as_usize()))
+                match selection {
+                    ValueSelectionRef::Grouped(grouped) => {
+                        grouped.try_for_each_group(|row, count| f($keys[row].as_usize(), count))
+                    }
+                    _ => selection.try_for_each(|row| f($keys[row].as_usize(), 1)),
+                }
             };
         }
         match self {
@@ -464,14 +624,28 @@ fn contiguous_key_range<K: ArrowNativeType>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhysicalValueSpan {
     Range { start: usize, len: usize },
+    Repeat { index: usize, count: usize },
 }
 
 impl PhysicalValueSpan {
+    #[inline]
+    fn from_group(index: usize, count: usize) -> Self {
+        debug_assert_ne!(count, 0);
+        match count {
+            1 => Self::Range {
+                start: index,
+                len: 1,
+            },
+            _ => Self::Repeat { index, count },
+        }
+    }
+
     #[cfg(test)]
     #[inline]
     pub(crate) fn len(self) -> usize {
         match self {
             Self::Range { len, .. } => len,
+            Self::Repeat { count, .. } => count,
         }
     }
 }
@@ -520,6 +694,10 @@ impl<'a> PhysicalValueSelection<'a> {
         self.dictionary.is_none().then_some(self.selection)
     }
 
+    pub(crate) fn is_grouped(self) -> bool {
+        matches!(self.selection, ValueSelectionRef::Grouped(_))
+    }
+
     pub(crate) fn has_dictionary_mapping(self) -> bool {
         self.dictionary.is_some()
     }
@@ -534,6 +712,9 @@ impl<'a> PhysicalValueSelection<'a> {
     /// selection whose keys are consecutive. Grouped selections retain their
     /// explicit run boundaries and are never flattened here.
     pub(crate) fn direct_physical_range(self) -> Option<Range<usize>> {
+        if self.is_grouped() {
+            return None;
+        }
         match self.dictionary {
             None => match self.selection {
                 ValueSelectionRef::Dense { offset, len } => Some(offset..offset + len),
@@ -551,6 +732,9 @@ impl<'a> PhysicalValueSelection<'a> {
         self,
         mut f: impl FnMut(Range<usize>) -> Result<(), E>,
     ) -> Result<bool, E> {
+        if self.is_grouped() {
+            return Ok(false);
+        }
         match self.dictionary {
             Some(keys) => {
                 let Some(range) = keys.contiguous_range(self.selection) else {
@@ -565,7 +749,7 @@ impl<'a> PhysicalValueSelection<'a> {
                     ranges.try_for_each_range(|start, len| f(start..start + len))?
                 }
                 ValueSelectionRef::Sparse([index]) => f(*index..*index + 1)?,
-                ValueSelectionRef::Sparse(_) => return Ok(false),
+                ValueSelectionRef::Sparse(_) | ValueSelectionRef::Grouped(_) => return Ok(false),
             },
         }
         Ok(true)
@@ -593,12 +777,14 @@ impl<'a> PhysicalValueSelection<'a> {
                         len: 1,
                     })
                 }),
+                ValueSelectionRef::Grouped(grouped) => {
+                    grouped.try_for_each_group(|index, count| {
+                        f(PhysicalValueSpan::from_group(index, count))
+                    })
+                }
             },
-            Some(keys) => keys.try_for_each(self.selection, |index| {
-                f(PhysicalValueSpan::Range {
-                    start: index,
-                    len: 1,
-                })
+            Some(keys) => keys.try_for_each_group(self.selection, |index, count| {
+                f(PhysicalValueSpan::from_group(index, count))
             }),
         }
     }
@@ -613,6 +799,19 @@ impl<'a> PhysicalValueSelection<'a> {
             Some(keys) => keys.try_for_each(self.selection, f),
         }
     }
+
+    pub(crate) fn try_for_each_index_group<E>(
+        self,
+        mut f: impl FnMut(usize, usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self.dictionary {
+            Some(keys) => keys.try_for_each_group(self.selection, f),
+            None => match self.selection {
+                ValueSelectionRef::Grouped(grouped) => grouped.try_for_each_group(f),
+                selection => selection.try_for_each(|index| f(index, 1)),
+            },
+        }
+    }
 }
 
 impl ValueProducer<usize> for PhysicalValueSelection<'_> {
@@ -622,6 +821,10 @@ impl ValueProducer<usize> for PhysicalValueSelection<'_> {
 
     fn try_for_each<E>(self, f: impl FnMut(usize) -> Result<(), E>) -> Result<(), E> {
         self.try_for_each_index(f)
+    }
+
+    fn for_each_run_group<E>(self, f: impl FnMut(usize, usize) -> Result<(), E>) -> Result<(), E> {
+        self.try_for_each_index_group(f)
     }
 }
 
@@ -682,6 +885,25 @@ mod tests {
         assert_eq!(ranges, [(2, 5)]);
     }
 
+    #[test]
+    fn run_end_widths_resolve_identically() {
+        fn describe(run_ends: RunEnds<'_>) -> (Vec<usize>, Vec<usize>) {
+            (
+                (0..9).map(|position| run_ends.run_of(position)).collect(),
+                (0..3).map(|run| run_ends.end_of(run)).collect(),
+            )
+        }
+
+        let i16_ends = [2i16, 5, 9];
+        let i32_ends = [2i32, 5, 9];
+        let i64_ends = [2i64, 5, 9];
+        let expected = describe(RunEnds::I16(&i16_ends));
+        assert_eq!(describe(RunEnds::I32(&i32_ends)), expected);
+        assert_eq!(describe(RunEnds::I64(&i64_ends)), expected);
+        assert_eq!(expected.0, [0, 0, 1, 1, 1, 2, 2, 2, 2]);
+        assert_eq!(expected.1, [2, 5, 9]);
+    }
+
     fn physical_spans(selection: PhysicalValueSelection<'_>) -> Vec<PhysicalValueSpan> {
         let mut spans = Vec::new();
         selection
@@ -699,6 +921,9 @@ mod tests {
             match span {
                 PhysicalValueSpan::Range { start, len } => {
                     values.extend(start..start + len);
+                }
+                PhysicalValueSpan::Repeat { index, count } => {
+                    values.extend(std::iter::repeat_n(index, count));
                 }
             }
         }
@@ -720,6 +945,10 @@ mod tests {
         PhysicalValueSpan::Range { start, len }
     }
 
+    fn repeat(index: usize, count: usize) -> PhysicalValueSpan {
+        PhysicalValueSpan::Repeat { index, count }
+    }
+
     fn assert_physical_selection(selection: PhysicalValueSelection<'_>, expected: &[usize]) {
         let spans = physical_spans(selection);
         assert_eq!(
@@ -728,6 +957,21 @@ mod tests {
         );
         assert_eq!(expand_spans(&spans), expected);
         assert_eq!(physical_indices(selection), expected);
+
+        let mut grouped = Vec::new();
+        selection
+            .try_for_each_index_group(|index, count| -> Result<(), ()> {
+                grouped.push((index, count));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            grouped
+                .iter()
+                .flat_map(|&(index, count)| std::iter::repeat_n(index, count))
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -771,6 +1015,47 @@ mod tests {
         let sparse = PhysicalValueSelection::identity(ValueSelectionRef::Sparse(&sparse_values));
         assert_physical_selection(sparse, &sparse_values);
         assert_physical_selection(sparse.slice(1, 7), &sparse_values[1..8]);
+    }
+
+    #[test]
+    fn physical_grouped_identity_preserves_compact_repeats() {
+        let indices = [7, 2, 3];
+        let ends = [3, 4, 6];
+        let selection = ValueSelectionRef::Grouped(GroupedSelectionRef::new(&indices, &ends));
+        let grouped = PhysicalValueSelection::identity(selection);
+
+        assert_eq!(grouped.unmapped_selection(), Some(selection));
+        assert!(grouped.is_grouped());
+        assert_eq!(
+            physical_spans(grouped),
+            [repeat(7, 3), range(2, 1), repeat(3, 2),]
+        );
+        assert_eq!(
+            physical_spans(grouped.slice(1, 4)),
+            [repeat(7, 2), range(2, 1), range(3, 1)]
+        );
+
+        let expanded = [7, 7, 7, 2, 3, 3];
+        for offset in 0..=expanded.len() {
+            for len in 0..=expanded.len() - offset {
+                let sliced = selection.slice(offset, len);
+                let expected = &expanded[offset..offset + len];
+                assert_eq!(sliced.len(), len);
+                assert_eq!(sliced.cursor().collect::<Vec<_>>(), expected);
+                let mut visited = Vec::new();
+                sliced
+                    .try_for_each(|index| -> Result<(), ()> {
+                        visited.push(index);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(visited, expected);
+                assert_physical_selection(PhysicalValueSelection::identity(sliced), expected);
+                for (position, &expected) in expected.iter().enumerate() {
+                    assert_eq!(sliced.index_at(position), expected);
+                }
+            }
+        }
     }
 
     #[test]
@@ -827,6 +1112,7 @@ mod tests {
         );
         assert_eq!(selection.unmapped_selection(), None);
         assert!(selection.has_dictionary_mapping());
+        assert!(!selection.is_grouped());
         assert_physical_selection(selection, &[4, 5, 6, 6, 7]);
         let present = selection.slice(0, 4);
         assert_eq!(present.direct_physical_range(), None);
@@ -865,6 +1151,8 @@ mod tests {
 
     #[test]
     fn value_selection_cursor_matches_callback_traversal() {
+        let grouped_indices = [4, 1, 4, 9];
+        let grouped_ends = [2, 3, 6, 7];
         let stored_ranges = [SelectionRange::new(2..5, 3), SelectionRange::new(8..12, 7)];
         let ranges = RangesSelectionRef::new(&stored_ranges, 7);
         for selection in [
@@ -874,6 +1162,7 @@ mod tests {
             ValueSelectionRef::Ranges(ranges.slice(2, 4)),
             ValueSelectionRef::Ranges(ranges.slice(0, 0)),
             ValueSelectionRef::Sparse(&[4, 1, 4, 9]),
+            ValueSelectionRef::Grouped(GroupedSelectionRef::new(&grouped_indices, &grouped_ends)),
         ] {
             let mut expected = Vec::new();
             selection
