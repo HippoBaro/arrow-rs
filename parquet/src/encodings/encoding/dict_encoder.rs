@@ -257,6 +257,24 @@ impl<T: DataType> DictEncoder<T> {
         Ok(())
     }
 
+    /// Intern raw bytes. Typed storage invokes `make` only on a miss; byte-array
+    /// page storage appends the bytes directly.
+    #[inline(always)]
+    pub(crate) fn put_value_bytes(
+        &mut self,
+        bytes: &[u8],
+        make: impl FnOnce() -> T::T,
+    ) -> Result<()> {
+        self.indices
+            .push(self.dictionary.intern_bytes(bytes, make)?);
+        Ok(())
+    }
+
+    /// Reserve capacity for `additional` more dictionary indices.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.indices.reserve(additional);
+    }
+
     #[inline]
     fn bit_width(&self) -> u8 {
         num_required_bits(self.num_entries().saturating_sub(1) as u64)

@@ -19,6 +19,101 @@
 
 use super::*;
 
+/// Borrowed fixed-length byte-array values.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackedFixedLenByteArrayBatch<'a> {
+    pub(super) bytes: &'a [u8],
+    pub(super) type_length: usize,
+    pub(super) len: usize,
+}
+
+impl<'a> PackedFixedLenByteArrayBatch<'a> {
+    pub(crate) fn new(bytes: &'a [u8], type_length: usize, len: usize) -> Self {
+        assert_eq!(
+            bytes.len(),
+            type_length
+                .checked_mul(len)
+                .expect("fixed-length byte-array values length overflow")
+        );
+        Self {
+            bytes,
+            type_length,
+            len,
+        }
+    }
+
+    pub(crate) fn iter(self) -> impl ExactSizeIterator<Item = &'a [u8]> {
+        (0..self.len).map(move |idx| {
+            let start = idx * self.type_length;
+            &self.bytes[start..start + self.type_length]
+        })
+    }
+}
+
+/// Encoder extension for raw fixed-length byte-array values.
+#[doc(hidden)]
+pub(crate) trait FixedLenByteArrayEncoder: Encoder<FixedLenByteArrayType> {
+    fn put_fixed_len_byte_array_batch(
+        &mut self,
+        values: PackedFixedLenByteArrayBatch<'_>,
+    ) -> Result<()> {
+        for value in values.iter() {
+            let value = FixedLenByteArray::from(ByteArray::from(value.to_vec()));
+            self.put(std::slice::from_ref(&value))?;
+        }
+        Ok(())
+    }
+
+    /// Reserve room for `additional_bytes` of appended fixed-length values.
+    fn reserve_fixed_len(&mut self, _additional_bytes: usize) {}
+
+    /// Append one fixed-length value to the encoder.
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        self.put_fixed_len_byte_array_batch(PackedFixedLenByteArrayBatch::new(
+            value,
+            value.len(),
+            1,
+        ))
+    }
+}
+
+impl FixedLenByteArrayEncoder for FixedLenByteArrayEncodingFamily {
+    fn put_fixed_len_byte_array_batch(
+        &mut self,
+        values: PackedFixedLenByteArrayBatch<'_>,
+    ) -> Result<()> {
+        match self {
+            Self::Dictionary(_) => {
+                unreachable!("dictionary variant is not routed through the fallback encoder")
+            }
+            Self::Plain(e) => e.put_fixed_len_byte_array_batch(values),
+            Self::DeltaByteArray(e) => e.put_fixed_len_byte_array_batch(values),
+            Self::ByteStreamSplit(e) => e.put_fixed_len_byte_array_batch(values),
+        }
+    }
+
+    fn reserve_fixed_len(&mut self, additional_bytes: usize) {
+        match self {
+            Self::Dictionary(_) => {
+                unreachable!("dictionary variant is not routed through the fallback encoder")
+            }
+            Self::Plain(e) => e.reserve_fixed_len(additional_bytes),
+            Self::DeltaByteArray(e) => e.reserve_fixed_len(additional_bytes),
+            Self::ByteStreamSplit(e) => e.reserve_fixed_len(additional_bytes),
+        }
+    }
+
+    fn append_fixed_len_value(&mut self, value: &[u8]) -> Result<()> {
+        match self {
+            Self::Dictionary(_) => {
+                unreachable!("dictionary variant is not routed through the fallback encoder")
+            }
+            Self::Plain(e) => e.append_fixed_len_value(value),
+            Self::DeltaByteArray(e) => e.append_fixed_len_value(value),
+            Self::ByteStreamSplit(e) => e.append_fixed_len_value(value),
+        }
+    }
+}
 impl FixedLenByteArrayEncodingFamily {
     pub(super) fn from_encoding(encoding: Encoding, descr: &ColumnDescPtr) -> Result<Self> {
         match encoding {
@@ -29,5 +124,16 @@ impl FixedLenByteArrayEncodingFamily {
             )),
             e => Err(unsupported_column_encoding(e, Type::FIXED_LEN_BYTE_ARRAY)),
         }
+    }
+}
+
+impl FixedLenByteArrayEncoder for PlainEncoder<FixedLenByteArrayType> {
+    #[inline]
+    fn put_fixed_len_byte_array_batch(
+        &mut self,
+        values: PackedFixedLenByteArrayBatch<'_>,
+    ) -> Result<()> {
+        self.buffer.extend_from_slice(values.bytes);
+        Ok(())
     }
 }
