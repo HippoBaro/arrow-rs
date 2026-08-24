@@ -24,11 +24,12 @@ use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
 
 use crate::arrow::array_reader::byte_array::{ByteArrayDecoder, ByteArrayDecoderPlain};
+use crate::arrow::array_reader::fixed_len_byte_array::ValueDecoder as FixedByteArrayDecoder;
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
 use crate::arrow::buffer::{dictionary_buffer::DictionaryBuffer, offset_buffer::OffsetBuffer};
 use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
-use crate::basic::{ConvertedType, Encoding};
+use crate::basic::{ConvertedType, Encoding, Type};
 use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::encodings::rle::RleDecoder;
@@ -119,7 +120,7 @@ pub fn make_byte_array_dictionary_reader(
     }
 }
 
-/// An [`ArrayReader`] for dictionary encoded variable length byte arrays
+/// An [`ArrayReader`] for dictionary encoded byte arrays
 ///
 /// Will attempt to preserve any dictionary encoding present in the parquet data
 struct ByteArrayDictionaryReader<K: ArrowNativeType, V: OffsetSizeTrait> {
@@ -215,9 +216,10 @@ enum MaybeDictionaryDecoder {
         max_remaining_values: usize,
     },
     Fallback(ByteArrayDecoder),
+    Fixed(FixedByteArrayDecoder),
 }
 
-/// A [`ColumnValueDecoder`] for dictionary encoded variable length byte arrays
+/// A [`ColumnValueDecoder`] for dictionary encoded byte arrays
 struct DictionaryDecoder<K, V> {
     /// The current dictionary
     dict: Option<ArrayRef>,
@@ -228,6 +230,8 @@ struct DictionaryDecoder<K, V> {
     validate_utf8: bool,
 
     value_type: ArrowType,
+
+    fixed: Option<ColumnDescPtr>,
 
     phantom: PhantomData<(K, V)>,
 }
@@ -254,6 +258,7 @@ where
             decoder: None,
             validate_utf8,
             value_type,
+            fixed: (col.physical_type() == Type::FIXED_LEN_BYTE_ARRAY).then(|| col.clone()),
             phantom: Default::default(),
         }
     }
@@ -281,8 +286,18 @@ where
 
         let len = num_values as usize;
         let mut buffer = OffsetBuffer::<V>::with_capacity(0);
-        let mut decoder = ByteArrayDecoderPlain::new(buf, len, Some(len), self.validate_utf8);
-        decoder.read(&mut buffer, usize::MAX)?;
+        if let Some(desc) = &self.fixed {
+            let mut decoder = FixedByteArrayDecoder::new(desc);
+            decoder.set_data(Encoding::PLAIN, buf, len, Some(len))?;
+            if decoder.read_offsets(&mut buffer, len)? != len {
+                return Err(general_err!(
+                    "too few bytes in fixed-length dictionary page"
+                ));
+            }
+        } else {
+            ByteArrayDecoderPlain::new(buf, len, Some(len), self.validate_utf8)
+                .read(&mut buffer, usize::MAX)?;
+        }
 
         let array = buffer.into_array(None, self.value_type.clone());
         self.dict = Some(array);
@@ -306,6 +321,11 @@ where
                     max_remaining_values: num_values.unwrap_or(num_levels),
                 }
             }
+            _ if self.fixed.is_some() => {
+                let mut decoder = FixedByteArrayDecoder::new(self.fixed.as_ref().unwrap());
+                decoder.set_data(encoding, data, num_levels, num_values)?;
+                MaybeDictionaryDecoder::Fixed(decoder)
+            }
             _ => MaybeDictionaryDecoder::Fallback(ByteArrayDecoder::new(
                 encoding,
                 data,
@@ -323,6 +343,9 @@ where
         match self.decoder.as_mut().expect("decoder set") {
             MaybeDictionaryDecoder::Fallback(decoder) => {
                 decoder.read(out.spill_values()?, num_values, None)
+            }
+            MaybeDictionaryDecoder::Fixed(decoder) => {
+                decoder.read_offsets(out.spill_values()?, num_values)
             }
             MaybeDictionaryDecoder::Dict {
                 decoder,
@@ -382,6 +405,7 @@ where
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {
         match self.decoder.as_mut().expect("decoder set") {
             MaybeDictionaryDecoder::Fallback(decoder) => decoder.skip::<V>(num_values, None),
+            MaybeDictionaryDecoder::Fixed(decoder) => decoder.skip_values(num_values),
             MaybeDictionaryDecoder::Dict {
                 decoder,
                 max_remaining_values,
