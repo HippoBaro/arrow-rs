@@ -41,14 +41,19 @@
 //! \[1\] [parquet-format#nested-encoding](https://github.com/apache/parquet-format#nested-encoding)
 
 use crate::column::chunker::CdcChunk;
+use crate::column::value_selection::ValueSelectionRef;
 use crate::column::writer::LevelDataRef;
 use crate::errors::{ParquetError, Result};
+
+mod plan;
+
 use arrow_array::cast::AsArray;
 use arrow_array::types::RunEndIndexType;
 use arrow_array::{Array, ArrayRef, Int32Array, OffsetSizeTrait, RunArray, downcast_run_array};
 use arrow_buffer::bit_iterator::BitIndexIterator;
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
+pub(crate) use plan::LeafBatch;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -1177,6 +1182,17 @@ impl ArrayLevels {
 
     pub fn non_null_indices(&self) -> &[usize] {
         &self.non_null_indices
+    }
+
+    /// Present this batch to the column writer: the leaf array, its level
+    /// streams, and the selection of values those levels refer to.
+    pub(crate) fn leaf_batch(&self) -> LeafBatch<'_> {
+        LeafBatch::new(
+            self.array.as_ref(),
+            self.def_levels.as_ref(),
+            self.rep_levels.as_ref(),
+            ValueSelectionRef::Sparse(&self.non_null_indices),
+        )
     }
 
     /// Create a sliced view of this `ArrayLevels` for a CDC chunk.

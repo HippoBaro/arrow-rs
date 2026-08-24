@@ -39,6 +39,35 @@ pub(crate) trait ValueProducer<T: Copy>: Copy {
     fn try_for_each<E>(self, f: impl FnMut(T) -> Result<(), E>) -> Result<(), E>;
 }
 
+/// Projects a producer through a copyable mapping while preserving run groups.
+#[cfg(feature = "arrow")]
+#[derive(Clone, Copy)]
+pub(crate) struct MappedValueProducer<P, F> {
+    source: P,
+    map: F,
+}
+
+#[cfg(feature = "arrow")]
+pub(crate) fn map_values<P, F>(source: P, map: F) -> MappedValueProducer<P, F> {
+    MappedValueProducer { source, map }
+}
+
+#[cfg(feature = "arrow")]
+impl<T, P, F> ValueProducer<T> for MappedValueProducer<P, F>
+where
+    T: Copy,
+    P: ValueProducer<usize>,
+    F: Fn(usize) -> T + Copy,
+{
+    fn len(self) -> usize {
+        self.source.len()
+    }
+
+    fn try_for_each<E>(self, mut f: impl FnMut(T) -> Result<(), E>) -> Result<(), E> {
+        self.source.try_for_each(|index| f((self.map)(index)))
+    }
+}
+
 /// View the initialized prefix of a `MaybeUninit` slice as initialized values.
 ///
 /// # Safety
@@ -147,6 +176,20 @@ mod tests {
             .unwrap();
 
             assert_tiled_batches::<4, _>(&batches, &input);
+        }
+
+        #[cfg(feature = "arrow")]
+        {
+            let input = [1_usize, 2, 3];
+            let mapped = map_values(SliceProducer(&input), |value| (value * 2) as u32);
+            assert_eq!(mapped.len(), input.len());
+            let mut batches = Vec::new();
+            gather_tiled::<2, _, _, _>(mapped, |batch| {
+                batches.push(batch.to_vec());
+                Ok(())
+            })
+            .unwrap();
+            assert_tiled_batches::<2, _>(&batches, &[2, 4, 6]);
         }
 
         let error = gather_tiled::<2, _, _, _>(SliceProducer(&[1_u32, 2, 3]), |_| {
