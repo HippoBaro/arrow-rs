@@ -552,6 +552,24 @@ impl Sbbf {
         self.0[block_index].insert(hash as u32)
     }
 
+    /// Start a batched insertion run.
+    ///
+    /// Every insert touches one pseudo-random 32-byte block, so for any filter
+    /// larger than L2 each one is a cache miss. Those misses are independent
+    /// and the core can keep several in flight — but only if the block updates
+    /// are issued close together. A caller that interleaves other per-value
+    /// work between inserts serialises them instead and pays the full miss
+    /// latency every time. [`SbbfBatch`] buffers the hashes, which depend on
+    /// nothing but the value, and issues the block updates back to back.
+    #[inline]
+    pub(crate) fn batch(&mut self) -> SbbfBatch<'_> {
+        SbbfBatch {
+            sbbf: self,
+            buf: [0; SBBF_BATCH],
+            len: 0,
+        }
+    }
+
     /// Check if an [AsBytes] value is probably present or definitely absent in the filter
     pub fn check<T: AsBytes + ?Sized>(&self, value: &T) -> bool {
         self.check_hash(hash_as_bytes(value))
@@ -759,6 +777,51 @@ const SEED: u64 = 0;
 #[inline]
 fn hash_as_bytes<A: AsBytes + ?Sized>(value: &A) -> u64 {
     XxHash64::oneshot(SEED, value.as_bytes())
+}
+
+/// Number of hashes buffered before the block updates are issued.
+///
+/// Sized so the buffer stays in L1 while still giving the memory system enough
+/// independent misses to overlap. Measured: 64 beats 16 on every fixed-length
+/// bloom benchmark.
+const SBBF_BATCH: usize = 64;
+
+/// A batched insertion run over an [`Sbbf`]. See [`Sbbf::batch`].
+///
+/// Buffered hashes are flushed when the buffer fills and again on drop, so a
+/// batch cannot lose values.
+pub(crate) struct SbbfBatch<'a> {
+    sbbf: &'a mut Sbbf,
+    buf: [u64; SBBF_BATCH],
+    len: usize,
+}
+
+impl SbbfBatch<'_> {
+    /// Buffer one value. Hashing is pure computation, so it stays in the
+    /// caller's loop; only the memory-bound block update is deferred.
+    #[inline]
+    pub(crate) fn insert<T: AsBytes + ?Sized>(&mut self, value: &T) {
+        self.buf[self.len] = hash_as_bytes(value);
+        self.len += 1;
+        if self.len == SBBF_BATCH {
+            self.flush();
+        }
+    }
+
+    /// Issue the buffered block updates back to back.
+    #[inline(never)]
+    fn flush(&mut self) {
+        for &hash in &self.buf[..self.len] {
+            self.sbbf.insert_hash(hash);
+        }
+        self.len = 0;
+    }
+}
+
+impl Drop for SbbfBatch<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 #[cfg(test)]
