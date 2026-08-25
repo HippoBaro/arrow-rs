@@ -1096,7 +1096,7 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
             self.props.write_batch_size()
         }
         .min(MAX_DATA_PAGE_VALUE_COUNT as usize);
-        let chunker = ByteBudgetChunker::new(&self.descr, &self.props, base_batch_size);
+        let chunker = ByteBudgetChunker::new(&self.descr, &self.props);
         while levels_offset < num_levels {
             let page_remaining =
                 (MAX_DATA_PAGE_VALUE_COUNT - self.page_metrics.num_buffered_values) as usize;
@@ -1446,17 +1446,14 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
         Ok(())
     }
 
-    // For float columns, always provide Some(n), even if n is 0
-    // For non-float columns, always provide None
-    fn get_nan_count<T: ParquetValueType>(&self) -> Option<i64> {
+    /// Returns `Some(n)` for floating-point pages (including zero) and `None`
+    /// for all other physical/logical types.
+    fn get_nan_count(&self) -> Option<i64> {
         let nan_count = || {
-            let nan_count = self.page_metrics.num_page_nans.unwrap_or(0);
-            match i64::try_from(nan_count) {
-                Ok(count) => Some(count),
-                _ => Some(i64::MAX),
-            }
+            let count = self.page_metrics.num_page_nans.unwrap_or(0);
+            Some(i64::try_from(count).unwrap_or(i64::MAX))
         };
-        match T::PHYSICAL_TYPE {
+        match E::Value::PHYSICAL_TYPE {
             Type::FLOAT | Type::DOUBLE => nan_count(),
             Type::FIXED_LEN_BYTE_ARRAY
                 if matches!(self.descr.logical_type_ref(), Some(LogicalType::Float16)) =>
@@ -1484,7 +1481,7 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
                 vec![],
                 vec![],
                 self.page_metrics.num_page_nulls as i64,
-                self.get_nan_count::<E::Value>(),
+                self.get_nan_count(),
             );
         } else if self.column_index_builder.valid() {
             // from page statistics
@@ -1498,42 +1495,38 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
                     let new_min = stat.min_opt().unwrap();
                     let new_max = stat.max_opt().unwrap();
                     if let Some((last_min, last_max)) = &self.last_non_null_data_page_min_max {
-                        let descr = self.descr.as_ref();
-                        if self.data_page_boundary_ascending {
-                            // If last min/max are greater than new min/max then not ascending anymore
-                            let not_ascending = compare_greater(descr, last_min, new_min)
-                                || compare_greater(descr, last_max, new_max);
-                            if not_ascending {
-                                self.data_page_boundary_ascending = false;
-                            }
-                        }
-
-                        if self.data_page_boundary_descending {
-                            // If new min/max are greater than last min/max then not descending anymore
-                            let not_descending = compare_greater(descr, new_min, last_min)
-                                || compare_greater(descr, new_max, last_max);
-                            if not_descending {
-                                self.data_page_boundary_descending = false;
-                            }
+                        let singleton = ByteMinMaxOrder::from_descr(&self.descr)
+                            == ByteMinMaxOrder::Unsigned
+                            && std::ptr::eq(last_min.as_bytes(), last_max.as_bytes())
+                            && std::ptr::eq(new_min.as_bytes(), new_max.as_bytes());
+                        if singleton {
+                            // A one-value page needs only one unsigned comparison.
+                            let order = last_min.as_bytes().cmp(new_min.as_bytes());
+                            self.data_page_boundary_ascending &= order != Ordering::Greater;
+                            self.data_page_boundary_descending &= order != Ordering::Less;
+                        } else {
+                            self.data_page_boundary_ascending = self.data_page_boundary_ascending
+                                && !compare_greater(&self.descr, last_min, new_min)
+                                && !compare_greater(&self.descr, last_max, new_max);
+                            self.data_page_boundary_descending = self.data_page_boundary_descending
+                                && !compare_greater(&self.descr, new_min, last_min)
+                                && !compare_greater(&self.descr, new_max, last_max);
                         }
                     }
                     self.last_non_null_data_page_min_max = Some((new_min.clone(), new_max.clone()));
 
                     if self.can_truncate_value() {
+                        let ((min, _), (max, _)) = self.truncate_min_max(
+                            self.props.column_index_truncate_length(),
+                            stat.min_bytes_opt().unwrap(),
+                            stat.max_bytes_opt().unwrap(),
+                        );
                         self.column_index_builder.append(
                             null_page,
-                            self.truncate_min_value(
-                                self.props.column_index_truncate_length(),
-                                stat.min_bytes_opt().unwrap(),
-                            )
-                            .0,
-                            self.truncate_max_value(
-                                self.props.column_index_truncate_length(),
-                                stat.max_bytes_opt().unwrap(),
-                            )
-                            .0,
+                            min,
+                            max,
                             self.page_metrics.num_page_nulls as i64,
-                            self.get_nan_count::<E::Value>(),
+                            self.get_nan_count(),
                         );
                     } else {
                         self.column_index_builder.append(
@@ -1541,7 +1534,7 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
                             stat.min_bytes_opt().unwrap().to_vec(),
                             stat.max_bytes_opt().unwrap().to_vec(),
                             self.page_metrics.num_page_nulls as i64,
-                            self.get_nan_count::<E::Value>(),
+                            self.get_nan_count(),
                         );
                     }
                 }
@@ -1587,63 +1580,39 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
             || self.get_descriptor().converted_type() == ConvertedType::UTF8
     }
 
-    /// Truncates a binary statistic to at most `truncation_length` bytes.
-    ///
-    /// If truncation is not possible, returns `data`.
-    ///
-    /// The `bool` in the returned tuple indicates whether truncation occurred or not.
-    ///
-    /// UTF-8 Note:
-    /// If the column type indicates UTF-8, and `data` contains valid UTF-8, then the result will
-    /// also remain valid UTF-8, but may be less tnan `truncation_length` bytes to avoid splitting
-    /// on non-character boundaries.
-    fn truncate_min_value(&self, truncation_length: Option<usize>, data: &[u8]) -> (Vec<u8>, bool) {
-        truncation_length
-            .filter(|l| data.len() > *l)
-            .and_then(|l|
-                // don't do extra work if this column isn't UTF-8
-                if self.is_utf8() {
-                    match str::from_utf8(data) {
-                        Ok(str_data) => truncate_utf8(str_data, l),
-                        Err(_) => Some(data[..l].to_vec()),
-                    }
-                } else {
-                    Some(data[..l].to_vec())
-                }
-            )
-            .map(|truncated| (truncated, true))
-            .unwrap_or_else(|| (data.to_vec(), false))
-    }
-
-    /// Truncates a binary statistic to at most `truncation_length` bytes, and then increment the
-    /// final byte(s) to yield a valid upper bound. This may result in a result of less than
-    /// `truncation_length` bytes if the last byte(s) overflows.
-    ///
-    /// If truncation is not possible, returns `data`.
-    ///
-    /// The `bool` in the returned tuple indicates whether truncation occurred or not.
-    ///
-    /// UTF-8 Note:
-    /// If the column type indicates UTF-8, and `data` contains valid UTF-8, then the result will
-    /// also remain valid UTF-8 (but again may be less than `truncation_length` bytes). If `data`
-    /// does not contain valid UTF-8, then truncation will occur as if the column is non-string
-    /// binary.
-    fn truncate_max_value(&self, truncation_length: Option<usize>, data: &[u8]) -> (Vec<u8>, bool) {
-        truncation_length
-            .filter(|l| data.len() > *l)
-            .and_then(|l|
-                // don't do extra work if this column isn't UTF-8
-                if self.is_utf8() {
-                    match str::from_utf8(data) {
-                        Ok(str_data) => truncate_and_increment_utf8(str_data, l),
-                        Err(_) => increment(data[..l].to_vec()),
-                    }
-                } else {
-                    increment(data[..l].to_vec())
-                }
-            )
-            .map(|truncated| (truncated, true))
-            .unwrap_or_else(|| (data.to_vec(), false))
+    /// Truncate min/max statistics, preserving valid UTF-8 boundaries.
+    /// The booleans indicate whether each bound was truncated.
+    fn truncate_min_max(
+        &self,
+        truncation_length: Option<usize>,
+        min: &[u8],
+        max: &[u8],
+    ) -> ((Vec<u8>, bool), (Vec<u8>, bool)) {
+        let is_utf8 = self.is_utf8();
+        let min_utf8 = (is_utf8 && truncation_length.is_some_and(|length| min.len() > length))
+            .then(|| str::from_utf8(min));
+        let max_utf8 = if std::ptr::eq(min, max) {
+            min_utf8
+        } else {
+            (is_utf8 && truncation_length.is_some_and(|length| max.len() > length))
+                .then(|| str::from_utf8(max))
+        };
+        let truncate = |data: &[u8], utf8: Option<Result<&str, _>>, upper| {
+            truncation_length
+                .filter(|length| data.len() > *length)
+                .and_then(|length| match (utf8.and_then(|value| value.ok()), upper) {
+                    (Some(value), false) => truncate_utf8(value, length),
+                    (Some(value), true) => truncate_and_increment_utf8(value, length),
+                    (None, false) => Some(data[..length].to_vec()),
+                    (None, true) => increment(data[..length].to_vec()),
+                })
+                .map(|truncated| (truncated, true))
+                .unwrap_or_else(|| (data.to_vec(), false))
+        };
+        (
+            truncate(min, min_utf8, false),
+            truncate(max, max_utf8, true),
+        )
     }
 
     /// Truncate the min and max values that will be written to a data page
@@ -1652,12 +1621,9 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
         let backwards_compatible_min_max = self.descr.sort_order().is_signed();
         match statistics {
             Statistics::ByteArray(stats) if stats._internal_has_min_max_set() => {
-                let (min, did_truncate_min) = self.truncate_min_value(
+                let ((min, did_truncate_min), (max, did_truncate_max)) = self.truncate_min_max(
                     self.props.statistics_truncate_length(),
                     stats.min_bytes_opt().unwrap(),
-                );
-                let (max, did_truncate_max) = self.truncate_max_value(
-                    self.props.statistics_truncate_length(),
                     stats.max_bytes_opt().unwrap(),
                 );
                 Statistics::ByteArray(
@@ -1675,12 +1641,9 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
             Statistics::FixedLenByteArray(stats)
                 if (stats._internal_has_min_max_set() && self.can_truncate_value()) =>
             {
-                let (min, did_truncate_min) = self.truncate_min_value(
+                let ((min, did_truncate_min), (max, did_truncate_max)) = self.truncate_min_max(
                     self.props.statistics_truncate_length(),
                     stats.min_bytes_opt().unwrap(),
-                );
-                let (max, did_truncate_max) = self.truncate_max_value(
-                    self.props.statistics_truncate_length(),
                     stats.max_bytes_opt().unwrap(),
                 );
                 Statistics::FixedLenByteArray(
@@ -3813,7 +3776,7 @@ mod tests {
             );
             assert_eq!(stats.nan_count_opt(), Some(6));
         } else {
-            panic!("Expected double statistics");
+            panic!("Expected float statistics");
         }
     }
 
@@ -3870,7 +3833,7 @@ mod tests {
             );
             assert_eq!(stats.nan_count_opt(), Some(6));
         } else {
-            panic!("Expected float statistics");
+            panic!("Expected double statistics");
         }
     }
 

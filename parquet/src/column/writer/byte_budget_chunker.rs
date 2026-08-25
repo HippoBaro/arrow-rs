@@ -48,23 +48,11 @@ pub(crate) struct ByteBudgetChunker {
     physical_value_byte_upper_bound: Option<PhysicalValueByteUpperBound>,
     /// Configured dictionary page byte limit for the column.
     dict_page_byte_limit: usize,
-    /// `true` when no chunk of `base_batch_size` values can ever overflow
-    /// `page_byte_limit` regardless of input. Set once at column open from
-    /// the physical type's known per-value byte size; lets the per-chunk
-    /// decision short-circuit with no work for every numeric, bool, or
-    /// narrow `FIXED_LEN_BYTE_ARRAY` column.
-    static_always_fits: bool,
-    /// As [`Self::static_always_fits`] but for the dictionary page.
-    static_dict_always_fits: bool,
 }
 
 impl ByteBudgetChunker {
     #[inline]
-    pub(crate) fn new(
-        descr: &ColumnDescriptor,
-        props: &WriterProperties,
-        base_batch_size: usize,
-    ) -> Self {
+    pub(crate) fn new(descr: &ColumnDescriptor, props: &WriterProperties) -> Self {
         let page_byte_limit = props.column_data_page_size_limit(descr.path());
         let dict_page_byte_limit = props.column_dictionary_page_size_limit(descr.path());
         let physical_bound = |bytes_per_value: usize, include_boundary_value| {
@@ -81,18 +69,11 @@ impl ByteBudgetChunker {
             Type::FIXED_LEN_BYTE_ARRAY => physical_bound(descr.type_length().max(0) as usize, true),
             Type::BYTE_ARRAY => None,
         };
-        let static_fits = |limit: usize| {
-            physical_value_byte_upper_bound
-                .map(|bound| bound.bytes_per_value.saturating_mul(base_batch_size) <= limit)
-                .unwrap_or(false)
-        };
         Self {
             page_byte_limit,
             max_def_level: descr.max_def_level(),
             physical_value_byte_upper_bound,
             dict_page_byte_limit,
-            static_always_fits: static_fits(page_byte_limit),
-            static_dict_always_fits: static_fits(dict_page_byte_limit),
         }
     }
 
@@ -128,9 +109,6 @@ impl ByteBudgetChunker {
             return chunk.len;
         }
         let (budget, target) = if encoder.has_dictionary() {
-            if self.static_dict_always_fits {
-                return chunk.len;
-            }
             // Bound the mini-batch by the dictionary page's *remaining*
             // budget (it accumulates across mini-batches until it spills).
             match encoder.estimated_dict_page_size() {
@@ -141,9 +119,6 @@ impl ByteBudgetChunker {
                 None => return chunk.len,
             }
         } else {
-            if self.static_always_fits {
-                return chunk.len;
-            }
             (self.page_byte_limit, ByteBudgetTarget::DataPage)
         };
         // A fixed-width upper bound avoids scanning nullable definition levels
