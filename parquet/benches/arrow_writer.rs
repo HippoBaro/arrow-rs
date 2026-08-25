@@ -423,8 +423,7 @@ fn create_string_dictionary_bench_batch(
 
 /// Run-end-encoded column whose run VALUES are a low-cardinality
 /// `Dictionary<Int32, Utf8>` (run length 8 -> ~size/8 runs, 16 distinct dict
-/// entries). Exercises the REE-of-dictionary path: native adoption vs the dense
-/// `take` expansion it replaced.
+/// entries). Exercises the REE-of-dictionary path at physical-run granularity.
 fn create_ree_of_dict_bench_batch(size: usize) -> RecordBatch {
     let run_len = 8usize;
     let num_runs = size / run_len;
@@ -443,9 +442,8 @@ fn create_ree_of_dict_bench_batch(size: usize) -> RecordBatch {
 }
 
 /// `RunArray<Int32, Dictionary<Int32, Int64>>` — a run-end column whose values
-/// are a *sized* numeric dictionary. Exercises the shallow-decode path (O(runs)
-/// dictionary decode onto the native flat numeric leaf) versus the O(rows) dense
-/// expand it replaces.
+/// are a *sized* numeric dictionary. Exercises shallow dictionary decoding at
+/// run granularity.
 fn create_ree_of_numeric_dict_bench_batch(size: usize) -> RecordBatch {
     let run_len = 8usize;
     let num_runs = size / run_len;
@@ -465,8 +463,8 @@ fn create_ree_of_numeric_dict_bench_batch(size: usize) -> RecordBatch {
 
 /// `RunArray<Int32, Struct<{tag: Dictionary<Int32,Utf8>, val: Int64}>>` — a
 /// run-encoded record with a rep-free dictionary field. Exercises the fan-out
-/// shallow-decode path (decode the dictionary child at run granularity + shred
-/// a flat leaf) versus the O(rows) dense expand it replaces.
+/// shallow-decode path: decode the dictionary child at run granularity and
+/// shred a flat leaf.
 fn create_ree_struct_of_dict_bench_batch(size: usize) -> RecordBatch {
     let run_len = 8usize;
     let num_runs = size / run_len;
@@ -964,8 +962,6 @@ fn create_nested_list_bench_batch(size: usize, null_density: f32) -> Result<Reco
 
 fn create_list_struct_with_list_batch(size: usize, null_density: f32) -> Result<RecordBatch> {
     // List<Struct<a:Int32, b:Float32, c:List<Int32>>>
-    // The struct child contains a nested list, so child_has_no_nested_rep() = false.
-    // This exercises the per-slot (non-batched) write path in level computation.
     let fields = vec![Field::new(
         "_1",
         DataType::List(Arc::new(Field::new_list_field(
@@ -1079,7 +1075,7 @@ fn write_batch_with_option(
 }
 
 /// High-null byte-array columns (Utf8 / LargeUtf8 / Utf8View / BinaryView).
-/// Isolates sparse/nullable byte-array writes through `write_byte_values`.
+/// Isolates sparse/nullable byte-array writes through `write_byte_array_source`.
 fn create_byte_array_sparse_bench_batch(size: usize, null_density: f32) -> Result<RecordBatch> {
     let fields = vec![
         Field::new("_1", DataType::Utf8, true),

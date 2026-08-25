@@ -28,7 +28,7 @@ use std::vec::IntoIter;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchWriter, new_empty_array};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchWriter, RunArray, new_empty_array};
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field, FieldRef, IntervalUnit, SchemaRef, TimeUnit,
 };
@@ -40,10 +40,12 @@ use crate::arrow::arrow_writer::byte_array::ByteArrayStorage;
 use crate::basic::PageType;
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
-use crate::column::value_batch::{BatchSink, map_values};
-use crate::column::value_selection::{DictionaryKeys, PhysicalValueSelection, ValueSelectionRef};
-use crate::column::writer::encoder::ColumnChunkEncoder;
+use crate::column::value_batch::{BatchSink, RunBatch, gather_run_groups_tiled, map_values};
+use crate::column::value_selection::{
+    DictionaryKeys, PhysicalValueSelection, RunEnds, ValueSelectionRef,
+};
 use crate::column::writer::encoder::{
+    ColumnChunkEncoder, FIXED_LEN_BYTE_ARRAY_BATCH_VALUES, FIXED_LEN_BYTE_ARRAY_MAX_WIDTH,
     FixedLenByteArrayBatch, FixedLenByteArrayBatchPacker, FixedLenByteArraySink,
     FixedLenByteArraySource, PhysicalNumericSource, TypedColumnChunkEncoder,
 };
@@ -64,8 +66,8 @@ use crate::file::properties::{WriterProperties, WriterPropertiesPtr};
 use crate::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use crate::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use crate::schema::types::{ColumnDescPtr, SchemaDescriptor};
+use levels::LeafBatch;
 use levels::cursor::LevelTree;
-use levels::{ArrayLevels, LeafBatch, calculate_array_levels};
 
 mod boolean;
 mod byte_array;
@@ -146,6 +148,8 @@ pub use crate::column::page_store::{
 ///
 /// The writer supports writing all Arrow [`DataType`]s that have a direct mapping to
 /// Parquet types including  [`StructArray`] and [`ListArray`].
+/// `RunEndEncoded` (REE) arrays are supported when their value type has a Parquet
+/// representation.
 ///
 /// The following are not supported:
 ///
@@ -167,8 +171,8 @@ pub use crate::column::page_store::{
 /// * String, LargeString, StringView
 /// * Binary, LargeBinary, BinaryView
 ///
-/// The writer can will also accept both native and dictionary encoded arrays if the dictionaries
-/// contain compatible values.
+/// The writer will also accept native, dictionary encoded, and `RunEndEncoded` (REE) arrays if
+/// they contain compatible values.
 /// ```
 /// # use std::sync::Arc;
 /// # use arrow_array::{DictionaryArray, LargeStringArray, RecordBatch, StringArray, UInt8Array};
@@ -412,14 +416,9 @@ impl<W: Write + Send> ArrowWriter<W> {
                 return self.write(batch);
             }
 
-            if let Some(avg_row_bytes) = current_bytes
-                .checked_div(in_progress.buffered_rows)
-                .filter(|avg_row_bytes| *avg_row_bytes > 0)
-            {
+            let avg_row_bytes = current_bytes / in_progress.buffered_rows;
+            if let Some(rows_that_fit) = (max_bytes - current_bytes).checked_div(avg_row_bytes) {
                 // At this point, `current_bytes < max_bytes` (checked above)
-                let remaining_bytes = max_bytes - current_bytes;
-                let rows_that_fit = remaining_bytes.checked_div(avg_row_bytes).unwrap_or(0);
-
                 if batch.num_rows() > rows_that_fit {
                     if rows_that_fit > 0 {
                         let a = batch.slice(0, rows_that_fit);
@@ -611,7 +610,6 @@ impl ArrowWriterOptions {
     ///
     /// impl PageStore for TempFilePageStore {
     ///     fn put(&mut self, value: Bytes) -> Result<PageKey> {
-    ///         // Append to the end of the file
     ///         self.file.seek(SeekFrom::Start(self.end))?;
     ///         self.file.write_all(&value)?;
     ///         let key = PageKey::new(self.locs.len() as u64);
@@ -639,7 +637,7 @@ impl ArrowWriterOptions {
     ///         // type, path), so a real backend might choose to spill only large columns.
     ///         let _ = (args.column_index(), args.column_descriptor());
     ///         Ok(Box::new(TempFilePageStore {
-    ///             file: tempfile::tempfile()?, // temp file is cleaned on drop
+    ///             file: tempfile::tempfile()?,
     ///             end: 0,
     ///             locs: Vec::new(),
     ///         }))
@@ -713,18 +711,11 @@ struct ArrowColumnChunkData {
     keys: Vec<PageKey>,
     /// Handles to the dictionary page's blobs (header then data) in the store.
     ///
-    /// A dictionary page is produced at most once and bounded by
-    /// `dict_page_size_limit`, but it must be written *first* in the chunk even
-    /// though the data pages reach the writer before it (see
-    /// [`PageWriter::defers_dictionary_ordering`]). Its header and data are `put`
-    /// into the store like any other page — which keeps the store uniform, and
-    /// lets an oversized dictionary page spill — and their handles are held apart
-    /// so they can be emitted ahead of the data pages at splice.
-    /// Empty for non-dictionary columns.
+    /// A dictionary page must be written first even though data pages reach the
+    /// writer before it. Keeping its handles separate lets the splice reorder it
+    /// while allowing an oversized dictionary page to spill like any other page.
     dictionary_keys: Vec<PageKey>,
-    /// Serialized length of the dictionary page (0 if there is none), recorded
-    /// so the data pages can be shifted past it when offsets are rewritten to a
-    /// dictionary-first layout at splice.
+    /// Serialized dictionary-page length, used when rewriting data-page offsets.
     dictionary_len: usize,
 }
 
@@ -747,9 +738,7 @@ impl ArrowColumnChunkData {
         Ok(())
     }
 
-    /// Store a dictionary-page blob (header or data) in the page store,
-    /// recording its handle (emitted first at splice) and accumulating its
-    /// serialized length.
+    /// Store a dictionary-page blob and record its handle for first-at-splice ordering.
     fn push_dictionary(&mut self, value: Bytes) -> Result<()> {
         self.dictionary_len += value.len();
         let key = self.store.put(value)?;
@@ -757,32 +746,21 @@ impl ArrowColumnChunkData {
         Ok(())
     }
 
-    /// Bytes this chunk currently holds on the heap: whatever the store keeps
-    /// resident (zero for a spilling backend).
+    /// Bytes this chunk currently holds on the heap.
     fn memory_size(&self) -> usize {
         self.store.memory_size()
     }
 }
 
-/// A streaming iterator over one column chunk's buffered page blobs, in final
-/// file order: the dictionary page (if any) first, then the data pages.
-///
-/// Each blob is taken back out of the [`PageStore`] *as it is
-/// consumed* and released immediately afterwards, so splicing a chunk into the
-/// output file never materializes more than a single page in memory at a time.
-/// This is what keeps the splice phase within the memory bound for a spilling
-/// backend (an in-memory store already holds the bytes, so it is unaffected).
+/// A streaming iterator over a chunk's blobs in final file order.
 struct StreamingColumnChunkPages {
     store: Box<dyn PageStore>,
-    /// Page handles in final file order: the dictionary page first (if any),
-    /// then the data pages.
+    /// Dictionary-page handles first, followed by data-page handles.
     keys: IntoIter<PageKey>,
 }
 
 impl StreamingColumnChunkPages {
     fn new(data: ArrowColumnChunkData) -> Self {
-        // The dictionary page must be emitted first, ahead of the data pages,
-        // even though it was the last page produced.
         let keys = if data.dictionary_keys.is_empty() {
             data.keys
         } else {
@@ -840,8 +818,6 @@ impl ArrowPageWriter {
         self.page_encryptor.as_mut()
     }
 
-    // Mirrors the signature of the encryption-enabled version above, so that the
-    // callers do not need a `cfg` of their own.
     #[cfg(not(feature = "encryption"))]
     #[expect(
         clippy::needless_pass_by_ref_mut,
@@ -894,8 +870,7 @@ impl PageWriter for ArrowPageWriter {
 
         buf.length += compressed_size;
         if spec.page_type == PageType::DICTIONARY_PAGE {
-            // Recorded apart from the data pages so it is emitted first at
-            // splice — see `ArrowColumnChunkData::dictionary_keys`.
+            // Recorded apart from data pages so it is emitted first at splice.
             buf.push_dictionary(header)?;
             buf.push_dictionary(data)?;
         } else {
@@ -925,16 +900,12 @@ impl PageWriter for ArrowPageWriter {
     }
 }
 
-/// How one leaf's levels are produced.
-#[derive(Debug)]
-enum ArrowLeafPlan {
-    Cursor { tree: Arc<LevelTree>, leaf: u32 },
-    Legacy(ArrayLevels),
-}
-
 /// A leaf column that can be encoded by [`ArrowColumnWriter`]
 #[derive(Debug)]
-pub struct ArrowLeafColumn(ArrowLeafPlan);
+pub struct ArrowLeafColumn {
+    tree: Arc<LevelTree>,
+    leaf: u32,
+}
 
 const CURSOR_TARGET_SLOTS: usize = 1024;
 
@@ -945,35 +916,7 @@ impl ArrowLeafColumn {
         cursor_row_limit: usize,
         emit: impl for<'a> FnMut(LeafBatch<'a>) -> Result<()>,
     ) -> Result<()> {
-        match &self.0 {
-            ArrowLeafPlan::Cursor { tree, leaf } => {
-                write_leaf_window(tree, *leaf, cursor_row_limit, emit)
-            }
-            ArrowLeafPlan::Legacy(levels) => {
-                let mut emit = emit;
-                emit(levels.leaf_batch())
-            }
-        }
-    }
-}
-
-/// Whether a shape still needs the materializing level builder.
-fn needs_legacy_levels(data_type: &ArrowDataType) -> bool {
-    match data_type {
-        ArrowDataType::RunEndEncoded(..) => true,
-        ArrowDataType::Dictionary(_, value) => {
-            !levels::is_leaf(value) || needs_legacy_levels(value)
-        }
-        ArrowDataType::List(field)
-        | ArrowDataType::LargeList(field)
-        | ArrowDataType::ListView(field)
-        | ArrowDataType::LargeListView(field)
-        | ArrowDataType::FixedSizeList(field, _)
-        | ArrowDataType::Map(field, _) => needs_legacy_levels(field.data_type()),
-        ArrowDataType::Struct(fields) => fields
-            .iter()
-            .any(|field| needs_legacy_levels(field.data_type())),
-        _ => false,
+        write_leaf_window(&self.tree, self.leaf, cursor_row_limit, emit)
     }
 }
 
@@ -993,6 +936,10 @@ fn write_leaf_window(
 }
 
 /// Write every leaf of `tree`, sharing structural walks where useful.
+///
+/// Each planned window shares list-row or nullable-ancestor work. Leaves with
+/// no work to amortize, and leaves behind indexed barriers, keep their own
+/// cursors.
 fn write_tree(tree: &LevelTree, writers: &mut [ArrowColumnWriter]) -> Result<()> {
     let Some(first) = writers.first() else {
         return Ok(());
@@ -1095,53 +1042,6 @@ fn write_tree_with_framers(
     Ok(())
 }
 
-fn shared_cursor_tree(leaves: &[ArrowLeafColumn]) -> Option<&LevelTree> {
-    let ArrowLeafPlan::Cursor {
-        tree,
-        leaf: first_leaf,
-    } = &leaves.first()?.0
-    else {
-        return None;
-    };
-    if *first_leaf != 0
-        || !leaves.iter().enumerate().all(|(index, column)| {
-            matches!(
-                &column.0,
-                ArrowLeafPlan::Cursor {
-                    tree: other,
-                    leaf,
-                } if *leaf == index as u32 && Arc::ptr_eq(tree, other)
-            )
-        })
-    {
-        return None;
-    }
-    Some(tree)
-}
-
-fn write_direct_group_batches(
-    leaves: &[ArrowLeafColumn],
-    writers: &mut [ArrowColumnWriter],
-) -> Result<bool> {
-    let Some(tree) = shared_cursor_tree(leaves) else {
-        return Ok(false);
-    };
-    write_tree(tree, writers)?;
-    Ok(true)
-}
-
-fn write_direct_group_batches_with_framers(
-    leaves: &[ArrowLeafColumn],
-    writers: &mut [ArrowColumnWriter],
-    framers: &mut [CdcFramer],
-) -> Result<bool> {
-    let Some(tree) = shared_cursor_tree(leaves) else {
-        return Ok(false);
-    };
-    write_tree_with_framers(tree, writers, framers)?;
-    Ok(true)
-}
-
 /// Computes the [`ArrowLeafColumn`] for a potentially nested [`ArrayRef`]
 ///
 /// This function can be used to encode individual columns in parallel.
@@ -1149,19 +1049,11 @@ fn write_direct_group_batches_with_framers(
 /// Structural compatibility is checked here. A logical null reachable at a
 /// non-nullable `field` returns an error when the leaf is written.
 pub fn compute_leaves(field: &Field, array: &ArrayRef) -> Result<Vec<ArrowLeafColumn>> {
-    if needs_legacy_levels(array.data_type()) {
-        return Ok(calculate_array_levels(array, field)?
-            .into_iter()
-            .map(|levels| ArrowLeafColumn(ArrowLeafPlan::Legacy(levels)))
-            .collect());
-    }
     let tree = Arc::new(LevelTree::build(field, array)?);
     Ok((0..tree.leaf_count() as u32)
-        .map(|leaf| {
-            ArrowLeafColumn(ArrowLeafPlan::Cursor {
-                tree: Arc::clone(&tree),
-                leaf,
-            })
+        .map(|leaf| ArrowLeafColumn {
+            tree: Arc::clone(&tree),
+            leaf,
         })
         .collect())
 }
@@ -1339,16 +1231,6 @@ impl ArrowColumnWriter {
         })
     }
 
-    /// Write through a content-defined framer, inserting page flushes at its
-    /// stream boundaries.
-    fn write_with_framer(&mut self, col: &ArrowLeafColumn, framer: &mut CdcFramer) -> Result<()> {
-        self.writer.start_arrow_source();
-        let cursor_row_limit = self.cursor_row_limit;
-        col.try_for_each_batch(cursor_row_limit, |batch| {
-            self.write_cdc_batch(batch, framer)
-        })
-    }
-
     fn write_cdc_batch(&mut self, batch: LeafBatch<'_>, framer: &mut CdcFramer) -> Result<()> {
         let spans = framer.split_arrow_batch(
             batch.def_level_data(),
@@ -1505,15 +1387,9 @@ impl ArrowRowGroupWriter {
         self.buffered_rows += batch.num_rows();
 
         for (column_idx, field) in self.schema_plan.fields.iter().enumerate() {
-            let leaves = compute_leaves(field.field.as_ref(), batch.column(column_idx))?;
-            self.validate_leaf_count(field, leaves.len())?;
-            let writers = &mut self.writers[field.leaf_range.clone()];
-            if write_direct_group_batches(&leaves, writers)? {
-                continue;
-            }
-            for (offset, leaf) in leaves.iter().enumerate() {
-                writers[offset].write(leaf)?;
-            }
+            let tree = LevelTree::build(field.field.as_ref(), batch.column(column_idx))?;
+            self.validate_leaf_count(field, tree.leaf_count())?;
+            write_tree(&tree, &mut self.writers[field.leaf_range.clone()])?;
         }
         Ok(())
     }
@@ -1523,16 +1399,13 @@ impl ArrowRowGroupWriter {
         self.buffered_rows += batch.num_rows();
 
         for (column_idx, field) in self.schema_plan.fields.iter().enumerate() {
-            let leaves = compute_leaves(field.field.as_ref(), batch.column(column_idx))?;
-            self.validate_leaf_count(field, leaves.len())?;
-            let writers = &mut self.writers[field.leaf_range.clone()];
-            let field_framers = &mut framers[field.leaf_range.clone()];
-            if write_direct_group_batches_with_framers(&leaves, writers, field_framers)? {
-                continue;
-            }
-            for (offset, leaf) in leaves.iter().enumerate() {
-                writers[offset].write_with_framer(leaf, &mut field_framers[offset])?;
-            }
+            let tree = LevelTree::build(field.field.as_ref(), batch.column(column_idx))?;
+            self.validate_leaf_count(field, tree.leaf_count())?;
+            write_tree_with_framers(
+                &tree,
+                &mut self.writers[field.leaf_range.clone()],
+                &mut framers[field.leaf_range.clone()],
+            )?;
         }
         Ok(())
     }
@@ -1949,6 +1822,54 @@ macro_rules! dispatch_leaf_writer {
     };
 }
 
+fn dispatch_physical_input<'a>(
+    column: &'a dyn arrow_array::Array,
+    selection: ValueSelectionRef<'a>,
+) -> (&'a dyn arrow_array::Array, PhysicalValueSelection<'a>) {
+    if let Some(dictionary) = column.as_any_dictionary_opt() {
+        let keys = dictionary_keys(dictionary.keys());
+        (
+            dictionary.values().as_ref(),
+            PhysicalValueSelection::dictionary(selection, keys),
+        )
+    } else {
+        (column, PhysicalValueSelection::identity(selection))
+    }
+}
+
+/// Extract the borrowed run boundaries, slice offset, and run-values child of a
+/// run-end-encoded array, type-erased over the run-end index width. The single
+/// source of truth for the `RunArray<Int16/32/64>` downcast used by the bounded
+/// recursive leaf cursor.
+pub(crate) fn run_ends_of(
+    array: &dyn arrow_array::Array,
+) -> Result<(RunEnds<'_>, usize, &ArrayRef)> {
+    let ArrowDataType::RunEndEncoded(run_ends_field, _) = array.data_type() else {
+        unreachable!("run_ends_of requires a run-end-encoded array");
+    };
+    macro_rules! extract {
+        ($ty:ty, $variant:ident) => {{
+            let run = array.as_any().downcast_ref::<RunArray<$ty>>().unwrap();
+            let ends = run.run_ends();
+            (
+                RunEnds::$variant(ends.values()),
+                ends.offset(),
+                run.values(),
+            )
+        }};
+    }
+    Ok(match run_ends_field.data_type() {
+        ArrowDataType::Int16 => extract!(Int16Type, I16),
+        ArrowDataType::Int32 => extract!(Int32Type, I32),
+        ArrowDataType::Int64 => extract!(Int64Type, I64),
+        d => {
+            return Err(ParquetError::NYI(format!(
+                "Unsupported run-end index type {d}"
+            )));
+        }
+    })
+}
+
 fn dictionary_keys(keys: &dyn arrow_array::Array) -> DictionaryKeys<'_> {
     macro_rules! extract {
         ($ty:ty, $variant:ident) => {
@@ -1968,21 +1889,7 @@ fn dictionary_keys(keys: &dyn arrow_array::Array) -> DictionaryKeys<'_> {
     }
 }
 
-fn dispatch_physical_input<'a>(
-    column: &'a dyn arrow_array::Array,
-    selection: ValueSelectionRef<'a>,
-) -> (&'a dyn arrow_array::Array, PhysicalValueSelection<'a>) {
-    if let Some(dictionary) = column.as_any_dictionary_opt() {
-        let keys = dictionary_keys(dictionary.keys());
-        (
-            dictionary.values().as_ref(),
-            PhysicalValueSelection::dictionary(selection, keys),
-        )
-    } else {
-        (column, PhysicalValueSelection::identity(selection))
-    }
-}
-
+#[inline]
 fn primitive_values<T: ArrowPrimitiveType>(column: &dyn arrow_array::Array) -> &[T::Native] {
     column.as_primitive::<T>().values().as_ref()
 }
@@ -2164,6 +2071,109 @@ mod tests {
     }
 
     #[test]
+    fn cached_schema_plan_preserves_compatible_physical_layout_alternation() {
+        let writer_schema = Arc::new(Schema::new(vec![
+            Field::new("number", ArrowDataType::Int32, false),
+            Field::new("text", ArrowDataType::Utf8, false),
+            Field::new("bytes", ArrowDataType::Binary, false),
+        ]));
+
+        let dense = RecordBatch::try_new(
+            Arc::clone(&writer_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(BinaryArray::from_iter_values([b"a".as_slice()])),
+            ],
+        )
+        .unwrap();
+
+        let number_dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0]),
+            Arc::new(Int32Array::from(vec![2])),
+        )
+        .unwrap();
+        let text_dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0]),
+            Arc::new(StringArray::from(vec!["b"])),
+        )
+        .unwrap();
+        let bytes_dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0]),
+            Arc::new(BinaryArray::from_iter_values([b"b".as_slice()])),
+        )
+        .unwrap();
+        let dictionary = RecordBatch::try_from_iter(vec![
+            ("number", Arc::new(number_dictionary) as ArrayRef),
+            ("text", Arc::new(text_dictionary) as ArrayRef),
+            ("bytes", Arc::new(bytes_dictionary) as ArrayRef),
+        ])
+        .unwrap();
+
+        let run_ends = Int32Array::from(vec![1]);
+        let number_ree: ArrayRef =
+            Arc::new(Int32RunArray::try_new(&run_ends, &Int32Array::from(vec![3])).unwrap());
+        let text_ree: ArrayRef =
+            Arc::new(Int32RunArray::try_new(&run_ends, &StringArray::from(vec!["c"])).unwrap());
+        let bytes_ree: ArrayRef = Arc::new(
+            Int32RunArray::try_new(&run_ends, &BinaryArray::from_iter_values([b"c".as_slice()]))
+                .unwrap(),
+        );
+        let ree = RecordBatch::try_from_iter(vec![
+            ("number", number_ree),
+            ("text", text_ree),
+            ("bytes", bytes_ree),
+        ])
+        .unwrap();
+
+        let alternate = RecordBatch::try_from_iter(vec![
+            ("number", Arc::new(Int32Array::from(vec![4])) as ArrayRef),
+            (
+                "text",
+                Arc::new(LargeStringArray::from(vec!["d"])) as ArrayRef,
+            ),
+            (
+                "bytes",
+                Arc::new(BinaryViewArray::from_iter_values([b"d".as_slice()])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1))
+            .build();
+        let mut out = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut out, Arc::clone(&writer_schema), Some(props)).unwrap();
+        for batch in [&dense, &dictionary, &ree, &alternate] {
+            writer.write(batch).unwrap();
+        }
+        writer.close().unwrap();
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(out)).unwrap();
+        assert_eq!(builder.metadata().num_row_groups(), 4);
+        let mut reader = builder.build().unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        assert_eq!(
+            actual.column(0).as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![1, 2, 3, 4])
+        );
+        assert_eq!(
+            actual.column(1).as_string::<i32>(),
+            &StringArray::from(vec!["a", "b", "c", "d"])
+        );
+        assert_eq!(
+            actual.column(2).as_binary::<i32>(),
+            &BinaryArray::from_iter_values([
+                b"a".as_slice(),
+                b"b".as_slice(),
+                b"c".as_slice(),
+                b"d".as_slice(),
+            ])
+        );
+    }
+
+    #[test]
     fn cached_schema_plan_does_not_retain_batch_arrays() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "a",
@@ -2182,62 +2192,6 @@ mod tests {
             "schema and row-group caches must not retain input ArrayRefs"
         );
         writer.close().unwrap();
-    }
-
-    #[test]
-    fn bound_physical_sources_slice_the_selection_without_retaining_arrays() {
-        let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
-        let keys = Int32Array::from(vec![2, 0, 1, 2]);
-        let dictionary: ArrayRef =
-            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values.clone()).unwrap());
-        let value_refs = Arc::strong_count(&values);
-        let dictionary_refs = Arc::strong_count(&dictionary);
-
-        {
-            let binding = ArrowPhysicalBinding::<Int32Storage<'_>>::bind(
-                dictionary.as_ref(),
-                ValueSelectionRef::Dense { offset: 0, len: 4 },
-            )
-            .unwrap();
-            let source = binding.source();
-            assert_eq!(Arc::strong_count(&values), value_refs);
-            assert_eq!(Arc::strong_count(&dictionary), dictionary_refs);
-            assert_eq!(source.len(), 4);
-            assert!(matches!(binding.storage, Int32Storage::Identity(_)));
-
-            let sliced = source.slice(1, 2);
-            let mut physical = Vec::new();
-            sliced
-                .selection()
-                .try_for_each_index(|index| -> Result<()> {
-                    physical.push(index);
-                    Ok(())
-                })
-                .unwrap();
-            assert_eq!(physical, [0, 1]);
-        }
-        assert_eq!(Arc::strong_count(&values), value_refs);
-        assert_eq!(Arc::strong_count(&dictionary), dictionary_refs);
-
-        let byte_values: ArrayRef = Arc::new(StringArray::from(vec!["a", "bb", "ccc"]));
-        let byte_keys = Int32Array::from(vec![2, 0, 1, 2]);
-        let byte_dictionary: ArrayRef = Arc::new(
-            DictionaryArray::<Int32Type>::try_new(byte_keys, byte_values.clone()).unwrap(),
-        );
-        let byte_value_refs = Arc::strong_count(&byte_values);
-        let byte_dictionary_refs = Arc::strong_count(&byte_dictionary);
-
-        {
-            let _binding = ArrowPhysicalBinding::<ByteArrayStorage<'_>>::bind(
-                byte_dictionary.as_ref(),
-                ValueSelectionRef::Dense { offset: 0, len: 4 },
-            )
-            .unwrap();
-            assert_eq!(Arc::strong_count(&byte_values), byte_value_refs);
-            assert_eq!(Arc::strong_count(&byte_dictionary), byte_dictionary_refs);
-        }
-        assert_eq!(Arc::strong_count(&byte_values), byte_value_refs);
-        assert_eq!(Arc::strong_count(&byte_dictionary), byte_dictionary_refs);
     }
 
     #[test]
@@ -2301,6 +2255,1764 @@ mod tests {
             roundtrip_opts(&batch, props);
         }
         roundtrip(batch, None);
+    }
+
+    /// Repeated REE values round-trip using `RLE_DICTIONARY` encoding.
+    #[test]
+    fn ree_uses_rle_dictionary() {
+        let run_ends = Int32Array::from(vec![3, 5, 8, 10]);
+        let values = Int32Array::from(vec![7, 7, 9, 7]); // 7 recurs across runs
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            ree.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ree]).unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(file)).unwrap();
+        let encodings: Vec<Encoding> = builder
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .encodings()
+            .collect();
+        assert!(
+            encodings.contains(&Encoding::RLE_DICTIONARY),
+            "run-end column should encode as RLE_DICTIONARY, got {encodings:?}"
+        );
+        let mut reader = builder.build().unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        assert_eq!(
+            actual.column(0).as_primitive::<Int32Type>().values(),
+            &[7, 7, 7, 7, 7, 9, 9, 9, 7, 7]
+        );
+    }
+
+    /// An REE writer field can be required while its value field is nullable.
+    /// Dense batches written to that schema still need definition levels because
+    /// the Parquet leaf is optional.
+    #[test]
+    fn ree_required_schema_writes_dense_int32_batch() {
+        let run_ends = Int32Array::from(vec![1]);
+        let values = Int32Array::from(vec![7]);
+        let ree = Int32RunArray::try_new(&run_ends, &values).unwrap();
+        let writer_schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            ree.data_type().clone(),
+            false,
+        )]));
+
+        let dense_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, false)]));
+        let dense_batch =
+            RecordBatch::try_new(dense_schema, vec![Arc::new(Int32Array::from(vec![3, 4]))])
+                .unwrap();
+
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, writer_schema, None).unwrap();
+        writer.write(&dense_batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        assert_eq!(
+            actual.column(0).as_primitive::<Int32Type>().values(),
+            &[3, 4]
+        );
+    }
+
+    /// REE null runs can be written through a dense nullable schema, but must be
+    /// rejected for a dense required schema because the target Parquet leaf has
+    /// no definition level to represent them.
+    #[test]
+    fn ree_nulls_respect_dense_schema_nullability() {
+        let run_ends = Int32Array::from(vec![2, 4, 5]);
+        let values = Int32Array::from(vec![Some(1), None, Some(2)]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+        let ree_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "c",
+                ree.data_type().clone(),
+                true,
+            )])),
+            vec![ree.clone()],
+        )
+        .unwrap();
+
+        let nullable_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, true)]));
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, nullable_schema, None).unwrap();
+        writer.write(&ree_batch).unwrap();
+        writer.close().unwrap();
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        assert_eq!(
+            actual.column(0).as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(1), Some(1), None, None, Some(2)])
+        );
+
+        let required_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, false)]));
+        let mut writer = ArrowWriter::try_new(Vec::new(), required_schema, None).unwrap();
+        let err = writer.write(&ree_batch).unwrap_err();
+        assert!(
+            err.to_string().contains("required field") && err.to_string().contains("Found null"),
+            "{err}"
+        );
+    }
+
+    /// String and binary REE values round-trip using `RLE_DICTIONARY` encoding.
+    #[test]
+    fn ree_byte_values() {
+        fn ree_roundtrip(run_ends: Int32Array, values: ArrayRef) -> (ArrayRef, Vec<Encoding>) {
+            let ree: ArrayRef =
+                Arc::new(Int32RunArray::try_new(&run_ends, values.as_ref()).unwrap());
+            assert_ree_roundtrip_matches_dense(ree.clone(), None);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "c",
+                ree.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![ree]).unwrap();
+            let mut file = vec![];
+            let mut writer = ArrowWriter::try_new(&mut file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(file)).unwrap();
+            let encodings: Vec<Encoding> = builder
+                .metadata()
+                .row_group(0)
+                .column(0)
+                .encodings()
+                .collect();
+            let mut reader = builder.build().unwrap();
+            (reader.next().unwrap().unwrap().column(0).clone(), encodings)
+        }
+
+        // Utf8 (i32 offsets) with a null run. Parquet stores byte values as a
+        // flat BYTE_ARRAY; the run-end value type is recorded in the (flattened)
+        // Arrow schema hint, so each layout round-trips back as itself.
+        let (got, encodings) = ree_roundtrip(
+            Int32Array::from(vec![3, 5, 8]),
+            Arc::new(StringArray::from(vec![Some("aa"), None, Some("cc")])),
+        );
+        assert!(
+            encodings.contains(&Encoding::RLE_DICTIONARY),
+            "byte run-end column should encode as RLE_DICTIONARY, got {encodings:?}"
+        );
+        assert_eq!(
+            got.as_string::<i32>(),
+            &StringArray::from(vec![
+                Some("aa"),
+                Some("aa"),
+                Some("aa"),
+                None,
+                None,
+                Some("cc"),
+                Some("cc"),
+                Some("cc"),
+            ])
+        );
+
+        // LargeUtf8 (i64-offset run values): the flattened Arrow schema hint
+        // preserves the value type, so it round-trips back as LargeUtf8.
+        let (got, _) = ree_roundtrip(
+            Int32Array::from(vec![2, 3]),
+            Arc::new(LargeStringArray::from(vec!["pp", "qq"])),
+        );
+        assert_eq!(
+            got.as_string::<i64>(),
+            &LargeStringArray::from(vec!["pp", "pp", "qq"])
+        );
+
+        // Utf8View run values, one value recurring across runs (deduplicated in
+        // the dictionary); round-trips back as Utf8View.
+        let (got, _) = ree_roundtrip(
+            Int32Array::from(vec![2, 4, 6]),
+            Arc::new(StringViewArray::from(vec!["x", "y", "x"])),
+        );
+        assert_eq!(
+            got.as_string_view(),
+            &StringViewArray::from(vec!["x", "x", "y", "y", "x", "x"])
+        );
+
+        // Binary run values exercise the binary (non-string) accessor.
+        let (got, _) = ree_roundtrip(
+            Int32Array::from(vec![2, 3]),
+            Arc::new(BinaryArray::from_iter_values([
+                b"a".as_ref(),
+                b"bb".as_ref(),
+            ])),
+        );
+        assert_eq!(
+            got.as_binary::<i32>(),
+            &BinaryArray::from_iter_values([b"a".as_ref(), b"a".as_ref(), b"bb".as_ref()])
+        );
+
+        let (got, _) = ree_roundtrip(
+            Int32Array::from(vec![3]),
+            Arc::new(StringArray::from(vec!["x"])),
+        );
+        assert_eq!(got.as_string::<i32>(), &StringArray::from(vec!["x"; 3]));
+    }
+
+    /// Dictionary schemas accept REE batches for variable and fixed-size bytes.
+    #[test]
+    fn ree_byte_batches_match_dictionary_schema() {
+        fn check(values: ArrayRef) {
+            let writer_schema = Arc::new(Schema::new(vec![Field::new(
+                "c",
+                DataType::Dictionary(
+                    Box::new(DataType::Int8),
+                    Box::new(values.data_type().clone()),
+                ),
+                false,
+            )]));
+            let ree: ArrayRef = Arc::new(
+                Int32RunArray::try_new(&Int32Array::from(vec![2, 4]), values.as_ref()).unwrap(),
+            );
+            let batch = RecordBatch::try_from_iter(vec![("c", ree)]).unwrap();
+            let mut file = Vec::new();
+            let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            let expected: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::new(
+                Int8Array::from(vec![0, 0, 1, 1]),
+                values,
+            ));
+            let expected = RecordBatch::try_new(writer_schema, vec![expected]).unwrap();
+            let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+            assert_eq!(reader.next().unwrap().unwrap(), expected);
+            assert!(reader.next().is_none());
+        }
+
+        check(Arc::new(StringArray::from(vec!["a", "b"])));
+        check(Arc::new(
+            FixedSizeBinaryArray::try_from_iter([vec![1, 2], vec![3, 4]].into_iter()).unwrap(),
+        ));
+    }
+
+    /// REE and dense inputs round-trip equivalently with CDC enabled across
+    /// nullability, slicing, value families, and every supported run-end width.
+    #[test]
+    fn ree_cdc_matrix() {
+        let props = WriterProperties::builder()
+            .set_write_batch_size(64)
+            .set_content_defined_chunking(Some(CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 256,
+                norm_level: 0,
+            }))
+            .build();
+
+        let run_ends = Int32Array::from_iter_values((1..=300usize).map(|r| (r * 64) as i32));
+        let non_null = Int32Array::from_iter_values((0..300).map(|r| r * 7 % 40));
+        let nullable = Int32Array::from_iter((0..300).map(|r| (r % 6 != 0).then_some(r * 7 % 40)));
+        let strings = StringArray::from_iter(
+            (0..300).map(|r| (r % 5 != 4).then(|| format!("run-{}", r % 23))),
+        );
+
+        let ree_non_null: ArrayRef =
+            Arc::new(Int32RunArray::try_new(&run_ends, &non_null).unwrap());
+        let ree_nullable: ArrayRef =
+            Arc::new(Int32RunArray::try_new(&run_ends, &nullable).unwrap());
+        let ree_strings: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &strings).unwrap());
+
+        let nullable_field = Field::new("c", ree_nullable.data_type().clone(), true);
+        let ree_plan = compute_leaves(&nullable_field, &ree_nullable).unwrap();
+        assert_eq!(ree_plan.len(), 1);
+
+        assert_ree_matches_dense(ree_non_null, Some(props.clone()));
+        assert_ree_matches_dense(ree_nullable.clone(), Some(props.clone()));
+        assert_ree_matches_dense(ree_nullable.slice(7, 941), Some(props.clone()));
+        assert_ree_matches_dense(ree_strings, Some(props.clone()));
+
+        // Also cover a longer, uneven run pattern under the same CDC settings.
+        let num_runs = 500usize;
+        let run_len = 5usize;
+        let run_ends = Int32Array::from_iter_values((1..=num_runs).map(|r| (r * run_len) as i32));
+        let values = Int64Array::from_iter(
+            (0..num_runs).map(|r| (r % 9 != 0).then_some((r * 31 % 100) as i64)),
+        );
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+        assert_ree_roundtrip_matches_dense(ree, Some(props));
+
+        let cursor_props = WriterProperties::builder()
+            .set_write_batch_size(2)
+            .set_content_defined_chunking(Some(CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 256,
+                norm_level: 0,
+            }))
+            .build();
+
+        let i16_ends = Int16Array::from(vec![64, 128, 192]);
+        let i16_values = Int32Array::from(vec![Some(10), None, Some(30)]);
+        let i16_full: ArrayRef = Arc::new(Int16RunArray::try_new(&i16_ends, &i16_values).unwrap());
+        let i16 = i16_full.slice(1, 190);
+
+        let i32_ends = Int32Array::from(vec![64, 128, 192]);
+        let i32_values = Int32Array::new(vec![1, 2, 3].into(), Some(NullBuffer::new_valid(3)));
+        let i32: ArrayRef = Arc::new(Int32RunArray::try_new(&i32_ends, &i32_values).unwrap());
+
+        let i64_ends = Int64Array::from(vec![64, 128]);
+        let i64_values = Int32Array::from(vec![None, None]);
+        let i64: ArrayRef = Arc::new(Int64RunArray::try_new(&i64_ends, &i64_values).unwrap());
+
+        for ree in [i16, i32, i64] {
+            assert_ree_matches_dense(ree, Some(cursor_props.clone()));
+        }
+    }
+
+    #[test]
+    fn ree_under_list_view_cdc_matches_reordered_dense_child() {
+        // ListView selections are allowed to move backwards through their
+        // child. REE resolution follows each selection independently so
+        // backwards jumps hash the selected content.
+        let num_runs = 300usize;
+        let run_len = 4usize;
+        let run_ends =
+            Int32Array::from_iter_values((1..=num_runs).map(|run| (run * run_len) as i32));
+        let run_values = Int32Array::from_iter_values((0..num_runs).map(|run| (run % 17) as i32));
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &run_values).unwrap());
+        let dense = ree_dense_equivalent(&ree);
+
+        let offsets: Vec<i32> = (0..num_runs)
+            .map(|row| {
+                let run = if row % 2 == 0 {
+                    num_runs - 1 - row / 2
+                } else {
+                    row / 2
+                };
+                (run * run_len) as i32
+            })
+            .collect();
+        let sizes = vec![run_len as i32; num_runs];
+        let make_view = |values: ArrayRef| -> ArrayRef {
+            let field = Arc::new(Field::new_list_field(values.data_type().clone(), true));
+            Arc::new(ListViewArray::new(
+                field,
+                offsets.clone().into(),
+                sizes.clone().into(),
+                values,
+                None,
+            ))
+        };
+        let ree_view = make_view(ree);
+        let dense = make_view(dense);
+
+        let props = WriterProperties::builder()
+            .set_write_batch_size(64)
+            .set_content_defined_chunking(Some(CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 256,
+                norm_level: 0,
+            }))
+            .build();
+        let ree_field = Field::new("c", ree_view.data_type().clone(), false);
+        let dense_field = Field::new("c", dense.data_type().clone(), false);
+        assert_eq!(
+            write_column_without_arrow_metadata_as(ree_field, ree_view, Some(props.clone())),
+            write_column_without_arrow_metadata_as(dense_field, dense, Some(props)),
+        );
+    }
+
+    #[test]
+    fn ree_under_struct_with_content_defined_chunking() {
+        let num_runs = 300usize;
+        let run_len = 3usize;
+        let run_ends = Int32Array::from_iter_values((1..=num_runs).map(|r| (r * run_len) as i32));
+        let values =
+            Int32Array::from_iter((0..num_runs).map(|r| (r % 6 != 0).then_some((r % 4) as i32)));
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+
+        let fields = Fields::from(vec![Field::new("r", ree.data_type().clone(), true)]);
+        let struct_array: ArrayRef = Arc::new(StructArray::new(fields.clone(), vec![ree], None));
+
+        let props = WriterProperties::builder()
+            .set_write_batch_size(64)
+            .set_content_defined_chunking(Some(CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 256,
+                norm_level: 0,
+            }))
+            .build();
+        let actual = roundtrip_column(
+            Field::new("s", DataType::Struct(fields), true),
+            struct_array,
+            Some(props),
+        );
+        let actual: Vec<Option<i32>> = actual
+            .as_struct()
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .iter()
+            .collect();
+        let expected: Vec<Option<i32>> = (0..num_runs * run_len)
+            .map(|i| {
+                let r = i / run_len;
+                (!r.is_multiple_of(6)).then_some((r % 4) as i32)
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    fn data_pages_for_column(
+        column: ArrayRef,
+        props: WriterProperties,
+    ) -> Vec<(usize, u32, Encoding)> {
+        let rows = column.len();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            column.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let mut metadata = ParquetMetaDataReader::new();
+        metadata.try_parse(&data).unwrap();
+        let metadata = metadata.finish().unwrap();
+        let col_meta = metadata.row_group(0).column(0);
+        let mut page_reader =
+            SerializedPageReader::new(Arc::new(data), col_meta, rows, None).unwrap();
+        let mut pages = Vec::new();
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            if page.is_data_page() {
+                pages.push((page.buffer().len(), page.num_values(), page.encoding()));
+            }
+        }
+        pages
+    }
+
+    /// Int16 and Int64 run-end arrays round-trip for numeric and byte values.
+    #[test]
+    fn ree_index_widths() {
+        // Int16 run-ends, numeric values with a null run.
+        let ree: ArrayRef = Arc::new(
+            Int16RunArray::try_new(
+                &Int16Array::from(vec![2, 5]),
+                &Int32Array::from(vec![Some(1), None]),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            roundtrip_array(ree, None).as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(1), Some(1), None, None, None])
+        );
+
+        // Int64 run ends with string values.
+        let ree: ArrayRef = Arc::new(
+            Int64RunArray::try_new(
+                &Int64Array::from(vec![3, 4]),
+                &StringArray::from(vec!["aa", "bb"]),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            roundtrip_array(ree, None).as_string::<i32>(),
+            &StringArray::from(vec!["aa", "aa", "aa", "bb"])
+        );
+    }
+
+    /// REE under a nullable parent produces a sparse value selection. A monotonic
+    /// sparse selection with gaps must not be treated as one contiguous run span;
+    /// the skipped parent-null row must not shift selected run values.
+    #[test]
+    fn ree_nullable_parent_sparse_gap() {
+        let run_ends = Int32Array::from(vec![1, 2, 3]);
+        let values = Int32Array::from(vec![7, 8, 9]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+
+        let fields = Fields::from(vec![Field::new("r", ree.data_type().clone(), true)]);
+        let struct_array: ArrayRef = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![ree],
+            Some(NullBuffer::from(vec![true, false, true])),
+        ));
+        let actual = roundtrip_column(
+            Field::new("s", DataType::Struct(fields), true),
+            struct_array,
+            None,
+        );
+        let inner = actual.as_struct().column(0);
+        assert_eq!(
+            inner.as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(7), None, Some(9)])
+        );
+    }
+
+    /// Dense logical equivalent of a run-end-encoded array, produced with
+    /// `take` for comparison in the tests below.
+    fn ree_dense_equivalent(ree: &ArrayRef) -> ArrayRef {
+        let (run_ends, base, values) = run_ends_of(ree.as_ref()).unwrap();
+        let indices: UInt64Array = (0..ree.len())
+            .map(|i| run_ends.run_of(base + i) as u64)
+            .collect();
+        arrow_select::take::take(values, &indices, None).unwrap()
+    }
+
+    /// Write a single column and read every row back as one array.
+    fn roundtrip_column(field: Field, col: ArrayRef, props: Option<WriterProperties>) -> ArrayRef {
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, schema, props).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        read_column(file)
+    }
+
+    /// Write a batch whose dense physical schema is logically compatible with
+    /// a wrapper-bearing writer schema.
+    fn roundtrip_compatible_column(field: Field, col: ArrayRef) -> ArrayRef {
+        let writer_schema = Arc::new(Schema::new(vec![field]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            col.data_type().clone(),
+            col.logical_null_count() != 0,
+        )]));
+        let batch = RecordBatch::try_new(batch_schema, vec![col]).unwrap();
+        let options = ArrowWriterOptions::new().with_skip_arrow_metadata(true);
+        let mut file = vec![];
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut file, writer_schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        read_column(file)
+    }
+
+    #[test]
+    fn arrow_writer_dense_batches_under_nested_wrapper_schemas() {
+        let run_ends = || Arc::new(Field::new("run_ends", DataType::Int32, false));
+        let ree = |value: DataType, nullable| {
+            DataType::RunEndEncoded(run_ends(), Arc::new(Field::new("values", value, nullable)))
+        };
+        let assert_unified = |field: Field, actual: ArrayRef, expected: &ArrayRef| {
+            assert!(!compute_leaves(&field, &actual).unwrap().is_empty());
+            assert_eq!(
+                roundtrip_compatible_column(field, actual).as_ref(),
+                expected.as_ref()
+            );
+        };
+
+        let item = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let list: ArrayRef = Arc::new(ListArray::new(
+            item.clone(),
+            OffsetBuffer::new(vec![0_i32, 2, 3].into()),
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+            None,
+        ));
+
+        // A dense list under an REE<List> schema uses range traversal; the
+        // schema wrapper is physical, not a second logical list node.
+        let ree_list_field = Field::new("c", ree(list.data_type().clone(), false), false);
+        assert_unified(ree_list_field, list.clone(), &list);
+
+        // Dictionary<List> has the same dense logical shape and follows the
+        // same list traversal after schema normalization.
+        let dictionary_list = Field::new(
+            "c",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(list.data_type().clone())),
+            false,
+        );
+        assert_unified(dictionary_list, list.clone(), &list);
+
+        let dense: ArrayRef = Arc::new(Int32Array::from(vec![Some(7), None, Some(9)]));
+        let nested_ree = Field::new("c", ree(ree(DataType::Int32, true), false), false);
+        assert_unified(nested_ree, dense.clone(), &dense);
+
+        let dictionary_ree = Field::new(
+            "c",
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(ree(DataType::Int32, true)),
+            ),
+            false,
+        );
+        assert_unified(dictionary_ree, dense.clone(), &dense);
+
+        // The inverse wrapper order must hoist REE value nullability before
+        // peeling the dictionary; the dense batch contains an actual null.
+        let ree_dictionary = Field::new(
+            "c",
+            ree(
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
+                true,
+            ),
+            false,
+        );
+        assert_unified(ree_dictionary, dense.clone(), &dense);
+
+        // Wrapper normalization is per logical node: a wrapper nested under a
+        // struct child must not make the enclosing struct incompatible.
+        let struct_fields = Fields::from(vec![Field::new("value", DataType::Int32, true)]);
+        let dense_struct: ArrayRef =
+            Arc::new(StructArray::new(struct_fields, vec![dense.clone()], None));
+        let wrapped_struct = Field::new(
+            "c",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "value",
+                ree(DataType::Int32, true),
+                false,
+            )])),
+            false,
+        );
+        assert_unified(wrapped_struct, dense_struct.clone(), &dense_struct);
+
+        // The same recursive compatibility is required for list children.
+        let wrapped_list = Field::new(
+            "c",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                ree(DataType::Int32, true),
+                false,
+            ))),
+            false,
+        );
+        assert_unified(wrapped_list, list.clone(), &list);
+
+        // Nested scalar dictionaries may alternate with their dense logical
+        // value in either direction between writer schema and batch.
+        let dict: ArrayRef = Arc::new(DictionaryArray::new(
+            Int8Array::from(vec![Some(0), None, Some(1)]),
+            Arc::new(Int32Array::from(vec![1, 3])),
+        ));
+        let dict_list: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new_list_field(dict.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0_i32, 2, 3].into()),
+            dict,
+            None,
+        ));
+        let list_of_dictionary = Field::new(
+            "c",
+            DataType::List(Arc::new(Field::new_list_field(
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
+                true,
+            ))),
+            false,
+        );
+        assert_unified(list_of_dictionary, list.clone(), &list);
+        assert_unified(
+            Field::new("c", list.data_type().clone(), false),
+            dict_list,
+            &list,
+        );
+
+        // A wrapper below a Map value is validated at the value node, after
+        // walking through the repeated entries struct.
+        let key_field = Arc::new(Field::new("keys", DataType::Utf8, false));
+        let entries = StructArray::new(
+            Fields::from(vec![
+                key_field.clone(),
+                Arc::new(Field::new("values", DataType::Int32, true)),
+            ]),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                dense.clone(),
+            ],
+            None,
+        );
+        let map: ArrayRef = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0_i32, 2, 3].into()),
+            entries,
+            None,
+            false,
+        ));
+        let wrapped_map = Field::new(
+            "c",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        key_field,
+                        Arc::new(Field::new("values", ree(DataType::Int32, true), false)),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        );
+        assert_unified(wrapped_map, map.clone(), &map);
+    }
+
+    fn read_column(file: Vec<u8>) -> ArrayRef {
+        let reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 4096).unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(0).as_ref()).collect();
+        arrow_select::concat::concat(&arrays).unwrap()
+    }
+
+    fn roundtrip_array(array: ArrayRef, props: Option<WriterProperties>) -> ArrayRef {
+        roundtrip_column(
+            Field::new("c", array.data_type().clone(), true),
+            array,
+            props,
+        )
+    }
+
+    /// A non-leaf REE field that is non-nullable can still have nullable run
+    /// values. Native lowering must retain the schema-merged nullability (field
+    /// OR run values), or its definition levels are one short of the Parquet
+    /// schema.
+    #[test]
+    fn ree_nonleaf_merges_nullability() {
+        // The struct-valued fixture includes a null run.
+        let ree = ree_struct_test_array();
+        let props = WriterProperties::builder()
+            .set_content_defined_chunking(Some(CdcOptions::default()))
+            .build();
+
+        // The outer field is non-nullable, but the REE value field is nullable
+        // and its nullability must carry through expansion.
+        let expanded = roundtrip_column(
+            Field::new("c", ree.data_type().clone(), false),
+            ree.clone(),
+            Some(props.clone()),
+        );
+        let dense = ree_dense_equivalent(&ree);
+        let via_dense = roundtrip_column(
+            Field::new("c", dense.data_type().clone(), true),
+            dense,
+            Some(props),
+        );
+        assert_eq!(expanded.as_ref(), via_dense.as_ref());
+    }
+
+    /// Verifies that an REE input and its dense equivalent produce the same
+    /// decoded values under the given writer properties.
+    fn assert_ree_matches_dense(ree: ArrayRef, props: Option<WriterProperties>) {
+        let ree_output = roundtrip_array(ree.clone(), props.clone());
+        let dense = ree_dense_equivalent(&ree);
+        let via_dense = roundtrip_array(dense, props);
+        assert_eq!(ree_output.as_ref(), via_dense.as_ref());
+    }
+
+    /// Write one column without Arrow schema metadata. This makes exact file
+    /// parity meaningful when the two Arrow inputs have different wrapper
+    /// types (for example `RunEndEncoded<Dictionary<...>>` and its dense
+    /// dictionary equivalent) but the same logical Parquet column.
+    fn write_column_without_arrow_metadata(
+        column: ArrayRef,
+        props: Option<WriterProperties>,
+    ) -> Vec<u8> {
+        let field = Field::new("c", column.data_type().clone(), true);
+        write_column_without_arrow_metadata_as(field, column, props)
+    }
+
+    fn write_column_without_arrow_metadata_as(
+        field: Field,
+        column: ArrayRef,
+        props: Option<WriterProperties>,
+    ) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let options = ArrowWriterOptions::new()
+            .with_properties(props.unwrap_or_else(|| WriterProperties::builder().build()))
+            .with_skip_arrow_metadata(true);
+        let mut file = Vec::new();
+        let mut writer = ArrowWriter::try_new_with_options(&mut file, schema, options).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        file
+    }
+
+    fn write_column_in_batches_without_arrow_metadata(
+        column: ArrayRef,
+        batch_size: usize,
+        props: WriterProperties,
+    ) -> Vec<u8> {
+        assert!(batch_size > 0);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            column.data_type().clone(),
+            true,
+        )]));
+        let options = ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut file = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new_with_options(&mut file, schema.clone(), options).unwrap();
+        for offset in (0..column.len()).step_by(batch_size) {
+            let len = batch_size.min(column.len() - offset);
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![column.slice(offset, len)]).unwrap();
+            writer.write(&batch).unwrap();
+        }
+        writer.close().unwrap();
+        file
+    }
+
+    /// Round-trip a metadata-free file so dictionary value families that the
+    /// reader cannot reconstruct as Arrow dictionaries can still be compared
+    /// through their exact logical arrays.
+    fn roundtrip_column_without_arrow_metadata(
+        column: ArrayRef,
+        props: Option<WriterProperties>,
+    ) -> ArrayRef {
+        read_column(write_column_without_arrow_metadata(column, props))
+    }
+
+    /// Assert that an REE input and its dense logical equivalent decode to the
+    /// same values. Their Parquet encodings need not be byte-identical.
+    fn assert_ree_roundtrip_matches_dense(ree: ArrayRef, props: Option<WriterProperties>) {
+        let dense = ree_dense_equivalent(&ree);
+        assert_eq!(
+            roundtrip_column_without_arrow_metadata(ree, props.clone()).as_ref(),
+            roundtrip_column_without_arrow_metadata(dense, props).as_ref(),
+        );
+    }
+
+    #[test]
+    fn arrow_writer_flba_physical_selection_preserves_cursor_roundtrip() {
+        let mut values = FixedSizeBinaryBuilder::new(2);
+        values.append_value([1, 2]).unwrap();
+        values.append_value([3, 4]).unwrap();
+        values.append_value([9, 10]).unwrap();
+        values.append_value([5, 6]).unwrap();
+        values.append_value([7, 8]).unwrap();
+        let values: ArrayRef = Arc::new(values.finish());
+
+        let keys = Int32Array::from(vec![0, 1, 1, 2, 3, 4]);
+        let dictionary: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values.clone()).unwrap());
+        let (physical, selection) = dispatch_physical_input(
+            dictionary.as_ref(),
+            ValueSelectionRef::Dense { offset: 0, len: 6 },
+        );
+        assert_eq!(physical.data_type(), values.data_type());
+        assert_eq!(selection.len(), 6);
+
+        let mut run_values = FixedSizeBinaryBuilder::new(2);
+        run_values.append_value([1, 2]).unwrap();
+        run_values.append_value([3, 4]).unwrap();
+        let run_values: ArrayRef = Arc::new(run_values.finish());
+        let run_keys = Int32Array::from(vec![0, 0, 1]);
+        let run_dictionary: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(run_keys, run_values).unwrap());
+        let run_ends = Int32Array::from(vec![3, 7, 10]);
+        let ree: ArrayRef =
+            Arc::new(Int32RunArray::try_new(&run_ends, run_dictionary.as_ref()).unwrap());
+        let dense = ree_dense_equivalent(&ree);
+        assert_eq!(
+            write_column_without_arrow_metadata(ree, None),
+            write_column_without_arrow_metadata(dense, None),
+        );
+    }
+
+    #[test]
+    fn bound_physical_sources_slice_the_selection_without_retaining_arrays() {
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
+        let keys = Int32Array::from(vec![2, 0, 1, 2]);
+        let dictionary: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values.clone()).unwrap());
+        let value_refs = Arc::strong_count(&values);
+        let dictionary_refs = Arc::strong_count(&dictionary);
+
+        {
+            let binding = ArrowPhysicalBinding::<Int32Storage<'_>>::bind(
+                dictionary.as_ref(),
+                ValueSelectionRef::Dense { offset: 0, len: 4 },
+            )
+            .unwrap();
+            let source = binding.source();
+            assert_eq!(Arc::strong_count(&values), value_refs);
+            assert_eq!(Arc::strong_count(&dictionary), dictionary_refs);
+            assert_eq!(source.len(), 4);
+            assert!(matches!(binding.storage, Int32Storage::Identity(_)));
+
+            let sliced = source.slice(1, 2);
+            let mut physical = Vec::new();
+            sliced
+                .selection()
+                .try_for_each_index(|index| -> Result<()> {
+                    physical.push(index);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(physical, [0, 1]);
+        }
+        assert_eq!(Arc::strong_count(&values), value_refs);
+        assert_eq!(Arc::strong_count(&dictionary), dictionary_refs);
+
+        let byte_values: ArrayRef = Arc::new(StringArray::from(vec!["a", "bb", "ccc"]));
+        let byte_keys = Int32Array::from(vec![2, 0, 1, 2]);
+        let byte_dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(byte_keys, byte_values.clone()).unwrap(),
+        );
+        let byte_value_refs = Arc::strong_count(&byte_values);
+        let byte_dictionary_refs = Arc::strong_count(&byte_dictionary);
+
+        {
+            let _binding = ArrowPhysicalBinding::<ByteArrayStorage<'_>>::bind(
+                byte_dictionary.as_ref(),
+                ValueSelectionRef::Dense { offset: 0, len: 4 },
+            )
+            .unwrap();
+            assert_eq!(Arc::strong_count(&byte_values), byte_value_refs);
+            assert_eq!(Arc::strong_count(&byte_dictionary), byte_dictionary_refs);
+        }
+        assert_eq!(Arc::strong_count(&byte_values), byte_value_refs);
+        assert_eq!(Arc::strong_count(&byte_dictionary), byte_dictionary_refs);
+    }
+
+    fn ree_struct_test_array() -> ArrayRef {
+        // Five runs over a struct<a: i32, b: utf8, c: bool>:
+        //   r0 = {1, "x", true}   × 3
+        //   r1 = NULL struct      × 2   (per-leaf values are arbitrary/masked)
+        //   r2 = {null, "y", false} × 4
+        //   r3 = {4, null, null}  × 5
+        //   r4 = {5, "z", true}   × 6   → 20 logical rows
+        let a = Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5)]);
+        let b = StringArray::from(vec![Some("x"), Some("masked"), Some("y"), None, Some("z")]);
+        let c = BooleanArray::from(vec![Some(true), None, Some(false), None, Some(true)]);
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Boolean, true),
+        ]);
+        let struct_nulls = NullBuffer::from(vec![true, false, true, true, true]);
+        let values = StructArray::new(
+            fields,
+            vec![Arc::new(a), Arc::new(b), Arc::new(c)],
+            Some(struct_nulls),
+        );
+        let run_ends = Int32Array::from(vec![3, 5, 9, 14, 20]);
+        Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap())
+    }
+
+    /// A struct-valued REE array round-trips with nulls at every level and with
+    /// page boundaries that split runs.
+    #[test]
+    fn ree_struct_roundtrip() {
+        let ree = ree_struct_test_array();
+        // Small page/batch limits split physical runs.
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(4)
+            .build();
+        assert_ree_matches_dense(ree.clone(), Some(props));
+        assert_ree_matches_dense(ree.clone(), None);
+        for (offset, len) in [(2, 15), (3, 2), (5, 9), (0, 20), (19, 1)] {
+            assert_ree_matches_dense(ree.slice(offset, len), None);
+        }
+
+        // Spot-check leaf `a` against explicitly computed logical rows.
+        let ree_output =
+            roundtrip_column(Field::new("c", ree.data_type().clone(), true), ree, None);
+        let a = ree_output.as_struct().column(0).as_primitive::<Int32Type>();
+        let mut expected: Vec<Option<i32>> = Vec::new();
+        expected.extend(std::iter::repeat_n(Some(1), 3));
+        expected.extend(std::iter::repeat_n(None, 2));
+        expected.extend(std::iter::repeat_n(None, 4));
+        expected.extend(std::iter::repeat_n(Some(4), 5));
+        expected.extend(std::iter::repeat_n(Some(5), 6));
+        assert_eq!(a.iter().collect::<Vec<_>>(), expected);
+    }
+
+    /// The numeric and string leaves of a struct-valued REE column use
+    /// `RLE_DICTIONARY` encoding.
+    #[test]
+    fn ree_struct_uses_rle_dictionary() {
+        let ree = ree_struct_test_array();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            ree.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ree]).unwrap();
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(file)).unwrap();
+        let rg = builder.metadata().row_group(0);
+        assert_eq!(rg.num_columns(), 3);
+        // Leaves 0 (int32) and 1 (utf8) are dictionary encoded.
+        for i in 0..2 {
+            assert!(
+                rg.column(i)
+                    .encodings()
+                    .any(|e| e == Encoding::RLE_DICTIONARY),
+                "leaf {i} should be dictionary-encoded from run values"
+            );
+        }
+    }
+
+    /// A run-end-encoded struct nested inside a nullable struct exercises
+    /// parent-null rows between repeated terminal-value groups.
+    #[test]
+    fn ree_struct_under_nullable_struct() {
+        let ree = ree_struct_test_array();
+        let outer_validity: Vec<bool> = (0..20).map(|i| !(4..=6).contains(&i) && i != 15).collect();
+        let outer_nulls = NullBuffer::from(outer_validity.clone());
+
+        let make_outer = |inner: ArrayRef| -> (Field, ArrayRef) {
+            let fields = Fields::from(vec![Field::new("r", inner.data_type().clone(), true)]);
+            let outer = StructArray::new(fields.clone(), vec![inner], Some(outer_nulls.clone()));
+            (
+                Field::new("s", DataType::Struct(fields), true),
+                Arc::new(outer) as ArrayRef,
+            )
+        };
+
+        let (ree_field, ree_col) = make_outer(ree.clone());
+        let (dense_field, dense_col) = make_outer(ree_dense_equivalent(&ree));
+
+        let plans = compute_leaves(&ree_field, &ree_col).unwrap();
+        assert!(!plans.is_empty());
+
+        for props in [
+            None,
+            Some(
+                WriterProperties::builder()
+                    .set_write_batch_size(1)
+                    .set_data_page_row_count_limit(2)
+                    .build(),
+            ),
+        ] {
+            let ree_output = roundtrip_column(ree_field.clone(), ree_col.clone(), props.clone());
+            let dense_output = roundtrip_column(dense_field.clone(), dense_col.clone(), props);
+            assert_eq!(ree_output.as_ref(), dense_output.as_ref());
+        }
+    }
+
+    /// Nested structs (struct-of-struct) and an FLBA leaf (decimal128) under REE.
+    #[test]
+    fn ree_struct_nested() {
+        let d = Decimal128Array::from(vec![Some(11111), None, Some(33333)])
+            .with_precision_and_scale(38, 10)
+            .unwrap();
+        let e = StringArray::from(vec![Some("p"), Some("q"), None]);
+        let inner_fields = Fields::from(vec![
+            Field::new("d", d.data_type().clone(), true),
+            Field::new("e", DataType::Utf8, true),
+        ]);
+        let inner_nulls = NullBuffer::from(vec![true, true, false]);
+        let inner = StructArray::new(
+            inner_fields.clone(),
+            vec![Arc::new(d), Arc::new(e)],
+            Some(inner_nulls),
+        );
+        let f = Int32Array::from(vec![Some(7), Some(8), Some(9)]);
+        let outer_fields = Fields::from(vec![
+            Field::new("inner", DataType::Struct(inner_fields), true),
+            Field::new("f", DataType::Int32, true),
+        ]);
+        let values = StructArray::new(
+            outer_fields,
+            vec![Arc::new(inner), Arc::new(f)],
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let run_ends = Int32Array::from(vec![4, 6, 11]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+        assert_ree_matches_dense(ree.clone(), None);
+        assert_ree_matches_dense(
+            ree,
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(3)
+                    .build(),
+            ),
+        );
+    }
+
+    /// All-valid run values collapse definition levels to a uniform stream
+    /// while the cursor resolves terminal-value indices.
+    #[test]
+    fn ree_struct_no_nulls() {
+        let a = Int32Array::from(vec![10, 20, 30]);
+        let b = StringArray::from(vec!["xx", "yy", "zz"]);
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let values = StructArray::new(fields, vec![Arc::new(a), Arc::new(b)], None);
+        let run_ends = Int32Array::from(vec![2, 7, 12]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+        assert_ree_matches_dense(ree, None);
+    }
+
+    /// Multiple batches into one writer, with a dictionary shared across their
+    /// leaf selections.
+    #[test]
+    fn ree_struct_multi_batch() {
+        let ree = ree_struct_test_array();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            ree.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ree.clone()]).unwrap();
+        let mut file = vec![];
+        let mut writer = ArrowWriter::try_new(&mut file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 4096).unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(0).as_ref()).collect();
+        let ree_output = arrow_select::concat::concat(&arrays).unwrap();
+
+        let dense = ree_dense_equivalent(&ree);
+        let expected = arrow_select::concat::concat(&[dense.as_ref(), dense.as_ref()]).unwrap();
+        assert_eq!(ree_output.as_ref(), expected.as_ref());
+    }
+
+    fn ree_list_test_array() -> ArrayRef {
+        // Six runs over a list<i32>:
+        //   r0 = [1, 2, 3]        × 2
+        //   r1 = NULL list        × 3
+        //   r2 = []               × 2
+        //   r3 = [4, null, 6]     × 4
+        //   r4 = [7]              × 5
+        //   r5 = [8, 9]           × 2   → 18 logical rows
+        let values = Int32Array::from(vec![
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            None,
+            Some(6),
+            Some(7),
+            Some(8),
+            Some(9),
+        ]);
+        let offsets = OffsetBuffer::new(vec![0i32, 3, 3, 3, 6, 7, 9].into());
+        let field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let nulls = NullBuffer::from(vec![true, false, true, true, true, true]);
+        let list = ListArray::new(field, offsets, Arc::new(values), Some(nulls));
+        let run_ends = Int32Array::from(vec![2, 5, 7, 11, 16, 18]);
+        Arc::new(Int32RunArray::try_new(&run_ends, &list).unwrap())
+    }
+
+    /// Run-end-encoded list values are lowered into bounded level/index tiles;
+    /// adjacent terminal values remain grouped at the encoder. Covers null runs, null
+    /// lists, empty lists, and element nulls, across page splits.
+    #[test]
+    fn ree_list_roundtrip() {
+        let ree = ree_list_test_array();
+        assert_ree_matches_dense(ree.clone(), None);
+        assert_ree_matches_dense(
+            ree.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(4)
+                    .build(),
+            ),
+        );
+
+        // Spot-check the logical rows explicitly.
+        let ree_output =
+            roundtrip_column(Field::new("c", ree.data_type().clone(), true), ree, None);
+        let lists = ree_output.as_list::<i32>();
+        assert_eq!(lists.len(), 18);
+        let row: Vec<Option<Vec<Option<i32>>>> = (0..lists.len())
+            .map(|i| {
+                lists.is_valid(i).then(|| {
+                    lists
+                        .value(i)
+                        .as_primitive::<Int32Type>()
+                        .iter()
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let l0 = Some(vec![Some(1), Some(2), Some(3)]);
+        let l3 = Some(vec![Some(4), None, Some(6)]);
+        let l4 = Some(vec![Some(7)]);
+        let l5 = Some(vec![Some(8), Some(9)]);
+        let mut expected: Vec<Option<Vec<Option<i32>>>> = Vec::new();
+        expected.extend(std::iter::repeat_n(l0, 2));
+        expected.extend(std::iter::repeat_n(None, 3));
+        expected.extend(std::iter::repeat_n(Some(vec![]), 2));
+        expected.extend(std::iter::repeat_n(l3, 4));
+        expected.extend(std::iter::repeat_n(l4, 5));
+        expected.extend(std::iter::repeat_n(l5, 2));
+        assert_eq!(row, expected);
+
+        let split_props = WriterProperties::builder()
+            .set_write_batch_size(1)
+            .set_data_page_row_count_limit(2)
+            .build();
+        let ree = ree_list_test_array();
+        for (offset, len) in [(1, 15), (3, 3), (6, 8), (0, 18), (17, 1)] {
+            let sliced = ree.slice(offset, len);
+            assert_ree_matches_dense(sliced.clone(), None);
+            assert_ree_matches_dense(sliced, Some(split_props.clone()));
+        }
+    }
+
+    fn ree_string_list_test_array() -> ArrayRef {
+        let values = StringArray::from(vec![Some("aa"), None, Some("cc"), Some("dd")]);
+        let offsets = OffsetBuffer::new(vec![0i32, 2, 2, 3, 4].into());
+        let field = Arc::new(Field::new_list_field(DataType::Utf8, true));
+        let nulls = NullBuffer::from(vec![true, true, false, true]);
+        let list = ListArray::new(field, offsets, Arc::new(values), Some(nulls));
+        let run_ends = Int32Array::from(vec![3, 4, 6, 10]);
+        Arc::new(Int32RunArray::try_new(&run_ends, &list).unwrap())
+    }
+
+    /// REE and dense string-list inputs report the same unencoded byte total,
+    /// including when page boundaries split runs.
+    #[test]
+    fn ree_list_strings_unencoded_bytes() {
+        fn unencoded_bytes(field: Field, col: ArrayRef, props: Option<WriterProperties>) -> i64 {
+            let schema = Arc::new(Schema::new(vec![field]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![col]).unwrap();
+            let mut file = vec![];
+            let mut writer = ArrowWriter::try_new(&mut file, schema, props).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(file)).unwrap();
+            builder
+                .metadata()
+                .row_group(0)
+                .column(0)
+                .unencoded_byte_array_data_bytes()
+                .expect("unencoded byte totals present for byte-array columns")
+        }
+
+        let ree = ree_string_list_test_array();
+        let dense = ree_dense_equivalent(&ree);
+        for props in [
+            None,
+            // Split pages mid-run so repeated groups straddle page boundaries.
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(3)
+                    .build(),
+            ),
+        ] {
+            assert_ree_matches_dense(ree.clone(), props.clone());
+            let ree_unencoded_bytes = unencoded_bytes(
+                Field::new("c", ree.data_type().clone(), true),
+                ree.clone(),
+                props.clone(),
+            );
+            let expected = unencoded_bytes(
+                Field::new("c", dense.data_type().clone(), true),
+                dense.clone(),
+                props,
+            );
+            assert_eq!(ree_unencoded_bytes, expected);
+        }
+    }
+
+    /// One scalar leaf and one list leaf share the same REE structure.
+    #[test]
+    fn ree_struct_with_list() {
+        let a = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let list_values = StringArray::from(vec![Some("x"), Some("y"), Some("z"), None]);
+        let offsets = OffsetBuffer::new(vec![0i32, 2, 2, 4].into());
+        let list_field = Arc::new(Field::new_list_field(DataType::Utf8, true));
+        let b = ListArray::new(list_field, offsets, Arc::new(list_values), None);
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", b.data_type().clone(), true),
+        ]);
+        let values = StructArray::new(
+            fields,
+            vec![Arc::new(a), Arc::new(b)],
+            Some(NullBuffer::from(vec![true, true, false])),
+        );
+        let run_ends = Int32Array::from(vec![4, 7, 9]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+        assert_ree_matches_dense(ree.clone(), None);
+        assert_ree_matches_dense(
+            ree,
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(2)
+                    .build(),
+            ),
+        );
+    }
+
+    /// A repeated list under a nullable parent struct exercises parent-null
+    /// rows between cursor-emitted groups.
+    #[test]
+    fn ree_list_under_nullable_struct() {
+        let ree = ree_list_test_array();
+        let outer_validity: Vec<bool> = (0..18).map(|i| !(3..=5).contains(&i) && i != 12).collect();
+        let outer_nulls = NullBuffer::from(outer_validity);
+
+        let make_outer = |inner: ArrayRef| -> (Field, ArrayRef) {
+            let fields = Fields::from(vec![Field::new("r", inner.data_type().clone(), true)]);
+            let outer = StructArray::new(fields.clone(), vec![inner], Some(outer_nulls.clone()));
+            (
+                Field::new("s", DataType::Struct(fields), true),
+                Arc::new(outer) as ArrayRef,
+            )
+        };
+
+        let (ree_field, ree_col) = make_outer(ree.clone());
+        let (dense_field, dense_col) = make_outer(ree_dense_equivalent(&ree));
+        for props in [
+            None,
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(3)
+                    .build(),
+            ),
+        ] {
+            let ree_output = roundtrip_column(ree_field.clone(), ree_col.clone(), props.clone());
+            let dense_output = roundtrip_column(dense_field.clone(), dense_col.clone(), props);
+            assert_eq!(ree_output.as_ref(), dense_output.as_ref());
+        }
+    }
+
+    /// Deeply nested run values: list-of-struct-of-list with nested repetition
+    /// levels.
+    #[test]
+    fn ree_list_nested() {
+        // inner lists: per struct element
+        let inner_values = Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5)]);
+        let inner_offsets = OffsetBuffer::new(vec![0i32, 2, 3, 3, 5].into());
+        let inner_field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let inner_list = ListArray::new(
+            inner_field,
+            inner_offsets,
+            Arc::new(inner_values),
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        );
+        let struct_fields =
+            Fields::from(vec![Field::new("x", inner_list.data_type().clone(), true)]);
+        let structs = StructArray::new(struct_fields, vec![Arc::new(inner_list)], None);
+        // outer lists of those structs: 3 run values
+        let outer_offsets = OffsetBuffer::new(vec![0i32, 2, 2, 4].into());
+        let outer_field = Arc::new(Field::new_list_field(structs.data_type().clone(), true));
+        let outer_list = ListArray::new(outer_field, outer_offsets, Arc::new(structs), None);
+        let run_ends = Int32Array::from(vec![3, 5, 8]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &outer_list).unwrap());
+        assert_ree_matches_dense(ree.clone(), None);
+        assert_ree_matches_dense(
+            ree,
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(2)
+                    .build(),
+            ),
+        );
+    }
+
+    /// REE-encoded fixed-size-list values match their dense equivalent,
+    /// including null lists and null elements.
+    #[test]
+    fn ree_fixed_size_list() {
+        let values = Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5), Some(6)]);
+        let field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let fsl = FixedSizeListArray::new(
+            field,
+            2,
+            Arc::new(values),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let run_ends = Int32Array::from(vec![2, 5, 9]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &fsl).unwrap());
+        assert_ree_matches_dense(ree, None);
+    }
+
+    /// Non-leaf REE inputs match their dense equivalents when content-defined
+    /// chunking is enabled.
+    #[test]
+    fn ree_nonleaf_with_content_defined_chunking() {
+        let props = WriterProperties::builder()
+            .set_content_defined_chunking(Some(CdcOptions::default()))
+            .build();
+        let struct_ree = ree_struct_test_array();
+        let list_ree = ree_list_test_array();
+        assert_ree_matches_dense(struct_ree.clone(), Some(props.clone()));
+        assert_ree_matches_dense(list_ree.clone(), Some(props.clone()));
+        assert_ree_roundtrip_matches_dense(struct_ree, Some(props.clone()));
+        assert_ree_roundtrip_matches_dense(list_ree, Some(props));
+    }
+
+    #[test]
+    fn ree_cdc_is_invariant_across_cursor_tiles() {
+        let list = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Int32, false)),
+            OffsetBuffer::new(vec![0_i32, 1].into()),
+            Arc::new(Int32Array::from(vec![42])),
+            None,
+        );
+        let rows = 20_000;
+        let ree: ArrayRef =
+            Arc::new(Int32RunArray::try_new(&Int32Array::from(vec![rows]), &list).unwrap());
+        let props = WriterProperties::builder()
+            .set_content_defined_chunking(Some(CdcOptions {
+                min_chunk_size: 64,
+                max_chunk_size: 256,
+                norm_level: 0,
+            }))
+            .build();
+
+        let one_batch = write_column_in_batches_without_arrow_metadata(
+            ree.clone(),
+            rows as usize,
+            props.clone(),
+        );
+        let partitioned =
+            write_column_in_batches_without_arrow_metadata(ree.clone(), 997, props.clone());
+        let dense = write_column_in_batches_without_arrow_metadata(
+            ree_dense_equivalent(&ree),
+            rows as usize,
+            props,
+        );
+        assert_eq!(one_batch, partitioned);
+        assert_eq!(one_batch, dense);
+    }
+
+    /// Dense equivalent of a list whose values child is run-end encoded:
+    /// same offsets and validity over the `take`-expanded child.
+    fn list_of_ree_dense_equivalent(list: &ArrayRef) -> ArrayRef {
+        let list = list.as_list::<i32>();
+        let dense_child = ree_dense_equivalent(&list.values().clone());
+        let field = Arc::new(Field::new_list_field(dense_child.data_type().clone(), true));
+        Arc::new(ListArray::new(
+            field,
+            list.offsets().clone(),
+            dense_child,
+            list.nulls().cloned(),
+        ))
+    }
+
+    fn assert_list_of_ree_matches_dense(list: ArrayRef, props: Option<WriterProperties>) {
+        let ree_output = roundtrip_column(
+            Field::new("c", list.data_type().clone(), true),
+            list.clone(),
+            props.clone(),
+        );
+        let dense = list_of_ree_dense_equivalent(&list);
+        let dense_output = roundtrip_column(
+            Field::new("c", dense.data_type().clone(), true),
+            dense,
+            props,
+        );
+        assert_eq!(ree_output.as_ref(), dense_output.as_ref());
+    }
+
+    fn list_of_ree_test_array() -> ArrayRef {
+        // REE child over 16 rows: (1)×5, (NULL)×3, (2)×6, (3)×2.
+        let run_ends = Int32Array::from(vec![5, 8, 14, 16]);
+        let values = Int32Array::from(vec![Some(1), None, Some(2), Some(3)]);
+        let ree = Int32RunArray::try_new(&run_ends, &values).unwrap();
+        // Six list rows: [1,1,1], [], [1,1,N,N,N,2] (crosses runs incl. the
+        // null run), NULL (zero extent), [2,2,2], [2,2,3,3] (crosses runs).
+        let offsets = OffsetBuffer::new(vec![0i32, 3, 3, 9, 9, 12, 16].into());
+        let field = Arc::new(Field::new_list_field(ree.data_type().clone(), true));
+        let nulls = NullBuffer::from(vec![true, true, true, false, true, true]);
+        Arc::new(ListArray::new(field, offsets, Arc::new(ree), Some(nulls)))
+    }
+
+    /// A list with an REE child matches its dense equivalent across run
+    /// boundaries, null runs, empty and null rows, and page splits.
+    #[test]
+    fn ree_under_list_roundtrip() {
+        let list = list_of_ree_test_array();
+        assert_list_of_ree_matches_dense(list.clone(), None);
+        assert_list_of_ree_matches_dense(
+            list.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(2)
+                    .build(),
+            ),
+        );
+
+        // Spot-check the logical rows explicitly.
+        let ree_output =
+            roundtrip_column(Field::new("c", list.data_type().clone(), true), list, None);
+        let rows = ree_output.as_list::<i32>();
+        let got: Vec<Option<Vec<Option<i32>>>> = (0..rows.len())
+            .map(|i| {
+                rows.is_valid(i).then(|| {
+                    rows.value(i)
+                        .as_primitive::<Int32Type>()
+                        .iter()
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let expected: Vec<Option<Vec<Option<i32>>>> = vec![
+            Some(vec![Some(1), Some(1), Some(1)]),
+            Some(vec![]),
+            Some(vec![Some(1), Some(1), None, None, None, Some(2)]),
+            None,
+            Some(vec![Some(2), Some(2), Some(2)]),
+            Some(vec![Some(2), Some(2), Some(3), Some(3)]),
+        ];
+        assert_eq!(got, expected);
+    }
+
+    /// Struct-valued REE data under a list matches its dense equivalent,
+    /// including nullable scalar and byte-array descendants.
+    #[test]
+    fn ree_struct_under_list() {
+        let a = Int32Array::from(vec![Some(10), None, Some(30)]);
+        let b = StringArray::from(vec![Some("xx"), Some("yy"), None]);
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let struct_nulls = NullBuffer::from(vec![true, false, true]);
+        let values = StructArray::new(fields, vec![Arc::new(a), Arc::new(b)], Some(struct_nulls));
+        let run_ends = Int32Array::from(vec![4, 6, 10]);
+        let ree = Int32RunArray::try_new(&run_ends, &values).unwrap();
+        let offsets = OffsetBuffer::new(vec![0i32, 2, 5, 5, 10].into());
+        let field = Arc::new(Field::new_list_field(ree.data_type().clone(), true));
+        let nulls = NullBuffer::from(vec![true, true, false, true]);
+        let list: ArrayRef = Arc::new(ListArray::new(field, offsets, Arc::new(ree), Some(nulls)));
+        assert_list_of_ree_matches_dense(list.clone(), None);
+        assert_list_of_ree_matches_dense(
+            list,
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(2)
+                    .build(),
+            ),
+        );
+    }
+
+    /// Covers sliced list windows and a list containing REE data under a
+    /// nullable outer struct.
+    #[test]
+    fn ree_under_list_sliced_and_nested() {
+        let list = list_of_ree_test_array();
+        for (offset, len) in [(1, 4), (2, 3), (0, 6), (5, 1)] {
+            assert_list_of_ree_matches_dense(list.slice(offset, len), None);
+        }
+
+        let outer_nulls = NullBuffer::from(vec![true, false, true, true, false, true]);
+        let make_outer = |inner: ArrayRef| -> (Field, ArrayRef) {
+            let fields = Fields::from(vec![Field::new("l", inner.data_type().clone(), true)]);
+            let outer = StructArray::new(fields.clone(), vec![inner], Some(outer_nulls.clone()));
+            (
+                Field::new("s", DataType::Struct(fields), true),
+                Arc::new(outer) as ArrayRef,
+            )
+        };
+        let (ree_field, ree_col) = make_outer(list.clone());
+        let (dense_field, dense_col) = make_outer(list_of_ree_dense_equivalent(&list));
+        let ree_output = roundtrip_column(ree_field, ree_col, None);
+        let dense_output = roundtrip_column(dense_field, dense_col, None);
+        assert_eq!(ree_output.as_ref(), dense_output.as_ref());
+    }
+
+    fn list_of_ree_lists_test_array() -> ArrayRef {
+        // Four run values, each an inner list: L0=[1,2], L1=NULL, L2=[],
+        // L3=[3,null]. Runs: L0×3, L1×2, L2×1, L3×3 → 9 elements.
+        let inner_values = Int32Array::from(vec![Some(1), Some(2), Some(3), None]);
+        let inner_offsets = OffsetBuffer::new(vec![0i32, 2, 2, 2, 4].into());
+        let inner_field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let inner_nulls = NullBuffer::from(vec![true, false, true, true]);
+        let inner = ListArray::new(
+            inner_field,
+            inner_offsets,
+            Arc::new(inner_values),
+            Some(inner_nulls),
+        );
+        let run_ends = Int32Array::from(vec![3, 5, 6, 9]);
+        let ree = Int32RunArray::try_new(&run_ends, &inner).unwrap();
+        // Outer rows: [e0,e1], [], [e2,e3,e4] (opens mid-run → override
+        // fragment), NULL, [e5..e9] (crosses three runs).
+        let offsets = OffsetBuffer::new(vec![0i32, 2, 2, 5, 5, 9].into());
+        let field = Arc::new(Field::new_list_field(ree.data_type().clone(), true));
+        let nulls = NullBuffer::from(vec![true, true, true, false, true]);
+        Arc::new(ListArray::new(field, offsets, Arc::new(ree), Some(nulls)))
+    }
+
+    /// A list of REE-encoded lists matches its dense equivalent across outer
+    /// row boundaries, null and empty rows, and page splits.
+    #[test]
+    fn ree_lists_under_list_roundtrip() {
+        let list = list_of_ree_lists_test_array();
+        assert_list_of_ree_matches_dense(list.clone(), None);
+        assert_list_of_ree_matches_dense(
+            list.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(2)
+                    .build(),
+            ),
+        );
+
+        // Spot-check the nested logical rows explicitly.
+        let ree_output =
+            roundtrip_column(Field::new("c", list.data_type().clone(), true), list, None);
+        let rows = ree_output.as_list::<i32>();
+        type Inner = Option<Vec<Option<i32>>>;
+        let got: Vec<Option<Vec<Inner>>> = (0..rows.len())
+            .map(|i| {
+                rows.is_valid(i).then(|| {
+                    let inner = rows.value(i);
+                    let inner = inner.as_list::<i32>();
+                    (0..inner.len())
+                        .map(|j| {
+                            inner.is_valid(j).then(|| {
+                                inner
+                                    .value(j)
+                                    .as_primitive::<Int32Type>()
+                                    .iter()
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        let l0: Inner = Some(vec![Some(1), Some(2)]);
+        let l3: Inner = Some(vec![Some(3), None]);
+        let expected: Vec<Option<Vec<Inner>>> = vec![
+            Some(vec![l0.clone(), l0.clone()]),
+            Some(vec![]),
+            Some(vec![l0, None, None]),
+            None,
+            Some(vec![Some(vec![]), l3.clone(), l3.clone(), l3]),
+        ];
+        assert_eq!(got, expected);
+
+        let list = list_of_ree_lists_test_array();
+        let props = WriterProperties::builder()
+            .set_write_batch_size(1)
+            .set_data_page_row_count_limit(2)
+            .build();
+        for (offset, len) in [(1, 3), (2, 3)] {
+            assert_list_of_ree_matches_dense(list.slice(offset, len), Some(props.clone()));
+        }
+    }
+
+    /// Equal-width outer rows span both complete child runs and a run boundary;
+    /// the resulting 2,080 leaf values also cross cursor tile boundaries.
+    #[test]
+    fn ree_lists_under_list_across_run_and_cursor_tile_boundaries() {
+        let values = Int32Array::from_iter_values(1..=8);
+        let inner_offsets = OffsetBuffer::from_lengths([4usize, 4]);
+        let inner_field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let inner = ListArray::new(inner_field, inner_offsets, Arc::new(values), None);
+        let run_ends = Int32Array::from(vec![513, 520]);
+        let ree = Int32RunArray::try_new(&run_ends, &inner).unwrap();
+
+        let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(2usize, 260));
+        let field = Arc::new(Field::new_list_field(ree.data_type().clone(), true));
+        let list: ArrayRef = Arc::new(ListArray::new(field, offsets, Arc::new(ree), None));
+        assert_list_of_ree_matches_dense(list.clone(), None);
+        assert_list_of_ree_matches_dense(
+            list,
+            Some(
+                WriterProperties::builder()
+                    .set_write_batch_size(7)
+                    .set_data_page_row_count_limit(17)
+                    .set_content_defined_chunking(Some(CdcOptions::default()))
+                    .build(),
+            ),
+        );
+    }
+
+    /// Covers struct-valued REE data with scalar and list-bearing leaves under
+    /// the same outer list.
+    #[test]
+    fn ree_struct_with_list_under_list() {
+        let a = Int32Array::from(vec![Some(7), None, Some(9)]);
+        let b_values = StringArray::from(vec![Some("x"), None, Some("z"), Some("w")]);
+        let b_offsets = OffsetBuffer::new(vec![0i32, 2, 2, 4].into());
+        let b_field = Arc::new(Field::new_list_field(DataType::Utf8, true));
+        let b = ListArray::new(
+            b_field,
+            b_offsets,
+            Arc::new(b_values),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", b.data_type().clone(), true),
+        ]);
+        let values = StructArray::new(
+            fields,
+            vec![Arc::new(a), Arc::new(b)],
+            Some(NullBuffer::from(vec![true, true, false])),
+        );
+        let run_ends = Int32Array::from(vec![2, 5, 8]);
+        let ree = Int32RunArray::try_new(&run_ends, &values).unwrap();
+        let offsets = OffsetBuffer::new(vec![0i32, 3, 3, 4, 8].into());
+        let field = Arc::new(Field::new_list_field(ree.data_type().clone(), true));
+        let nulls = NullBuffer::from(vec![true, true, false, true]);
+        let list: ArrayRef = Arc::new(ListArray::new(field, offsets, Arc::new(ree), Some(nulls)));
+        assert_list_of_ree_matches_dense(list.clone(), None);
+        assert_list_of_ree_matches_dense(
+            list.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_data_page_row_count_limit(2)
+                    .build(),
+            ),
+        );
+
+        // Also compare sliced windows and a nullable outer struct.
+        for (offset, len) in [(1, 3), (0, 4), (2, 2)] {
+            assert_list_of_ree_matches_dense(list.slice(offset, len), None);
+        }
+        let outer_nulls = NullBuffer::from(vec![true, false, true, true]);
+        let make_outer = |inner: ArrayRef| -> (Field, ArrayRef) {
+            let fields = Fields::from(vec![Field::new("l", inner.data_type().clone(), true)]);
+            let outer = StructArray::new(fields.clone(), vec![inner], Some(outer_nulls.clone()));
+            (
+                Field::new("s", DataType::Struct(fields), true),
+                Arc::new(outer) as ArrayRef,
+            )
+        };
+        let (ree_field, ree_col) = make_outer(list.clone());
+        let (dense_field, dense_col) = make_outer(list_of_ree_dense_equivalent(&list));
+        let ree_output = roundtrip_column(ree_field, ree_col, None);
+        let dense_output = roundtrip_column(dense_field, dense_col, None);
+        assert_eq!(ree_output.as_ref(), dense_output.as_ref());
+    }
+
+    /// Round-trip a LargeList containing REE values.
+    #[test]
+    fn ree_under_large_list() {
+        let run_ends = Int32Array::from(vec![3, 7]);
+        let values = Int32Array::from(vec![Some(5), None]);
+        let ree = Int32RunArray::try_new(&run_ends, &values).unwrap();
+        let offsets = OffsetBuffer::new(vec![0i64, 2, 4, 7].into());
+        let field = Arc::new(Field::new_list_field(ree.data_type().clone(), true));
+        let list: ArrayRef = Arc::new(LargeListArray::new(field, offsets, Arc::new(ree), None));
+        let plan_field = Field::new("c", list.data_type().clone(), true);
+        let leaves = compute_leaves(&plan_field, &list).unwrap();
+        assert_eq!(leaves.len(), 1);
+
+        let ree_output = roundtrip_column(
+            Field::new("c", list.data_type().clone(), true),
+            list.clone(),
+            None,
+        );
+        let large = list.as_list::<i64>();
+        let dense_child = ree_dense_equivalent(&large.values().clone());
+        let dense_field = Arc::new(Field::new_list_field(dense_child.data_type().clone(), true));
+        let dense: ArrayRef = Arc::new(LargeListArray::new(
+            dense_field,
+            large.offsets().clone(),
+            dense_child,
+            None,
+        ));
+        let dense_output = roundtrip_column(
+            Field::new("c", dense.data_type().clone(), true),
+            dense,
+            None,
+        );
+        assert_eq!(ree_output.as_ref(), dense_output.as_ref());
     }
 
     /// A [`PageStore`] that allocates *sparse, non-contiguous* handles and keeps
@@ -2458,10 +4170,12 @@ mod tests {
                 self.blobs.push(value);
                 Ok(key)
             }
+
             fn take(&mut self, key: PageKey) -> Result<Bytes> {
                 Ok(std::mem::take(&mut self.blobs[key.get() as usize]))
             }
         }
+
         #[derive(Debug)]
         struct Factory {
             bytes_put: Arc<std::sync::atomic::AtomicUsize>,
@@ -2488,12 +4202,10 @@ mod tests {
         let opts = ArrowWriterOptions::new().with_page_store_factory(Arc::new(Factory {
             bytes_put: bytes_put.clone(),
         }));
-
         // A single batch / single column means exactly one row group and one
         // store instance, so the bytes it saw map to one column chunk.
         let mut buffer = Vec::new();
-        let mut writer =
-            ArrowWriter::try_new_with_options(&mut buffer, schema.clone(), opts).unwrap();
+        let mut writer = ArrowWriter::try_new_with_options(&mut buffer, schema, opts).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
@@ -2753,6 +4465,68 @@ mod tests {
     }
 
     #[test]
+    fn ree_under_list_view_out_of_order_dictionary_disabled() {
+        let run_ends = Int32Array::from(vec![2, 4]);
+        let run_values = Int32Array::from(vec![10, 20]);
+        let values: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &run_values).unwrap());
+        let list_field = Arc::new(Field::new("element", values.data_type().clone(), false));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::ListView(list_field.clone()),
+            false,
+        )]));
+
+        // Child logical values are [10, 10, 20, 20]. The list view offsets below
+        // select [2, 3] and then [0, 1], so the REE value selection is not
+        // monotonic.
+        let list_view = ListViewArray::new(
+            list_field,
+            vec![2, 0].into(),
+            vec![2, 2].into(),
+            values,
+            None,
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list_view)]).unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .build();
+
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        let data = Bytes::from(writer.into_inner().unwrap());
+
+        let mut reader = ParquetRecordBatchReader::try_new(data, 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let column = actual.column(0);
+        let got: Vec<Vec<i32>> = match column.data_type() {
+            DataType::ListView(_) => {
+                let list = column.as_list_view::<i32>();
+                (0..list.len())
+                    .map(|idx| {
+                        list.value(idx)
+                            .as_primitive::<Int32Type>()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect()
+            }
+            DataType::List(_) => {
+                let list = column.as_list::<i32>();
+                (0..list.len())
+                    .map(|idx| {
+                        list.value(idx)
+                            .as_primitive::<Int32Type>()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect()
+            }
+            data_type => panic!("expected list output, got {data_type:?}"),
+        };
+        assert_eq!(got, vec![vec![20, 20], vec![10, 10]]);
+    }
+
+    #[test]
     fn arrow_writer_large_list_view() {
         let list_field = Arc::new(Field::new_list_field(DataType::Int32, false));
         let schema = Schema::new(vec![Field::new(
@@ -2761,19 +4535,26 @@ mod tests {
             true,
         )]);
 
-        //  [[1], [2, 3], null, [4, 5, 6], [7, 8, 9, 10]]
-        let a = LargeListViewArray::new(
+        // [[1], [2, 3], null, [7, 8, 9, 10], [4, 5, 6]] — out of order offsets
+        let a: ArrayRef = Arc::new(LargeListViewArray::new(
             list_field,
-            vec![0i64, 1, 0, 3, 6].into(),
-            vec![1i64, 2, 0, 3, 4].into(),
+            vec![0i64, 1, 0, 6, 3].into(),
+            vec![1i64, 2, 0, 4, 3].into(),
             Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
             Some(vec![true, true, false, true, true].into()),
-        );
-        assert_eq!(a.null_count(), 1);
+        ));
 
-        RoundTripTest::new(Arc::new(a))
-            .with_schema(Arc::new(schema))
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![a.clone()]).unwrap();
+
+        assert_eq!(batch.column(0).null_count(), 1);
+
+        RoundTripTest::new(batch.column(0).clone())
+            .with_schema(batch.schema())
             .run();
+
+        let run_ends = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, a.as_ref()).unwrap());
+        assert_ree_roundtrip_matches_dense(ree, None);
     }
 
     #[test]
@@ -3521,6 +5302,20 @@ mod tests {
         );
     }
 
+    fn data_page_count(schema: SchemaRef, batch: &RecordBatch, props: WriterProperties) -> usize {
+        let file = tempfile::tempfile().unwrap();
+        let mut writer =
+            ArrowWriter::try_new(file.try_clone().unwrap(), schema, Some(props)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+
+        let options = ReadOptionsBuilder::new().with_page_index().build();
+        let reader = SerializedFileReader::new_with_options(file, options).unwrap();
+        reader.metadata().offset_index().expect("offset index")[0][0]
+            .page_locations
+            .len()
+    }
+
     #[test]
     fn arrow_writer_caps_page_size_for_fixed_len_decimal_inputs() {
         const ROWS: usize = 4000;
@@ -3570,20 +5365,6 @@ mod tests {
                  13-byte FLBA {kind} decimal column, got {pages} page(s)",
             );
         }
-    }
-
-    fn data_page_count(schema: SchemaRef, batch: &RecordBatch, props: WriterProperties) -> usize {
-        let file = tempfile::tempfile().unwrap();
-        let mut writer =
-            ArrowWriter::try_new(file.try_clone().unwrap(), schema, Some(props)).unwrap();
-        writer.write(batch).unwrap();
-        writer.close().unwrap();
-
-        let options = ReadOptionsBuilder::new().with_page_index().build();
-        let reader = SerializedFileReader::new_with_options(file, options).unwrap();
-        reader.metadata().offset_index().expect("offset index")[0][0]
-            .page_locations
-            .len()
     }
 
     #[test]
@@ -3996,26 +5777,23 @@ mod tests {
                 assert!(column.column_index_length().is_some());
             }
         }
-        assert!(file_meta_data.column_index().is_some());
-        if let Some(col_indexes) = file_meta_data.column_index() {
-            for rg_idx in col_indexes {
-                for idx in rg_idx {
-                    assert!(idx.nan_counts().is_some());
-                    let float_idx = match idx {
-                        ColumnIndexMetaData::DOUBLE(idx) => idx,
-                        _ => panic!("expected double statistics"),
-                    };
-                    for i in 0..idx.num_pages() as usize {
-                        assert_eq!(float_idx.nan_count(i), Some(10));
-                        assert_eq!(
-                            f64::NAN.total_cmp(float_idx.min_value(i).unwrap()),
-                            Ordering::Equal
-                        );
-                        assert_eq!(
-                            f64::NAN.total_cmp(float_idx.max_value(i).unwrap()),
-                            Ordering::Equal
-                        );
-                    }
+        let col_indexes = file_meta_data.column_index().unwrap();
+        for row_group in col_indexes {
+            for index in row_group {
+                assert!(index.nan_counts().is_some());
+                let ColumnIndexMetaData::DOUBLE(index) = index else {
+                    panic!("expected double statistics")
+                };
+                for page in 0..index.num_pages() as usize {
+                    assert_eq!(index.nan_count(page), Some(10));
+                    assert_eq!(
+                        f64::NAN.total_cmp(index.min_value(page).unwrap()),
+                        Ordering::Equal
+                    );
+                    assert_eq!(
+                        f64::NAN.total_cmp(index.max_value(page).unwrap()),
+                        Ordering::Equal
+                    );
                 }
             }
         }
@@ -4028,84 +5806,55 @@ mod tests {
             DataType::Float64,
             true,
         )]));
-
-        let mut out = Vec::with_capacity(1024);
         let props = WriterProperties::builder()
             .set_data_page_row_count_limit(10)
             .build();
-        let mut writer = ArrowWriter::try_new(&mut out, schema.clone(), Some(props))
-            .expect("Unable to write file");
+        let mut out = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut out, schema.clone(), Some(props)).unwrap();
 
-        // write a page of all NaN (since batch min and max are NaN, global min/max are NaN)
-        let values = Arc::new(Float64Array::from(vec![f64::NAN; 10]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        writer.write(&batch).unwrap();
+        for values in [
+            vec![f64::NAN; 10],
+            vec![-f64::NAN; 10],
+            vec![0.0; 10],
+            vec![-1.0, 0.0, f64::NAN, -f64::NAN, 1.0],
+        ] {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(values))])
+                    .unwrap();
+            writer.write(&batch).unwrap();
+        }
 
-        // write a page of all -NaN (batch min/max is -NaN, should update global min to -NaN)
-        let values = Arc::new(Float64Array::from(vec![-f64::NAN; 10]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        writer.write(&batch).unwrap();
+        let metadata = writer.close().unwrap();
+        let stats = metadata.row_group(0).column(0).statistics().unwrap();
+        assert_eq!(stats.nan_count_opt(), Some(22));
+        assert_eq!(stats.min_bytes_opt(), Some((-1.0f64).as_bytes()));
+        assert_eq!(stats.max_bytes_opt(), Some(1.0f64.as_bytes()));
 
-        // write a page of all 0 (non-NaN should override global min/max, now 0/0)
-        let values = Arc::new(Float64Array::from(vec![0_f64; 10]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        writer.write(&batch).unwrap();
-
-        // write a mixed page (should now have min -1, max 1)
-        let values = Arc::new(Float64Array::from(vec![
-            -1.0,
-            0.0,
-            f64::NAN,
-            -f64::NAN,
-            1.0,
-        ]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        writer.write(&batch).unwrap();
-
-        let file_meta_data = writer.close().unwrap();
-
-        // check the column chunk stats are correct
-        let col_stats = file_meta_data
-            .row_group(0)
-            .column(0)
-            .statistics()
-            .expect("missing column chunk statistics");
-
-        assert_eq!(col_stats.nan_count_opt(), Some(22));
-        assert_eq!(col_stats.min_bytes_opt(), Some((-1.0f64).as_bytes()));
-        assert_eq!(col_stats.max_bytes_opt(), Some(1.0f64.as_bytes()));
-
-        assert!(file_meta_data.column_index().is_some());
-        let col_idx = &file_meta_data.column_index().as_ref().unwrap()[0][0];
-        assert_eq!(col_idx.num_pages(), 4);
-
-        // test each page
-        let float_idx = match col_idx {
-            ColumnIndexMetaData::DOUBLE(idx) => idx,
-            _ => panic!("expected double statistics"),
+        let ColumnIndexMetaData::DOUBLE(index) = &metadata.column_index().unwrap()[0][0] else {
+            panic!("expected double statistics")
         };
-
-        assert_eq!(float_idx.nan_counts, Some(vec![10, 10, 0, 2]));
+        assert_eq!(index.num_pages(), 4);
+        assert_eq!(index.nan_counts, Some(vec![10, 10, 0, 2]));
         assert_eq!(
-            f64::NAN.total_cmp(float_idx.min_value(0).unwrap()),
+            f64::NAN.total_cmp(index.min_value(0).unwrap()),
             Ordering::Equal
         );
         assert_eq!(
-            f64::NAN.total_cmp(float_idx.max_value(0).unwrap()),
+            f64::NAN.total_cmp(index.max_value(0).unwrap()),
             Ordering::Equal
         );
         assert_eq!(
-            (-f64::NAN).total_cmp(float_idx.min_value(1).unwrap()),
+            (-f64::NAN).total_cmp(index.min_value(1).unwrap()),
             Ordering::Equal
         );
         assert_eq!(
-            (-f64::NAN).total_cmp(float_idx.max_value(1).unwrap()),
+            (-f64::NAN).total_cmp(index.max_value(1).unwrap()),
             Ordering::Equal
         );
-        assert_eq!(float_idx.min_value(2), Some(&0.0));
-        assert_eq!(float_idx.max_value(2), Some(&0.0));
-        assert_eq!(float_idx.min_value(3), Some(&-1.0));
-        assert_eq!(float_idx.max_value(3), Some(&1.0));
+        assert_eq!(index.min_value(2), Some(&0.0));
+        assert_eq!(index.max_value(2), Some(&0.0));
+        assert_eq!(index.min_value(3), Some(&-1.0));
+        assert_eq!(index.max_value(3), Some(&1.0));
     }
 
     #[test]
@@ -4553,6 +6302,23 @@ mod tests {
     }
 
     #[test]
+    fn list_utf8_view_selective_padding_roundtrip() {
+        let item = Arc::new(Field::new_list_field(DataType::Utf8View, true));
+        let mut builder = ListBuilder::new(StringViewBuilder::new()).with_field(item);
+        builder.values().append_value("a");
+        builder.values().append_null();
+        builder.append(true);
+        // A null parent list drops padding below the list definition level while
+        // preserving the preceding item null.
+        builder.append(false);
+        // The long string covers the non-inlined Utf8View buffer path.
+        builder.values().append_value("large payload over 12 bytes");
+        builder.append(true);
+
+        RoundTripTest::new(Arc::new(builder.finish())).run();
+    }
+
+    #[test]
     fn large_list_single_column() {
         let a_values = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let a_value_offsets = arrow::buffer::Buffer::from([0i64, 1, 3, 3, 6, 10].to_byte_slice());
@@ -4594,23 +6360,6 @@ mod tests {
 
         let list = LargeListArray::from_iter_primitive::<Int32Type, _, _>(data);
         RoundTripTest::new(Arc::new(list)).run();
-    }
-
-    #[test]
-    fn list_utf8_view_selective_padding_roundtrip() {
-        let item = Arc::new(Field::new_list_field(DataType::Utf8View, true));
-        let mut builder = ListBuilder::new(StringViewBuilder::new()).with_field(item);
-        builder.values().append_value("a");
-        builder.values().append_null();
-        builder.append(true);
-        // A null parent list drops padding below the list definition level while
-        // preserving the preceding item null.
-        builder.append(false);
-        // The long string covers the non-inlined Utf8View buffer path.
-        builder.values().append_value("large payload over 12 bytes");
-        builder.append(true);
-
-        RoundTripTest::new(Arc::new(builder.finish())).run();
     }
 
     #[test]
@@ -5308,13 +7057,11 @@ mod tests {
             .set_data_page_row_count_limit(2)
             .set_content_defined_chunking(Some(CdcOptions::default()))
             .build();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "col",
-            array.data_type().clone(),
-            true,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        roundtrip_opts(&batch, props);
+        roundtrip_column(
+            Field::new("col", array.data_type().clone(), true),
+            array,
+            Some(props),
+        );
     }
 
     fn row_group_sizes(metadata: &ParquetMetaData) -> Vec<i64> {
@@ -5606,6 +7353,56 @@ mod tests {
         assert!(writer.bytes_written() > pre_flush_bytes_written);
 
         writer.close().unwrap();
+
+        fn check(values: ArrayRef, props: WriterProperties) {
+            let batch = RecordBatch::try_from_iter([("a", values)]).unwrap();
+            let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            assert!(writer.memory_size() >= writer.in_progress_size());
+            writer.flush().unwrap();
+            assert_eq!(writer.memory_size(), 0);
+            writer.close().unwrap();
+        }
+
+        check(
+            Arc::new(BooleanArray::from(vec![true, false, true])),
+            WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::RLE)
+                .set_statistics_enabled(EnabledStatistics::None)
+                .build(),
+        );
+        check(
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::DELTA_BINARY_PACKED)
+                .build(),
+        );
+        check(
+            Arc::new(StringArray::from(vec!["prefix-a", "prefix-b"])),
+            WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::DELTA_BYTE_ARRAY)
+                .build(),
+        );
+        let fixed =
+            FixedSizeBinaryArray::try_from_iter([[1, 2, 3, 4], [5, 6, 7, 8]].into_iter()).unwrap();
+        check(
+            Arc::new(fixed),
+            WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_encoding(Encoding::BYTE_STREAM_SPLIT)
+                .build(),
+        );
+        for limit in [usize::MAX, 1] {
+            check(
+                Arc::new(StringArray::from(vec!["dictionary-a", "dictionary-b"])),
+                WriterProperties::builder()
+                    .set_dictionary_page_size_limit(limit)
+                    .build(),
+            );
+        }
     }
 
     #[test]
@@ -6616,24 +8413,7 @@ mod tests {
     }
 
     #[test]
-    fn ree_string() {
-        let ree: ArrayRef = Arc::new(
-            [Some("a"), Some("a"), None, Some("b"), Some("b")]
-                .into_iter()
-                .collect::<Int32RunArray>(),
-        );
-        let flat: ArrayRef = Arc::new(StringArray::from(vec![
-            Some("a"),
-            Some("a"),
-            None,
-            Some("b"),
-            Some("b"),
-        ]));
-        ree_write_read_roundtrip(ree, flat);
-    }
-
-    #[test]
-    fn ree_int32() {
+    fn ree_numeric() {
         let mut b = PrimitiveRunBuilder::<Int32Type, Int32Type>::new();
         for v in [Some(1), Some(1), None, Some(2), Some(2)] {
             b.append_option(v);
@@ -6647,6 +8427,47 @@ mod tests {
             Some(2),
         ]));
         ree_write_read_roundtrip(ree, flat);
+
+        let ree: ArrayRef = Arc::new(
+            Int32RunArray::try_new(
+                &Int32Array::from(vec![2, 5]),
+                &Int64Array::from(vec![Some(100), None]),
+            )
+            .unwrap(),
+        );
+        let flat: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(100),
+            Some(100),
+            None,
+            None,
+            None,
+        ]));
+        ree_write_read_roundtrip(ree, flat);
+
+        let ree: ArrayRef = Arc::new(
+            Int32RunArray::try_new(
+                &Int32Array::from(vec![2, 3]),
+                &Float64Array::from(vec![1.5, 2.5]),
+            )
+            .unwrap(),
+        );
+        ree_write_read_roundtrip(ree, Arc::new(Float64Array::from(vec![1.5, 1.5, 2.5])));
+
+        let full = Int32RunArray::try_new(
+            &Int32Array::from(vec![3, 5, 8]),
+            &Int32Array::from(vec![Some(10), None, Some(30)]),
+        )
+        .unwrap();
+        ree_write_read_roundtrip(
+            Arc::new(full.slice(2, 5)),
+            Arc::new(Int32Array::from(vec![
+                Some(10),
+                None,
+                None,
+                Some(30),
+                Some(30),
+            ])),
+        );
     }
 
     #[test]
@@ -6730,9 +8551,293 @@ mod tests {
     }
 
     #[test]
+    fn ree_float32_nan_statistics_match_dense() {
+        let negative_nan = f32::from_bits(0xffc0_0001);
+        let positive_nan = f32::from_bits(0x7fc0_0002);
+        let ree: ArrayRef = Arc::new(
+            RunArray::try_new(
+                &Int32Array::from(vec![3, 5, 9, 10]),
+                &Float32Array::from(vec![negative_nan, 1.0, positive_nan, -2.0]),
+            )
+            .unwrap(),
+        );
+        let flat: ArrayRef = Arc::new(Float32Array::from(vec![
+            negative_nan,
+            negative_nan,
+            negative_nan,
+            1.0,
+            1.0,
+            positive_nan,
+            positive_nan,
+            positive_nan,
+            positive_nan,
+            -2.0,
+        ]));
+        assert_eq!(
+            write_column_to_bytes(ree),
+            write_column_to_bytes(flat),
+            "REE floating-point NaN counts must follow logical run multiplicity"
+        );
+    }
+
+    // Float16 REE values use a two-byte FIXED_LEN_BYTE_ARRAY representation.
+    #[test]
+    fn ree_float16() {
+        // run_ends [2, 4, 5] → [1.5, 1.5, null, null, -2.0]
+        let ree: ArrayRef = Arc::new(
+            RunArray::try_new(
+                &Int32Array::from(vec![2, 4, 5]),
+                &Float16Array::from(vec![
+                    Some(f16::from_f32(1.5)),
+                    None,
+                    Some(f16::from_f32(-2.0)),
+                ]),
+            )
+            .unwrap(),
+        );
+        let flat: ArrayRef = Arc::new(Float16Array::from(vec![
+            Some(f16::from_f32(1.5)),
+            Some(f16::from_f32(1.5)),
+            None,
+            None,
+            Some(f16::from_f32(-2.0)),
+        ]));
+        ree_write_read_roundtrip(ree, flat);
+    }
+
+    // Float16 REE and dense inputs containing NaN and signed zero produce
+    // byte-identical output, covering both encoded values and statistics.
+    #[test]
+    fn ree_float16_nan_and_signed_zero() {
+        let neg_zero = f16::from_f32(-0.0);
+        let pos_zero = f16::from_f32(0.0);
+        let values: ArrayRef = Arc::new(Float16Array::from(vec![
+            Some(neg_zero),
+            Some(f16::NAN),
+            Some(pos_zero),
+            Some(f16::from_f32(3.0)),
+        ]));
+        let dictionary =
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0, 1, 2, 3]), values)
+                .unwrap();
+        let ree: ArrayRef =
+            Arc::new(RunArray::try_new(&Int32Array::from(vec![2, 4, 6, 8]), &dictionary).unwrap());
+        let flat: ArrayRef = Arc::new(Float16Array::from(vec![
+            Some(neg_zero),
+            Some(neg_zero),
+            Some(f16::NAN),
+            Some(f16::NAN),
+            Some(pos_zero),
+            Some(pos_zero),
+            Some(f16::from_f32(3.0)),
+            Some(f16::from_f32(3.0)),
+        ]));
+        assert_eq!(
+            write_column_without_arrow_metadata(ree, None),
+            write_column_without_arrow_metadata(flat, None),
+            "REE Float16 output (values and NaN/±0 statistics) must match dense"
+        );
+    }
+
+    // Decimal32, Decimal64, and Decimal128 REE inputs produce the same FLBA
+    // values and statistics as their dense equivalents.
+    #[test]
+    fn ree_decimals() {
+        fn write_as_flba(array: ArrayRef, precision: u8, width: usize) -> Bytes {
+            use crate::file::writer::SerializedFileWriter;
+            use crate::schema::parser::parse_message_type;
+
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "col",
+                array.data_type().clone(),
+                true,
+            )]));
+            let parquet = Arc::new(
+                parse_message_type(&format!(
+                    "message schema {{ OPTIONAL FIXED_LEN_BYTE_ARRAY ({width}) col (DECIMAL ({precision}, 2)); }}"
+                ))
+                .unwrap(),
+            );
+            let props = Arc::new(WriterProperties::default());
+            let mut out = Vec::new();
+            let mut writer = SerializedFileWriter::new(&mut out, parquet, props.clone()).unwrap();
+            let mut columns = ArrowRowGroupWriterFactory::new(&writer, schema.clone())
+                .create_column_writers(0)
+                .unwrap();
+            for leaf in compute_leaves(schema.field(0), &array).unwrap() {
+                columns[0].write(&leaf).unwrap();
+            }
+            let chunk = columns.pop().unwrap().close().unwrap();
+            let mut row_group = writer.next_row_group().unwrap();
+            chunk.append_to_row_group(&mut row_group).unwrap();
+            row_group.close().unwrap();
+            writer.close().unwrap();
+            Bytes::from(out)
+        }
+
+        macro_rules! check {
+            ($array:ty, $value:ty, $precision:expr, $width:expr) => {{
+                let values = <$array>::from(vec![
+                    Some(<$value>::from(100_i8)),
+                    None,
+                    Some(<$value>::from(-55_i8)),
+                ])
+                .with_precision_and_scale($precision, 2)
+                .unwrap();
+                let ree: ArrayRef =
+                    Arc::new(RunArray::try_new(&Int32Array::from(vec![2, 4, 5]), &values).unwrap());
+                let flat = ree_dense_equivalent(&ree);
+                let ree_bytes = write_as_flba(ree, $precision, $width);
+                let flat_bytes = write_as_flba(flat.clone(), $precision, $width);
+                assert_eq!(ree_bytes, flat_bytes);
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "col",
+                    flat.data_type().clone(),
+                    true,
+                )]));
+                assert_eq!(
+                    read_column_with_schema(ree_bytes, schema).as_ref(),
+                    flat.as_ref()
+                );
+            }};
+        }
+
+        check!(Decimal32Array, i32, 9, 4);
+        check!(Decimal64Array, i64, 18, 8);
+        check!(Decimal128Array, i128, 38, 16);
+    }
+
+    // Dictionary-disabled numeric and byte runs emit logical repetitions
+    // through their explicitly selected delta encoders.
+    #[test]
+    fn ree_delta_encodings() {
+        fn check(ree: ArrayRef, expected: ArrayRef, encoding: Encoding) {
+            let props = WriterProperties::builder()
+                .set_writer_version(WriterVersion::PARQUET_2_0)
+                .set_dictionary_enabled(false)
+                .set_encoding(encoding)
+                .build();
+            assert_eq!(
+                roundtrip_array(ree.clone(), Some(props.clone())).as_ref(),
+                expected.as_ref()
+            );
+            let pages = data_pages_for_column(ree, props);
+            assert!(!pages.is_empty());
+            assert!(pages.iter().all(|page| page.2 == encoding));
+        }
+
+        check(
+            Arc::new(
+                Int32RunArray::try_new(
+                    &Int32Array::from(vec![3, 5, 8]),
+                    &Int32Array::from(vec![10, 20, 30]),
+                )
+                .unwrap(),
+            ),
+            Arc::new(Int32Array::from(vec![10, 10, 10, 20, 20, 30, 30, 30])),
+            Encoding::DELTA_BINARY_PACKED,
+        );
+        check(
+            Arc::new(
+                RunArray::try_new(
+                    &Int32Array::from(vec![2, 4, 5]),
+                    &BinaryArray::from_iter_values([
+                        b"aa".as_ref(),
+                        b"bbb".as_ref(),
+                        b"c".as_ref(),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            Arc::new(BinaryArray::from_iter_values([
+                b"aa".as_ref(),
+                b"aa".as_ref(),
+                b"bbb".as_ref(),
+                b"bbb".as_ref(),
+                b"c".as_ref(),
+            ])),
+            Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        );
+    }
+
+    // A FixedSizeList whose values child is REE. This is distinct from
+    // `ree_fixed_size_list`, where the REE values are fixed-size lists.
+    #[test]
+    fn ree_under_fixed_size_list() {
+        // REE child of 6 rows: (1)×3, (2)×2, (null)×1 → 3 fixed-size-list rows of 2.
+        let run_ends = Int32Array::from(vec![3, 5, 6]);
+        let values = Int32Array::from(vec![Some(1), Some(2), None]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+        let field = Arc::new(Field::new_list_field(ree.data_type().clone(), true));
+        let fsl: ArrayRef = Arc::new(FixedSizeListArray::new(field, 2, ree.clone(), None));
+
+        let dense_child = ree_dense_equivalent(&ree);
+        let dense_field = Arc::new(Field::new_list_field(dense_child.data_type().clone(), true));
+        let dense_fsl: ArrayRef =
+            Arc::new(FixedSizeListArray::new(dense_field, 2, dense_child, None));
+
+        for (offset, len) in [(0, 3), (1, 2), (2, 1)] {
+            let ree_col = fsl.slice(offset, len);
+            let dense_col = dense_fsl.slice(offset, len);
+            let ree_output = roundtrip_column(
+                Field::new("c", ree_col.data_type().clone(), true),
+                ree_col,
+                None,
+            );
+            let dense_output = roundtrip_column(
+                Field::new("c", dense_col.data_type().clone(), true),
+                dense_col,
+                None,
+            );
+            assert_eq!(ree_output.as_ref(), dense_output.as_ref());
+        }
+    }
+
+    // A Map whose value child is run-end encoded: the cursor follows the leaf
+    // through the entries struct and repeated map with its distinct levels.
+    #[test]
+    fn ree_under_map() {
+        let build = |values: ArrayRef| -> ArrayRef {
+            let keys = StringArray::from(vec!["a", "b", "c", "d"]);
+            let key_field = Arc::new(Field::new("keys", DataType::Utf8, false));
+            let value_field = Arc::new(Field::new("values", values.data_type().clone(), true));
+            let entries = StructArray::new(
+                Fields::from(vec![key_field, value_field]),
+                vec![Arc::new(keys) as ArrayRef, values],
+                None,
+            );
+            let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+            let offsets = OffsetBuffer::new(vec![0i32, 2, 4].into());
+            Arc::new(MapArray::new(entries_field, offsets, entries, None, false))
+        };
+
+        // Two map rows over a REE value child: (1)×2, (2)×2 → values [1,1,2,2].
+        let run_ends = Int32Array::from(vec![2, 4]);
+        let values = Int32Array::from(vec![1, 2]);
+        let ree: ArrayRef = Arc::new(Int32RunArray::try_new(&run_ends, &values).unwrap());
+        let map = build(ree.clone());
+        let dense_map = build(ree_dense_equivalent(&ree));
+
+        let DataType::Map(entries, _) = map.data_type() else {
+            unreachable!()
+        };
+        let mismatched = Field::new("c", DataType::Map(entries.clone(), true), true);
+        assert!(compute_leaves(&mismatched, &map).is_err());
+
+        let ree_output =
+            roundtrip_column(Field::new("c", map.data_type().clone(), true), map, None);
+        let dense_output = roundtrip_column(
+            Field::new("c", dense_map.data_type().clone(), true),
+            dense_map,
+            None,
+        );
+        assert_eq!(ree_output.as_ref(), dense_output.as_ref());
+    }
+
+    #[test]
     fn ree_sliced() {
-        // A sliced (non-zero offset) REE array: verify that get_physical_index
-        // correctly accounts for the logical offset when expanding.
+        // A sliced (non-zero offset) REE array verifies that physical run
+        // selection correctly accounts for the logical offset.
         // Full array: run_ends [3, 5, 7] → [a,a,a, b,b, c,c]
         // After slice(2, 5) the logical view is [a, b, b, c, c].
         let full: ArrayRef = Arc::new(
@@ -6745,6 +8850,31 @@ mod tests {
         let sliced = full.slice(2, 5);
         let flat: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "b", "c", "c"]));
         ree_write_read_roundtrip(sliced, flat);
+    }
+
+    #[test]
+    fn ree_nested_run_end_wrappers() {
+        let inner: ArrayRef = Arc::new(
+            Int32RunArray::try_new(
+                &Int32Array::from(vec![1, 2]),
+                &Int32Array::from(vec![Some(7), None]),
+            )
+            .unwrap(),
+        );
+        let outer: ArrayRef = Arc::new(
+            Int32RunArray::try_new(&Int32Array::from(vec![3, 7]), inner.as_ref()).unwrap(),
+        );
+        let flat: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(7),
+            Some(7),
+            Some(7),
+            None,
+            None,
+            None,
+            None,
+        ]));
+        ree_write_read_roundtrip(outer.clone(), flat.clone());
+        ree_write_read_roundtrip(outer.slice(2, 4), flat.slice(2, 4));
     }
 
     #[test]
@@ -6797,6 +8927,51 @@ mod tests {
             crate::basic::Type::INT32
         );
         assert_eq!(parquet_schema.column(1).path().string(), "row.b");
+
+        let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(buf), 1024).unwrap();
+        let actual = reader.next().unwrap().unwrap();
+        let row = actual.column(0).as_struct();
+        assert_eq!(
+            row.column(0).as_string::<i32>(),
+            &StringArray::from(vec![
+                Some("foo"),
+                Some("foo"),
+                None,
+                Some("bar"),
+                Some("bar")
+            ])
+        );
+        assert_eq!(
+            row.column(1).as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(1), Some(1), None, Some(2), Some(2)])
+        );
+    }
+    #[test]
+    fn arrow_writer_rejects_null_dictionary_key_for_required_column() {
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "dictionary",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
+                true,
+            )])),
+            vec![Arc::new(DictionaryArray::<Int32Type>::new(
+                Int32Array::new(
+                    vec![0, 99, 1].into(),
+                    Some(NullBuffer::from(vec![true, false, true])),
+                ),
+                values,
+            ))],
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dictionary",
+            DataType::Int32,
+            false,
+        )]));
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        let err = writer.write(&batch).unwrap_err();
+        assert!(err.to_string().contains("Found null"), "{err}");
     }
 
     /// Dictionaries whose values are `Utf8View` or `BinaryView` round-trip
@@ -6881,6 +9056,248 @@ mod tests {
         );
     }
 
+    fn check_required_dict_null_value(values: ArrayRef) {
+        let value_type = values.data_type().clone();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            value_type.clone(),
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type)),
+            true,
+        )]));
+        let keys = Int32Array::from(vec![0, 1, 2]);
+        let array = DictionaryArray::<Int32Type>::new(keys, values);
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
+
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        let err = writer.write(&batch).unwrap_err();
+        assert!(err.to_string().contains("Found null"), "{err}");
+    }
+
+    #[test]
+    fn arrow_writer_rejects_null_dictionary_value_for_required_column() {
+        check_required_dict_null_value(Arc::new(Int32Array::from(vec![Some(10), None, Some(20)])));
+
+        let mut fixed = FixedSizeBinaryBuilder::new(2);
+        fixed.append_value([1, 2]).unwrap();
+        fixed.append_null();
+        fixed.append_value([3, 4]).unwrap();
+        check_required_dict_null_value(Arc::new(fixed.finish()));
+    }
+
+    /// Primitive dictionaries round-trip across all supported key types.
+    #[test]
+    fn arrow_writer_native_primitive_dictionary_key_types() {
+        fn inner<K>()
+        where
+            K: ArrowDictionaryKeyType,
+            K::Native: TryFrom<u8>,
+            <<K as arrow_array::ArrowPrimitiveType>::Native as TryFrom<u8>>::Error: std::fmt::Debug,
+        {
+            let keys = PrimitiveArray::<K>::from_iter_values(
+                [0u8, 0, 1, 2, 1]
+                    .into_iter()
+                    .map(|i| K::Native::try_from(i).unwrap()),
+            );
+            let values = Int32Array::from(vec![10, 20, 30]);
+            let array: ArrayRef = Arc::new(DictionaryArray::<K>::new(keys, Arc::new(values)));
+            RoundTripTest::new(array.clone()).run();
+
+            let run_ends = Int32Array::from(vec![2, 4, 6, 8, 10]);
+            let ree: ArrayRef =
+                Arc::new(Int32RunArray::try_new(&run_ends, array.as_ref()).unwrap());
+            assert_ree_roundtrip_matches_dense(ree, None);
+
+            let item = Arc::new(Field::new_list_field(array.data_type().clone(), false));
+            let list = ListArray::new(item, OffsetBuffer::from_lengths([2, 0, 3]), array, None);
+            RoundTripTest::new(Arc::new(list)).run();
+        }
+        inner::<UInt8Type>();
+        inner::<UInt16Type>();
+        inner::<UInt32Type>();
+        inner::<UInt64Type>();
+        inner::<Int8Type>();
+        inner::<Int16Type>();
+        inner::<Int32Type>();
+        inner::<Int64Type>();
+    }
+
+    /// Binary and LargeBinary dictionaries round-trip.
+    #[test]
+    fn arrow_writer_low_cardinality_binary_dictionary() {
+        let dict_vals: Vec<&[u8]> = vec![b"alpha".as_ref(), b"beta", b"gamma", b"delta"];
+        let keys = Int32Array::from_iter_values((0..64).map(|i| i % 4));
+        let bin = DictionaryArray::<Int32Type>::new(
+            keys.clone(),
+            Arc::new(BinaryArray::from_iter_values(dict_vals.clone())),
+        );
+        RoundTripTest::new(Arc::new(bin)).run();
+        let lbin = DictionaryArray::<Int32Type>::new(
+            keys,
+            Arc::new(LargeBinaryArray::from_iter_values(dict_vals)),
+        );
+        RoundTripTest::new(Arc::new(lbin)).run();
+    }
+
+    /// Plain Decimal32 and Decimal64 columns round-trip.
+    #[test]
+    fn arrow_writer_decimal32_decimal64_plain_column() {
+        let d32 = Decimal32Array::from(vec![Some(12345), Some(56789), Some(34567)])
+            .with_precision_and_scale(9, 2)
+            .unwrap();
+        RoundTripTest::new(Arc::new(d32)).with_nullable(false).run();
+        let d32n = Decimal32Array::from(vec![Some(12345), None, Some(34567)])
+            .with_precision_and_scale(9, 2)
+            .unwrap();
+        RoundTripTest::new(Arc::new(d32n)).run();
+        let d64 = Decimal64Array::from(vec![Some(12345i64), Some(56789), Some(34567)])
+            .with_precision_and_scale(12, 2)
+            .unwrap();
+        RoundTripTest::new(Arc::new(d64)).with_nullable(false).run();
+        let d64n = Decimal64Array::from(vec![Some(12345i64), None, Some(34567)])
+            .with_precision_and_scale(12, 2)
+            .unwrap();
+        RoundTripTest::new(Arc::new(d64n)).run();
+    }
+
+    /// Dictionary columns round-trip with bloom filters enabled.
+    #[test]
+    fn arrow_writer_low_cardinality_dictionary_with_bloom_filter() {
+        let keys = Int32Array::from_iter_values((0..64).map(|i| i % 4));
+        let values = StringArray::from(vec!["alpha", "beta", "gamma", "delta"]);
+        let dict = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+        RoundTripTest::new(Arc::new(dict))
+            .with_bloom_filter(true)
+            .run();
+    }
+
+    #[test]
+    fn arrow_writer_non_byte_dictionary_physical_types() {
+        fn roundtrip_with_native_schema(
+            values: ArrayRef,
+            native_type: DataType,
+            expected: ArrayRef,
+        ) {
+            let writer_schema = Arc::new(Schema::new(vec![Field::new("col", native_type, true)]));
+            let batch_schema = Arc::new(Schema::new(vec![Field::new(
+                "col",
+                values.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(batch_schema, vec![values]).unwrap();
+
+            let mut file = vec![];
+            let mut writer = ArrowWriter::try_new(&mut file, writer_schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+
+            let mut reader = ParquetRecordBatchReader::try_new(Bytes::from(file), 1024).unwrap();
+            let actual = reader.next().unwrap().unwrap();
+            let expected = RecordBatch::try_new(writer_schema, vec![expected]).unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        let keys = UInt8Array::from(vec![Some(0), Some(1), None, Some(0), Some(1)]);
+
+        let bool_values = BooleanArray::from(vec![Some(true), Some(false), None]);
+        let array = DictionaryArray::new(
+            UInt8Array::from(vec![Some(0), Some(1), None, Some(2), Some(0)]),
+            Arc::new(bool_values),
+        );
+        roundtrip_with_native_schema(
+            Arc::new(array),
+            DataType::Boolean,
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                None,
+                None,
+                Some(true),
+            ])),
+        );
+
+        let float_values = Float32Array::from(vec![1.25, -2.5]);
+        let array = DictionaryArray::new(keys.clone(), Arc::new(float_values));
+        roundtrip_with_native_schema(
+            Arc::new(array),
+            DataType::Float32,
+            Arc::new(Float32Array::from(vec![
+                Some(1.25),
+                Some(-2.5),
+                None,
+                Some(1.25),
+                Some(-2.5),
+            ])),
+        );
+
+        let double_values = Float64Array::from(vec![1.25, -2.5]);
+        let array = DictionaryArray::new(keys.clone(), Arc::new(double_values));
+        roundtrip_with_native_schema(
+            Arc::new(array),
+            DataType::Float64,
+            Arc::new(Float64Array::from(vec![
+                Some(1.25),
+                Some(-2.5),
+                None,
+                Some(1.25),
+                Some(-2.5),
+            ])),
+        );
+
+        let int64_values = Int64Array::from(vec![1234567890123, -987654321098]);
+        let array = DictionaryArray::new(keys, Arc::new(int64_values));
+        roundtrip_with_native_schema(
+            Arc::new(array),
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![
+                Some(1234567890123),
+                Some(-987654321098),
+                None,
+                Some(1234567890123),
+                Some(-987654321098),
+            ])),
+        );
+
+        let keys = UInt8Array::from(vec![Some(0), None, Some(1), Some(2), Some(1)]);
+        let decimal = Decimal128Array::from(vec![12345, 56789, 34567])
+            .with_precision_and_scale(30, 2)
+            .unwrap();
+        roundtrip_with_native_schema(
+            Arc::new(DictionaryArray::new(keys.clone(), Arc::new(decimal))),
+            DataType::Decimal128(30, 2),
+            Arc::new(
+                Decimal128Array::from(vec![
+                    Some(12345),
+                    None,
+                    Some(56789),
+                    Some(34567),
+                    Some(56789),
+                ])
+                .with_precision_and_scale(30, 2)
+                .unwrap(),
+            ),
+        );
+
+        let values = [1.25, -2.5, 4.0].map(f16::from_f32);
+        roundtrip_with_native_schema(
+            Arc::new(DictionaryArray::new(
+                keys,
+                Arc::new(Float16Array::from(values.to_vec())),
+            )),
+            DataType::Float16,
+            Arc::new(Float16Array::from(vec![
+                Some(values[0]),
+                None,
+                Some(values[1]),
+                Some(values[2]),
+                Some(values[1]),
+            ])),
+        );
+    }
+
     #[test]
     fn arrow_writer_primitive_dictionary_with_cdc() {
         #[expect(deprecated)]
@@ -6917,114 +9334,5 @@ mod tests {
             .build();
 
         roundtrip_opts(&batch, props);
-    }
-
-    #[test]
-    fn arrow_writer_rejects_null_dictionary_key_for_required_column() {
-        let values: ArrayRef = Arc::new(Int32Array::from(vec![10, 20]));
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "dictionary",
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
-                true,
-            )])),
-            vec![Arc::new(DictionaryArray::<Int32Type>::new(
-                Int32Array::new(
-                    vec![0, 99, 1].into(),
-                    Some(NullBuffer::from(vec![true, false, true])),
-                ),
-                values,
-            ))],
-        )
-        .unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "dictionary",
-            DataType::Int32,
-            false,
-        )]));
-        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
-        let err = writer.write(&batch).unwrap_err();
-        assert!(err.to_string().contains("Found null"), "{err}");
-    }
-
-    fn check_required_dict_null_value(values: ArrayRef) {
-        let value_type = values.data_type().clone();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "d",
-            value_type.clone(),
-            false,
-        )]));
-        let batch_schema = Arc::new(Schema::new(vec![Field::new(
-            "d",
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type)),
-            true,
-        )]));
-        let keys = Int32Array::from(vec![0, 1, 2]);
-        let array = DictionaryArray::<Int32Type>::new(keys, values);
-        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(array)]).unwrap();
-
-        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
-        let err = writer.write(&batch).unwrap_err();
-        assert!(err.to_string().contains("Found null"), "{err}");
-    }
-
-    /// Plain Decimal32 and Decimal64 columns round-trip.
-    #[test]
-    fn arrow_writer_decimal32_decimal64_plain_column() {
-        let d32 = Decimal32Array::from(vec![Some(12345), Some(56789), Some(34567)])
-            .with_precision_and_scale(9, 2)
-            .unwrap();
-        RoundTripTest::new(Arc::new(d32)).with_nullable(false).run();
-        let d32n = Decimal32Array::from(vec![Some(12345), None, Some(34567)])
-            .with_precision_and_scale(9, 2)
-            .unwrap();
-        RoundTripTest::new(Arc::new(d32n)).run();
-        let d64 = Decimal64Array::from(vec![Some(12345i64), Some(56789), Some(34567)])
-            .with_precision_and_scale(12, 2)
-            .unwrap();
-        RoundTripTest::new(Arc::new(d64)).with_nullable(false).run();
-        let d64n = Decimal64Array::from(vec![Some(12345i64), None, Some(34567)])
-            .with_precision_and_scale(12, 2)
-            .unwrap();
-        RoundTripTest::new(Arc::new(d64n)).run();
-    }
-
-    /// Binary and LargeBinary dictionaries round-trip.
-    #[test]
-    fn arrow_writer_low_cardinality_binary_dictionary() {
-        let dict_vals: Vec<&[u8]> = vec![b"alpha".as_ref(), b"beta", b"gamma", b"delta"];
-        let keys = Int32Array::from_iter_values((0..64).map(|i| i % 4));
-        let bin = DictionaryArray::<Int32Type>::new(
-            keys.clone(),
-            Arc::new(BinaryArray::from_iter_values(dict_vals.clone())),
-        );
-        RoundTripTest::new(Arc::new(bin)).run();
-        let lbin = DictionaryArray::<Int32Type>::new(
-            keys,
-            Arc::new(LargeBinaryArray::from_iter_values(dict_vals)),
-        );
-        RoundTripTest::new(Arc::new(lbin)).run();
-    }
-
-    #[test]
-    fn arrow_writer_rejects_null_dictionary_value_for_required_column() {
-        check_required_dict_null_value(Arc::new(Int32Array::from(vec![Some(10), None, Some(20)])));
-
-        let mut fixed = FixedSizeBinaryBuilder::new(2);
-        fixed.append_value([1, 2]).unwrap();
-        fixed.append_null();
-        fixed.append_value([3, 4]).unwrap();
-        check_required_dict_null_value(Arc::new(fixed.finish()));
-    }
-
-    /// Dictionary columns round-trip with bloom filters enabled.
-    #[test]
-    fn arrow_writer_low_cardinality_dictionary_with_bloom_filter() {
-        let keys = Int32Array::from_iter_values((0..64).map(|i| i % 4));
-        let values = StringArray::from(vec!["alpha", "beta", "gamma", "delta"]);
-        let dict = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
-        RoundTripTest::new(Arc::new(dict))
-            .with_bloom_filter(true)
-            .run();
     }
 }

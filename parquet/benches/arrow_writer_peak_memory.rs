@@ -777,8 +777,8 @@ fn bench_cell<M: Measurement>(
 
 /// Run-end-encoded column whose run VALUES are a low-cardinality
 /// `Dictionary<Int32, Utf8>` (run length 8 -> ~size/8 runs, 16 distinct dict
-/// entries). Exercises the REE-of-dictionary path: native adoption vs the dense
-/// `take` expansion it replaced (which materializes a full `size`-row array).
+/// entries). Exercises the REE-of-dictionary path with many logical rows but
+/// only `size / 8` physical runs.
 fn create_ree_of_dict_bench_batch(size: usize) -> RecordBatch {
     let run_len = 8usize;
     let num_runs = size / run_len;
@@ -797,7 +797,7 @@ fn create_ree_of_dict_bench_batch(size: usize) -> RecordBatch {
 }
 
 /// `RunArray<Int32, Dictionary<Int32, Int64>>` — a sized numeric dictionary run
-/// column, exercising the shallow-decode path against the dense expand.
+/// column, exercising shallow dictionary decoding at run granularity.
 fn create_ree_of_numeric_dict_bench_batch(size: usize) -> RecordBatch {
     let run_len = 8usize;
     let num_runs = size / run_len;
@@ -817,7 +817,7 @@ fn create_ree_of_numeric_dict_bench_batch(size: usize) -> RecordBatch {
 
 /// `RunArray<Int32, Struct<{tag: Dictionary<Int32,Utf8>, val: Int64}>>` — a
 /// run-encoded record with a rep-free dictionary field, exercising the fan-out
-/// shallow-decode path against the dense expand it replaces.
+/// shallow-decode path at run granularity.
 fn create_ree_struct_of_dict_bench_batch(size: usize) -> RecordBatch {
     let run_len = 8usize;
     let num_runs = size / run_len;
@@ -863,7 +863,6 @@ macro_rules! lazy_batches {
 
 fn create_batches() -> Vec<BatchBenchmark> {
     lazy_batches![
-        // Numeric primitives — the canonical dense-`Vec<T>` materialization.
         (
             "primitive_non_null",
             create_primitive_bench_batch_non_null(BATCH_SIZE, 0.0, 0.75).unwrap(),
@@ -876,12 +875,10 @@ fn create_batches() -> Vec<BatchBenchmark> {
             "primitive_sparse_99pct_null",
             create_primitive_bench_batch(BATCH_SIZE, 0.99, 0.75).unwrap(),
         ),
-        // Boolean — packed-bit path.
         (
             "bool_non_null",
             create_bool_bench_batch_non_null(BATCH_SIZE, 0.25, 0.75).unwrap(),
         ),
-        // Byte arrays — the dense-`Vec<ByteArray>` materialization.
         (
             "string_non_null",
             create_string_bench_batch_non_null(BATCH_SIZE, 0.0, 0.75).unwrap(),
@@ -894,7 +891,6 @@ fn create_batches() -> Vec<BatchBenchmark> {
             "byte_array_sparse_99pct_null",
             create_byte_array_sparse_bench_batch(BATCH_SIZE, 0.99).unwrap(),
         ),
-        // Fixed-length byte arrays — raw + converted (decimal) FLBA paths.
         (
             "fixed_size_binary_non_null",
             create_fixed_size_binary_bench_batch(BATCH_SIZE, 16, 0.0).unwrap(),
@@ -911,7 +907,6 @@ fn create_batches() -> Vec<BatchBenchmark> {
             "decimal128_sparse",
             create_decimal128_bench_batch(BATCH_SIZE, 0.25).unwrap(),
         ),
-        // Dictionaries — native dictionary adoption path.
         (
             "int64_dictionary",
             create_int64_dictionary_bench_batch(BATCH_SIZE, 0.25, 0.75).unwrap(),
@@ -928,7 +923,6 @@ fn create_batches() -> Vec<BatchBenchmark> {
             "string_dictionary_1pct_cardinality",
             create_string_dictionary_bench_batch_1pct_cardinality(BATCH_SIZE, 0.25).unwrap(),
         ),
-        // Run-end-encoded columns with long runs and few distinct values.
         (
             "decimal128_dictionary",
             create_decimal128_dictionary_bench_batch(BATCH_SIZE, 0.25, 0.75).unwrap(),
@@ -982,9 +976,6 @@ fn create_batches() -> Vec<BatchBenchmark> {
             "ree_struct_of_dict",
             create_ree_struct_of_dict_bench_batch(BATCH_SIZE),
         ),
-        // 99%-null REE sparse columns: long null runs with occasional non-null
-        // bursts. Exercises definition-level derivation, value selection from
-        // runs, and interning of non-null run values.
         (
             "int32_ree_99pct_null",
             create_run_end_encoded_bench_batch(DataType::Int32, BATCH_SIZE, 256, |n| {
@@ -1001,8 +992,6 @@ fn create_batches() -> Vec<BatchBenchmark> {
                 })))
             }),
         ),
-        // Non-leaf run values: peak memory is the point — the native paths
-        // must not `take`-materialize the dense logical array.
         (
             "struct_ree",
             create_run_end_encoded_bench_batch(DataType::Int32, BATCH_SIZE, 256, |n| {
@@ -1015,8 +1004,6 @@ fn create_batches() -> Vec<BatchBenchmark> {
                 make_ree_list_values(n)
             }),
         ),
-        // Lists over run-end-encoded children (the fused list-of-runs node);
-        // peak memory is the point of the native paths.
         (
             "list_of_int32_ree",
             create_list_of_int32_ree_batch(BATCH_SIZE),
