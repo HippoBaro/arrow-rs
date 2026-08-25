@@ -48,6 +48,21 @@ pub(super) enum BoolBatchSelection<'a> {
     },
 }
 
+#[cfg(feature = "arrow")]
+#[inline]
+fn put_repeated_bit(bit_writer: &mut BitWriter, bit: bool, count: usize) {
+    let word = if bit { u64::MAX } else { 0 };
+    let mut remaining = count;
+    while remaining >= 64 {
+        bit_writer.put_value(word, 64);
+        remaining -= 64;
+    }
+    if remaining != 0 {
+        let tail = if bit { (1_u64 << remaining) - 1 } else { 0 };
+        bit_writer.put_value(tail, remaining);
+    }
+}
+
 /// Borrowed packed boolean values.
 ///
 /// Bits are addressed in the same least-significant-bit-first order used by
@@ -92,7 +107,7 @@ impl<'a> BoolBatch<'a> {
                 _ => BoolBatchSelection::Physical {
                     bit_offset,
                     selection,
-                    scalar: selection.has_dictionary_mapping(),
+                    scalar: selection.has_dictionary_mapping() && !selection.is_grouped(),
                 },
             },
         };
@@ -151,6 +166,29 @@ impl<'a> BoolBatch<'a> {
         }
     }
 
+    /// Yield source-provided run groups. Run-end input can produce multi-bit
+    /// groups; every other selection emits one group per bit. Adjacent groups
+    /// may contain the same value because grouping follows storage, not value
+    /// equality.
+    #[inline]
+    pub(super) fn for_each_run_group(self, mut f: impl FnMut(bool, usize)) {
+        match self.selection {
+            #[cfg(feature = "arrow")]
+            BoolBatchSelection::Physical {
+                bit_offset,
+                selection,
+                ..
+            } if selection.is_grouped() => {
+                let bytes = self.bytes;
+                let _ = selection.try_for_each_index_group(|index, count| -> Result<(), ()> {
+                    f(get_bit(bytes, bit_offset + index), count);
+                    Ok(())
+                });
+            }
+            _ => self.for_each(|b| f(b, 1)),
+        }
+    }
+
     #[inline]
     fn put_indexed_packed(self, bit_writer: &mut BitWriter) {
         #[cfg(feature = "arrow")]
@@ -168,6 +206,10 @@ impl<'a> BoolBatch<'a> {
                     match span {
                         PhysicalValueSpan::Range { start, len } => {
                             bit_writer.put_bits(self.bytes, bit_offset + start, len);
+                        }
+                        PhysicalValueSpan::Repeat { index, count } => {
+                            let bit = get_bit(self.bytes, bit_offset + index);
+                            put_repeated_bit(bit_writer, bit, count);
                         }
                     }
                     Ok(())
@@ -225,6 +267,12 @@ impl<'a> BoolBatch<'a> {
                         PhysicalValueSpan::Range { start, len } => {
                             count += UnalignedBitChunk::new(self.bytes, bit_offset + start, len)
                                 .count_ones();
+                        }
+                        PhysicalValueSpan::Repeat {
+                            index,
+                            count: repeated,
+                        } => {
+                            count += repeated * get_bit(self.bytes, bit_offset + index) as usize;
                         }
                     }
                     Ok(())
@@ -306,7 +354,9 @@ impl BoolEncoder for RleValueEncoder<BoolType> {
             RleEncoder::new_from_buf(1, buffer)
         });
 
-        values.for_each(|b| rle_encoder.put(b as u64));
+        // Run-end input emits one O(1) put per selected run group; every other
+        // selection emits per-bit puts.
+        values.for_each_run_group(|b, n| rle_encoder.put_run(b as u64, n));
         Ok(())
     }
 }

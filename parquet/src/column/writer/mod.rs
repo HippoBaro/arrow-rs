@@ -34,7 +34,6 @@ use crate::basic::{
     PageType, Type,
 };
 use crate::column::page::{CompressedPage, Page, PageWriteSpec, PageWriter};
-use crate::column::writer::encoder::byte_array::ByteMinMaxOrder;
 use crate::column::writer::encoder::{
     ColumnChunkEncoder, ColumnWriterValue, TypedColumnChunkEncoder, count_within_budget,
 };
@@ -58,13 +57,18 @@ use crate::schema::types::{ColumnDescPtr, ColumnDescriptor};
 mod byte_budget_chunker;
 pub(crate) mod encoder;
 
+use encoder::byte_array::ByteMinMaxOrder;
+#[cfg(feature = "arrow")]
+pub(crate) use encoder::{ByteArrayBatch, ByteArraySink, ByteArraySource};
+
 use byte_budget_chunker::ByteBudgetChunker;
 
 /// Page value counts are serialized as signed Thrift `i32` fields.
 const MAX_DATA_PAGE_VALUE_COUNT: u32 = i32::MAX as u32;
 
-/// Checked page value-count increment: the page format cannot represent more
-/// than `i32::MAX` values in one data page.
+/// Validate a page-count increment and return it in the page metric's `u32`
+/// representation.
+#[inline]
 fn checked_page_value_increment(buffered: u32, additional: usize) -> Result<u32> {
     if additional > MAX_DATA_PAGE_VALUE_COUNT.saturating_sub(buffered) as usize {
         return Err(general_err!(
@@ -162,36 +166,34 @@ pub fn get_column_writer<'a>(
 ) -> ColumnWriter<'a> {
     match descr.physical_type() {
         Type::BOOLEAN => {
-            ColumnWriter::BoolColumnWriter(ColumnWriterImpl::new(descr, props, page_writer))
+            ColumnWriter::BoolColumnWriter(GenericColumnWriter::new(descr, props, page_writer))
         }
         Type::INT32 => {
-            ColumnWriter::Int32ColumnWriter(ColumnWriterImpl::new(descr, props, page_writer))
+            ColumnWriter::Int32ColumnWriter(GenericColumnWriter::new(descr, props, page_writer))
         }
         Type::INT64 => {
-            ColumnWriter::Int64ColumnWriter(ColumnWriterImpl::new(descr, props, page_writer))
+            ColumnWriter::Int64ColumnWriter(GenericColumnWriter::new(descr, props, page_writer))
         }
         Type::INT96 => {
-            ColumnWriter::Int96ColumnWriter(ColumnWriterImpl::new(descr, props, page_writer))
+            ColumnWriter::Int96ColumnWriter(GenericColumnWriter::new(descr, props, page_writer))
         }
         Type::FLOAT => {
-            ColumnWriter::FloatColumnWriter(ColumnWriterImpl::new(descr, props, page_writer))
+            ColumnWriter::FloatColumnWriter(GenericColumnWriter::new(descr, props, page_writer))
         }
         Type::DOUBLE => {
-            ColumnWriter::DoubleColumnWriter(ColumnWriterImpl::new(descr, props, page_writer))
+            ColumnWriter::DoubleColumnWriter(GenericColumnWriter::new(descr, props, page_writer))
         }
         Type::BYTE_ARRAY => {
-            ColumnWriter::ByteArrayColumnWriter(ColumnWriterImpl::new(descr, props, page_writer))
+            ColumnWriter::ByteArrayColumnWriter(GenericColumnWriter::new(descr, props, page_writer))
         }
         Type::FIXED_LEN_BYTE_ARRAY => ColumnWriter::FixedLenByteArrayColumnWriter(
-            ColumnWriterImpl::new(descr, props, page_writer),
+            GenericColumnWriter::new(descr, props, page_writer),
         ),
     }
 }
 
 /// Gets a typed column writer for the specific type `T`, by "up-casting" `col_writer` of
 /// non-generic type to a generic column writer type `ColumnWriterImpl`.
-///
-/// # Panics
 ///
 /// Panics if actual enum value for `col_writer` does not match the type `T`.
 pub fn get_typed_column_writer<T: DataType>(col_writer: ColumnWriter) -> ColumnWriterImpl<T> {
@@ -1248,19 +1250,8 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
         })
     }
 
-    /// Writes a chunk in `sub_batch_size`-level sub-batches, checking the
-    /// data page byte limit after each. This keeps the page size close to
-    /// `data_page_size_limit` instead of overshooting it by a whole chunk.
-    ///
-    /// For repeated/nested columns sub-batches step from one `rep == 0`
-    /// boundary to the next so a record never spans data pages, matching
-    /// the parquet format rule.
-    ///
-    /// Returns the total number of values consumed across all sub-batches.
-    ///
-    /// `#[inline(never)]` keeps this slow path — only reached for
-    /// variable-width columns whose values need page splitting — out of
-    /// the hot `write_batch_internal` loop.
+    /// Writes a chunk in byte-budgeted sub-batches, checking the data page byte
+    /// limit after each.
     #[inline(never)]
     fn write_granular_chunk<S>(
         &mut self,
@@ -2070,6 +2061,55 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
     }
 }
 
+impl<'a, D: DataType> GenericColumnWriter<'a, TypedColumnChunkEncoder<D>> {
+    /// Writes batch of values, definition levels and repetition levels.
+    /// Returns number of values processed (written).
+    ///
+    /// If definition and repetition levels are provided, write those levels and
+    /// select how many values to write. The returned value count may be smaller
+    /// than the provided value count.
+    ///
+    /// If only values are provided, all values are written and the values buffer
+    /// length is returned.
+    ///
+    /// Definition and/or repetition levels can be omitted, if values are
+    /// non-nullable and/or non-repeated.
+    pub fn write_batch(
+        &mut self,
+        values: &[D::T],
+        def_levels: Option<&[i16]>,
+        rep_levels: Option<&[i16]>,
+    ) -> Result<usize> {
+        self.write_batch_with_statistics(values, def_levels, rep_levels, None, None, None)
+    }
+
+    /// Writer may optionally provide pre-calculated statistics for use when computing
+    /// chunk-level statistics
+    ///
+    /// NB: [`WriterProperties::statistics_enabled`] must be set to [`EnabledStatistics::Chunk`]
+    /// for these statistics to take effect. [`EnabledStatistics::None`] ignores them,
+    /// and [`EnabledStatistics::Page`] computes chunk statistics from the computed page
+    /// statistics.
+    pub fn write_batch_with_statistics(
+        &mut self,
+        values: &[D::T],
+        def_levels: Option<&[i16]>,
+        rep_levels: Option<&[i16]>,
+        min: Option<&D::T>,
+        max: Option<&D::T>,
+        distinct_count: Option<u64>,
+    ) -> Result<usize> {
+        self.write_batch_internal(
+            values,
+            LevelDataRef::from(def_levels),
+            LevelDataRef::from(rep_levels),
+            min,
+            max,
+            distinct_count,
+        )
+    }
+}
+
 fn update_min<T: ParquetValueType>(descr: &ColumnDescriptor, val: &T, min: &mut Option<T>) {
     match min {
         None => *min = Some(val.clone()),
@@ -2206,55 +2246,6 @@ pub(crate) fn compare_greater_f16(a: &[u8], b: &[u8]) -> bool {
     let a = f16::from_le_bytes(a.try_into().unwrap());
     let b = f16::from_le_bytes(b.try_into().unwrap());
     a.total_cmp(&b) == Ordering::Greater
-}
-
-impl<'a, D: DataType> GenericColumnWriter<'a, TypedColumnChunkEncoder<D>> {
-    /// Writes batch of values, definition levels and repetition levels.
-    /// Returns number of values processed (written).
-    ///
-    /// If definition and repetition levels are provided, write those levels and
-    /// select how many values to write. The returned value count may be smaller
-    /// than the provided value count.
-    ///
-    /// If only values are provided, all values are written and the values buffer
-    /// length is returned.
-    ///
-    /// Definition and/or repetition levels can be omitted, if values are
-    /// non-nullable and/or non-repeated.
-    pub fn write_batch(
-        &mut self,
-        values: &[D::T],
-        def_levels: Option<&[i16]>,
-        rep_levels: Option<&[i16]>,
-    ) -> Result<usize> {
-        self.write_batch_with_statistics(values, def_levels, rep_levels, None, None, None)
-    }
-
-    /// Writer may optionally provide pre-calculated statistics for use when computing
-    /// chunk-level statistics
-    ///
-    /// NB: [`WriterProperties::statistics_enabled`] must be set to [`EnabledStatistics::Chunk`]
-    /// for these statistics to take effect. [`EnabledStatistics::None`] ignores them,
-    /// and [`EnabledStatistics::Page`] computes chunk statistics from the computed page
-    /// statistics.
-    pub fn write_batch_with_statistics(
-        &mut self,
-        values: &[D::T],
-        def_levels: Option<&[i16]>,
-        rep_levels: Option<&[i16]>,
-        min: Option<&D::T>,
-        max: Option<&D::T>,
-        distinct_count: Option<u64>,
-    ) -> Result<usize> {
-        self.write_batch_internal(
-            values,
-            LevelDataRef::from(def_levels),
-            LevelDataRef::from(rep_levels),
-            min,
-            max,
-            distinct_count,
-        )
-    }
 }
 
 /// Signed comparison of bytes arrays
@@ -2429,6 +2420,14 @@ mod tests {
                 "Parquet error: Repetition levels are required, because max repetition level = 1"
             );
         }
+
+        let error = writer
+            .write_batch(&[1, 2], None, Some(&[1, 0]))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Parquet error: Write must start at a record boundary, got non-zero repetition level of 1"
+        );
     }
 
     #[test]
@@ -3013,6 +3012,7 @@ mod tests {
         let props = Arc::new(
             WriterProperties::builder()
                 .set_write_page_header_statistics(true)
+                .set_data_page_row_count_limit(4)
                 .build(),
         );
         let mut writer = get_test_column_writer::<Int32Type>(page_writer, 0, 0, props);
@@ -3046,22 +3046,18 @@ mod tests {
         .unwrap();
 
         let pages = reader.collect::<Result<Vec<_>>>().unwrap();
-        assert_eq!(pages.len(), 2);
+        assert_eq!(pages.len(), 3);
 
         assert_eq!(pages[0].page_type(), PageType::DICTIONARY_PAGE);
         assert_eq!(pages[1].page_type(), PageType::DATA_PAGE);
-
-        let page_statistics = pages[1].statistics().unwrap();
-        assert_eq!(
-            page_statistics.min_bytes_opt().unwrap(),
-            1_i32.to_le_bytes()
-        );
-        assert_eq!(
-            page_statistics.max_bytes_opt().unwrap(),
-            7_i32.to_le_bytes()
-        );
-        assert_eq!(page_statistics.null_count_opt(), Some(0));
-        assert!(page_statistics.distinct_count_opt().is_none());
+        assert_eq!(pages[2].page_type(), PageType::DATA_PAGE);
+        for (page, min, max) in [(&pages[1], 1_i32, 4_i32), (&pages[2], 5_i32, 7_i32)] {
+            let stats = page.statistics().unwrap();
+            assert_eq!(stats.min_bytes_opt().unwrap(), min.to_le_bytes());
+            assert_eq!(stats.max_bytes_opt().unwrap(), max.to_le_bytes());
+            assert_eq!(stats.null_count_opt(), Some(0));
+            assert!(stats.distinct_count_opt().is_none());
+        }
     }
 
     #[test]
@@ -3782,11 +3778,10 @@ mod tests {
 
         let stats = statistics_roundtrip::<FloatType>(&values);
         if let Statistics::Float(stats) = stats {
-            // With IEEE 754 total order, min should be -NaN, max should be +NaN
-            // But since we filter out NaN values, min should be -Inf, max should be +Inf
+            // NaNs are counted but excluded from min/max when finite values exist.
             assert_eq!(stats.min_opt().unwrap(), &neg_inf);
             assert_eq!(stats.max_opt().unwrap(), &pos_inf);
-            assert_eq!(stats.nan_count_opt(), Some(2)); // neg_nan and pos_nan
+            assert_eq!(stats.nan_count_opt(), Some(2));
         } else {
             panic!("Expected float statistics");
         }
@@ -3818,7 +3813,7 @@ mod tests {
             );
             assert_eq!(stats.nan_count_opt(), Some(6));
         } else {
-            panic!("Expected float statistics");
+            panic!("Expected double statistics");
         }
     }
 
@@ -5854,7 +5849,6 @@ mod tests {
                 self.max_rep_level,
                 Arc::new(self.props),
             );
-
             writer
                 .write_batch_internal(
                     self.values,

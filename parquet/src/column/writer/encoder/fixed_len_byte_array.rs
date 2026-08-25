@@ -313,11 +313,103 @@ impl FixedLenByteArraySink<'_> {
             }),
         }
     }
+
+    #[inline(never)]
+    fn encode_run_groups(&mut self, values: &[&[u8]], counts: &[usize]) -> Result<()> {
+        for (&value, &count) in values.iter().zip(counts) {
+            if count == 0 {
+                continue;
+            }
+            self.observer.observe(value, count);
+            match &mut self.target {
+                FixedLenByteArraySinkTarget::Dictionary(dict) => {
+                    dict.put_value_bytes_run(value, count, || value.to_vec().into())?
+                }
+                FixedLenByteArraySinkTarget::Fallback(encoder) => {
+                    for _ in 0..count {
+                        encoder.append_fixed_len_value(value)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a reused physical source, or pre-observe it for fallback.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn try_consume_physical_source(
+        &mut self,
+        physical_len: usize,
+        indices: impl ValueProducer<usize>,
+        width: usize,
+        grouped: bool,
+        write_at: impl Fn(usize, &mut [u8]),
+    ) -> Result<bool> {
+        debug_assert!(width <= FIXED_LEN_BYTE_ARRAY_MAX_WIDTH);
+        // NaN counts follow logical multiplicity, so the unique-physical-value
+        // shortcut cannot be used for Float16 statistics.
+        if self.observer.collect_stats && self.observer.is_float16 {
+            return Ok(false);
+        }
+        let dictionary = matches!(self.target, FixedLenByteArraySinkTarget::Dictionary(_));
+        let observe = self.observer.collect_stats || self.observer.bloom.is_some();
+        if !dictionary && (!observe || physical_len > u64::BITS as usize) {
+            return Ok(false);
+        }
+        let mut observed = (physical_len <= u64::BITS as usize).then_some(0_u64);
+        let mut value = [0_u8; FIXED_LEN_BYTE_ARRAY_MAX_WIDTH];
+        let mut first = |index| {
+            observed.as_mut().is_none_or(|observed| {
+                let bit = 1_u64 << index;
+                let first = *observed & bit == 0;
+                *observed |= bit;
+                first
+            })
+        };
+        if !dictionary {
+            indices.try_for_each(|index| {
+                if first(index) {
+                    write_at(index, &mut value[..width]);
+                    self.observer.observe(&value[..width], 1);
+                }
+                Ok::<_, ParquetError>(())
+            })?;
+            self.observer.collect_stats = false;
+            self.observer.bloom = None;
+            return Ok(false);
+        }
+        let mut push = |index: usize, count: usize| {
+            let mut rendered = false;
+            if observe && first(index) {
+                write_at(index, &mut value[..width]);
+                rendered = true;
+                self.observer.observe(&value[..width], count);
+            }
+            let FixedLenByteArraySinkTarget::Dictionary(dict) = &mut self.target else {
+                unreachable!("physical dictionary source requires dictionary encoding")
+            };
+            let intern = |dictionary: &mut <FixedLenByteArray as DictionaryValue>::Storage| {
+                if !rendered {
+                    write_at(index, &mut value[..width]);
+                }
+                let bytes = &value[..width];
+                DictionaryStorage::intern_bytes(dictionary, bytes, || bytes.to_vec().into())
+            };
+            dict.put_arrow_dictionary(index, grouped.then_some(count), intern)
+        };
+        if grouped {
+            indices.for_each_run_group(&mut push)?;
+        } else {
+            indices.try_for_each(|index| push(index, 1))?;
+        }
+        Ok(true)
+    }
 }
 
 #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
 pub(crate) enum FixedLenByteArrayBatch<'a> {
     Packed(PackedFixedLenByteArrayBatch<'a>),
+    RunGroups(RunBatch<'a, &'a [u8]>),
 }
 
 impl<'batch> BatchSink<FixedLenByteArrayBatch<'batch>> for FixedLenByteArraySink<'_> {
@@ -325,6 +417,9 @@ impl<'batch> BatchSink<FixedLenByteArrayBatch<'batch>> for FixedLenByteArraySink
     fn push_batch(&mut self, values: FixedLenByteArrayBatch<'batch>) -> Result<()> {
         match values {
             FixedLenByteArrayBatch::Packed(values) => self.encode_packed(values),
+            FixedLenByteArrayBatch::RunGroups(values) => {
+                self.encode_run_groups(values.values, values.counts)
+            }
         }
     }
 }

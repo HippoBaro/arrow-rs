@@ -45,6 +45,19 @@ pub(super) enum FixedLenByteArrayStorage<'a> {
 }
 
 impl FixedLenByteArrayStorage<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Fixed(values) => values.len(),
+            Self::YearMonth(values) => values.len(),
+            Self::DayTime(values) => values.len(),
+            Self::Decimal32 { values, .. } => values.len(),
+            Self::Decimal64 { values, .. } => values.len(),
+            Self::Decimal128 { values, .. } => values.len(),
+            Self::Decimal256 { values, .. } => values.len(),
+            Self::Float16(values) => values.len(),
+        }
+    }
+
     fn width(self) -> usize {
         match self {
             Self::Fixed(values) => values.value_size(),
@@ -97,9 +110,28 @@ impl FixedLenByteArraySource for PhysicalFixedLenByteArraySource<'_> {
         self.1.len()
     }
 
+    fn is_grouped(&self) -> bool {
+        self.1.is_grouped()
+    }
+
     fn write_to(self, sink: &mut FixedLenByteArraySink<'_>, _: Option<usize>) -> Result<()> {
         let Self(storage, selection) = self;
-        if let FixedLenByteArrayStorage::Fixed(array) = storage {
+        if selection.should_cache_dictionary(storage.len())
+            && storage.width() <= FIXED_LEN_BYTE_ARRAY_MAX_WIDTH
+            && sink.try_consume_physical_source(
+                storage.len(),
+                selection,
+                storage.width(),
+                selection.is_grouped(),
+                move |index, dest| storage.write_at(index, dest),
+            )?
+        {
+            return Ok(());
+        }
+
+        if let FixedLenByteArrayStorage::Fixed(array) = storage
+            && !selection.is_grouped()
+        {
             let bytes = array.value_data();
             let width = array.value_size();
             let mut push = |start: usize, len: usize| {
@@ -115,9 +147,26 @@ impl FixedLenByteArraySource for PhysicalFixedLenByteArraySource<'_> {
             if selection.try_for_each_borrowable_range(|range| push(range.start, range.len()))? {
                 return Ok(());
             }
-            return sink.push_selected(map_values(selection, move |index| {
-                &bytes[index * width..(index + 1) * width]
-            }));
+        }
+
+        if let FixedLenByteArrayStorage::Fixed(array) = storage {
+            if !selection.is_grouped() {
+                let bytes = array.value_data();
+                let width = array.value_size();
+                return sink.push_selected(map_values(selection, move |index| {
+                    &bytes[index * width..(index + 1) * width]
+                }));
+            }
+            let values = map_values(selection, move |index| array.value(index));
+            return gather_run_groups_tiled::<FIXED_LEN_BYTE_ARRAY_BATCH_VALUES, _, _>(
+                values,
+                |values, counts| {
+                    sink.push_batch(FixedLenByteArrayBatch::RunGroups(RunBatch {
+                        values,
+                        counts,
+                    }))
+                },
+            );
         }
 
         write_computed_fixed_len_values(selection, sink, storage.width(), move |index, dest| {
@@ -202,6 +251,17 @@ fn write_computed_fixed_len_values<F>(
 where
     F: Fn(usize, &mut [u8]) + Copy,
 {
+    if selection.is_grouped() {
+        let mut buf = [0u8; FIXED_LEN_BYTE_ARRAY_MAX_WIDTH];
+        return selection.try_for_each_index_group(|index, count| {
+            write_at(index, &mut buf[..width]);
+            sink.push_batch(FixedLenByteArrayBatch::RunGroups(RunBatch {
+                values: &[&buf[..width]],
+                counts: &[count],
+            }))
+        });
+    }
+
     let mut packer = FixedLenByteArrayBatchPacker::new(sink, width);
     selection.try_for_each_index(|index| packer.push(|dest| write_at(index, dest)))?;
     packer.finish()
