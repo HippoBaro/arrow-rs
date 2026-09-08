@@ -565,7 +565,7 @@ impl<T: DataType> DeltaBitPackEncoderConversion<T> for DeltaBitPackEncoder<T> {
 /// Encoding for byte arrays to separate the length values and the data.
 /// The lengths are encoded using DELTA_BINARY_PACKED encoding, data is
 /// stored as raw bytes.
-pub struct DeltaLengthByteArrayEncoder<T: DataType> {
+struct DeltaLengthByteArrayEncoder<T: DataType> {
     // length encoder
     len_encoder: DeltaBitPackEncoder<Int32Type>,
     // byte array data
