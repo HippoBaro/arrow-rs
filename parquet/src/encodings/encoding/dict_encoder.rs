@@ -23,7 +23,7 @@ use bytes::Bytes;
 use crate::basic::{Encoding, Type};
 use crate::data_type::DataType;
 use crate::data_type::private::ParquetValueType;
-use crate::encodings::encoding::{Encoder, PlainEncoder};
+use crate::encodings::encoding::{Encoder, LegacyPlainEncoder};
 use crate::encodings::rle::RleEncoder;
 use crate::errors::Result;
 use crate::schema::types::ColumnDescPtr;
@@ -124,7 +124,7 @@ impl<T: DataType> DictEncoder<T> {
     /// Writes out the dictionary values with PLAIN encoding in a byte buffer, and return
     /// the result.
     pub fn write_dict(&self) -> Result<Bytes> {
-        let mut plain_encoder = PlainEncoder::<T>::new();
+        let mut plain_encoder = LegacyPlainEncoder::<T>::new();
         plain_encoder.put(&self.interner.storage().uniques)?;
         plain_encoder.flush_buffer()
     }
