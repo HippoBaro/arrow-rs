@@ -21,12 +21,16 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use parquet::basic::Encoding;
+use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
+use parquet::column::writer::{ColumnWriter, ColumnWriterImpl};
 use parquet::data_type::{
-    ByteArray, ByteArrayType, DataType, FixedLenByteArray, FixedLenByteArrayType,
+    BoolType, ByteArray, ByteArrayType, DataType, DoubleType, FixedLenByteArray,
+    FixedLenByteArrayType, FloatType, Int32Type, Int64Type, Int96, Int96Type,
 };
 use parquet::decoding::get_decoder;
-use parquet::encoding::get_encoder;
+use parquet::encoding::{DictEncoder, Encoder, PlainEncoder, get_encoder};
 use parquet::schema::types::{ColumnDescPtr, ColumnDescriptor, ColumnPath, Type as SchemaType};
 
 fn column_descriptor<T: DataType>(type_length: i32) -> ColumnDescPtr {
@@ -103,4 +107,131 @@ fn delta_byte_array_factory_fixed_length_roundtrip() {
         .map(|value| FixedLenByteArray::from(ByteArray::from(value)))
         .collect::<Vec<_>>();
     delta_byte_array_factory_pages::<FixedLenByteArrayType>(4, &[vec![], values.clone(), values]);
+}
+
+fn generic_plain_factory<T: DataType>(descriptor: &ColumnDescPtr, values: &[T::T]) -> Bytes {
+    let mut encoder = get_encoder::<T>(Encoding::PLAIN, descriptor).unwrap();
+    assert_eq!(encoder.encoding(), Encoding::PLAIN);
+    let split = values.len().min(2);
+    encoder.put(&values[..split]).unwrap();
+    encoder.put(&[]).unwrap();
+    encoder.put(&values[split..]).unwrap();
+    encoder.flush_buffer().unwrap()
+}
+
+fn generic_plain_and_dictionary<T: DataType>(type_length: i32, values: &[T::T]) -> Bytes {
+    let descriptor = column_descriptor::<T>(type_length);
+    let data = generic_plain_factory::<T>(&descriptor, values);
+    let mut decoder = get_decoder::<T>(descriptor.clone(), Encoding::PLAIN).unwrap();
+    decoder.set_data(data.clone(), values.len()).unwrap();
+    let mut decoded = vec![T::T::default(); values.len()];
+    assert_eq!(decoder.get(&mut decoded).unwrap(), values.len());
+    assert_eq!(decoded, values);
+
+    let mut dict = DictEncoder::<T>::new(descriptor.clone());
+    dict.put(values).unwrap();
+    let mut unique = Vec::new();
+    for value in values {
+        if !unique.contains(value) {
+            unique.push(value.clone());
+        }
+    }
+    assert_eq!(dict.num_entries(), unique.len());
+    assert_eq!(
+        dict.write_dict().unwrap(),
+        generic_plain_factory::<T>(&descriptor, &unique)
+    );
+    data
+}
+
+fn supported_plain<T: DataType>(mut encoder: impl Encoder<T>, type_length: i32, values: &[T::T]) {
+    for _ in 0..2 {
+        let split = values.len().min(2);
+        encoder.put(&values[..split]).unwrap();
+        encoder.put(&[]).unwrap();
+        encoder.put(&values[split..]).unwrap();
+        assert_eq!(encoder.encoding(), Encoding::PLAIN);
+        let size = encoder.estimated_data_encoded_size();
+        assert!(encoder.estimated_memory_size() >= size);
+        let data = encoder.flush_buffer().unwrap();
+        assert_eq!(size, data.len());
+        assert_eq!(encoder.estimated_data_encoded_size(), 0);
+        assert_eq!(data, generic_plain_and_dictionary::<T>(type_length, values));
+    }
+}
+
+#[test]
+fn plain_encoder_supported_concrete_types() {
+    supported_plain::<BoolType>(
+        PlainEncoder::new(),
+        -1,
+        &[true, false, true, false, false, true, false, true, true],
+    );
+    supported_plain::<Int32Type>(PlainEncoder::new(), -1, &[i32::MIN, 0, i32::MAX, 0]);
+    supported_plain::<Int64Type>(PlainEncoder::new(), -1, &[i64::MIN, 0, i64::MAX, 0]);
+    supported_plain::<Int96Type>(
+        PlainEncoder::new(),
+        -1,
+        &[Int96::from(vec![1, 2, 3]), Int96::from(vec![1, 2, 3])],
+    );
+    supported_plain::<FloatType>(PlainEncoder::new(), -1, &[-1.5, 0.0, 3.25, 0.0]);
+    supported_plain::<DoubleType>(PlainEncoder::new(), -1, &[-1.5, 0.0, 3.25, 0.0]);
+    supported_plain::<FixedLenByteArrayType>(
+        PlainEncoder::new(),
+        4,
+        &[
+            FixedLenByteArray::from(ByteArray::from("abcd")),
+            FixedLenByteArray::from(ByteArray::from("abcd")),
+            FixedLenByteArray::from(ByteArray::from("xyzw")),
+        ],
+    );
+}
+
+#[test]
+fn plain_byte_array_generic_factory_and_dictionary() {
+    let values = ["", "abc", "abc", "z", ""]
+        .into_iter()
+        .map(ByteArray::from)
+        .collect::<Vec<_>>();
+    let data = generic_plain_and_dictionary::<ByteArrayType>(-1, &values);
+    assert_eq!(
+        data.as_ref(),
+        b"\x00\x00\x00\x00\x03\x00\x00\x00abc\x03\x00\x00\x00abc\x01\x00\x00\x00z\x00\x00\x00\x00"
+    );
+    assert!(generic_plain_and_dictionary::<ByteArrayType>(-1, &[]).is_empty());
+}
+
+struct CustomInt32Type;
+
+impl DataType for CustomInt32Type {
+    type T = i32;
+
+    fn get_type_size() -> usize {
+        std::mem::size_of::<Self::T>()
+    }
+
+    fn get_column_reader(_: ColumnReader) -> Option<ColumnReaderImpl<Self>> {
+        None
+    }
+
+    fn get_column_writer(_: ColumnWriter<'_>) -> Option<ColumnWriterImpl<'_, Self>> {
+        None
+    }
+
+    fn get_column_writer_ref<'a, 'b: 'a>(
+        _: &'b ColumnWriter<'a>,
+    ) -> Option<&'b ColumnWriterImpl<'a, Self>> {
+        None
+    }
+
+    fn get_column_writer_mut<'a, 'b: 'a>(
+        _: &'a mut ColumnWriter<'b>,
+    ) -> Option<&'a mut ColumnWriterImpl<'b, Self>> {
+        None
+    }
+}
+
+#[test]
+fn plain_encoder_custom_data_type_marker() {
+    supported_plain::<CustomInt32Type>(PlainEncoder::new(), -1, &[1, 2, 1, 3]);
 }
