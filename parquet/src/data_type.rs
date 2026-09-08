@@ -780,9 +780,15 @@ pub(crate) mod private {
         }
     }
 
-    impl ParquetValueType for bool {
-        const PHYSICAL_TYPE: Type = Type::BOOLEAN;
+    pub trait PlainEncoderValue: ParquetValueType {
+        fn encode<W: std::io::Write>(
+            values: &[Self],
+            writer: &mut W,
+            bit_writer: &mut BitWriter,
+        ) -> Result<()>;
+    }
 
+    impl PlainEncoderValue for bool {
         #[inline]
         fn encode<W: std::io::Write>(
             values: &[Self],
@@ -793,6 +799,19 @@ pub(crate) mod private {
                 bit_writer.put_value(*value as u64, 1)
             }
             Ok(())
+        }
+    }
+
+    impl ParquetValueType for bool {
+        const PHYSICAL_TYPE: Type = Type::BOOLEAN;
+
+        #[inline]
+        fn encode<W: std::io::Write>(
+            values: &[Self],
+            writer: &mut W,
+            bit_writer: &mut BitWriter,
+        ) -> Result<()> {
+            <Self as PlainEncoderValue>::encode(values, writer, bit_writer)
         }
 
         #[inline]
@@ -836,9 +855,7 @@ pub(crate) mod private {
 
     macro_rules! impl_from_raw {
         ($ty: ty, $physical_ty: expr, $self: ident => $as_i64: block) => {
-            impl ParquetValueType for $ty {
-                const PHYSICAL_TYPE: Type = $physical_ty;
-
+            impl PlainEncoderValue for $ty {
                 #[inline]
                 fn encode<W: std::io::Write>(values: &[Self], writer: &mut W, _: &mut BitWriter) -> Result<()> {
                     // SAFETY: Self is one of i32, i64, f32, f64, which have no padding.
@@ -851,6 +868,19 @@ pub(crate) mod private {
                     writer.write_all(raw)?;
 
                     Ok(())
+                }
+            }
+
+            impl ParquetValueType for $ty {
+                const PHYSICAL_TYPE: Type = $physical_ty;
+
+                #[inline]
+                fn encode<W: std::io::Write>(
+                    values: &[Self],
+                    writer: &mut W,
+                    bit_writer: &mut BitWriter,
+                ) -> Result<()> {
+                    <Self as PlainEncoderValue>::encode(values, writer, bit_writer)
                 }
 
                 #[inline]
@@ -925,9 +955,7 @@ pub(crate) mod private {
     impl_from_raw!(f32, Type::FLOAT, self => { Err(general_err!("Type cannot be converted to i64")) });
     impl_from_raw!(f64, Type::DOUBLE, self => { Err(general_err!("Type cannot be converted to i64")) });
 
-    impl ParquetValueType for super::Int96 {
-        const PHYSICAL_TYPE: Type = Type::INT96;
-
+    impl PlainEncoderValue for super::Int96 {
         #[inline]
         fn encode<W: std::io::Write>(
             values: &[Self],
@@ -939,6 +967,19 @@ pub(crate) mod private {
                 writer.write_all(raw)?;
             }
             Ok(())
+        }
+    }
+
+    impl ParquetValueType for super::Int96 {
+        const PHYSICAL_TYPE: Type = Type::INT96;
+
+        #[inline]
+        fn encode<W: std::io::Write>(
+            values: &[Self],
+            writer: &mut W,
+            bit_writer: &mut BitWriter,
+        ) -> Result<()> {
+            <Self as PlainEncoderValue>::encode(values, writer, bit_writer)
         }
 
         #[inline]
@@ -1116,9 +1157,7 @@ pub(crate) mod private {
         }
     }
 
-    impl ParquetValueType for super::FixedLenByteArray {
-        const PHYSICAL_TYPE: Type = Type::FIXED_LEN_BYTE_ARRAY;
-
+    impl PlainEncoderValue for super::FixedLenByteArray {
         #[inline]
         fn encode<W: std::io::Write>(
             values: &[Self],
@@ -1130,6 +1169,19 @@ pub(crate) mod private {
                 writer.write_all(raw)?;
             }
             Ok(())
+        }
+    }
+
+    impl ParquetValueType for super::FixedLenByteArray {
+        const PHYSICAL_TYPE: Type = Type::FIXED_LEN_BYTE_ARRAY;
+
+        #[inline]
+        fn encode<W: std::io::Write>(
+            values: &[Self],
+            writer: &mut W,
+            bit_writer: &mut BitWriter,
+        ) -> Result<()> {
+            <Self as PlainEncoderValue>::encode(values, writer, bit_writer)
         }
 
         #[inline]

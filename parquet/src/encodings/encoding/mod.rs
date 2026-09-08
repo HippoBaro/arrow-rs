@@ -20,7 +20,7 @@
 use std::{cmp, marker::PhantomData};
 
 use crate::basic::*;
-use crate::data_type::private::ParquetValueType;
+use crate::data_type::private::{ParquetValueType, PlainEncoderValue};
 use crate::data_type::*;
 use crate::encodings::rle::RleEncoder;
 use crate::errors::{ParquetError, Result};
@@ -86,7 +86,7 @@ pub fn get_encoder<T: DataType>(
     descr: &ColumnDescPtr,
 ) -> Result<Box<dyn Encoder<T>>> {
     let encoder: Box<dyn Encoder<T>> = match encoding {
-        Encoding::PLAIN => Box::new(PlainEncoder::new()),
+        Encoding::PLAIN => Box::new(LegacyPlainEncoder::new()),
         Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
             return Err(general_err!(
                 "Cannot initialize this encoding through this function"
@@ -111,7 +111,7 @@ pub fn get_encoder<T: DataType>(
 // ----------------------------------------------------------------------
 // Plain encoding
 
-/// Plain encoding that supports all types.
+/// Plain encoding for boolean, numeric, and fixed-length byte-array values.
 /// Values are encoded back to back.
 /// The plain encoding is used whenever a more efficient encoding can not be used.
 /// It stores the data in the following format:
@@ -120,7 +120,6 @@ pub fn get_encoder<T: DataType>(
 /// - INT64 - 8 bytes per value, stored as little-endian.
 /// - FLOAT - 4 bytes per value, stored as IEEE little-endian.
 /// - DOUBLE - 8 bytes per value, stored as IEEE little-endian.
-/// - BYTE_ARRAY - 4 byte length stored as little endian, followed by bytes.
 /// - FIXED_LEN_BYTE_ARRAY - just the bytes are stored.
 pub struct PlainEncoder<T: DataType> {
     buffer: Vec<u8>,
@@ -145,7 +144,10 @@ impl<T: DataType> PlainEncoder<T> {
     }
 }
 
-impl<T: DataType> Encoder<T> for PlainEncoder<T> {
+impl<T: DataType> Encoder<T> for PlainEncoder<T>
+where
+    T::T: PlainEncoderValue,
+{
     // Performance Note:
     // As far as can be seen these functions are rarely called and as such we can hint to the
     // compiler that they dont need to be folded into hot locations in the final output.
@@ -168,13 +170,65 @@ impl<T: DataType> Encoder<T> for PlainEncoder<T> {
 
     #[inline]
     fn put(&mut self, values: &[T::T]) -> Result<()> {
-        T::T::encode(values, &mut self.buffer, &mut self.bit_writer)?;
+        <T::T as PlainEncoderValue>::encode(values, &mut self.buffer, &mut self.bit_writer)?;
         Ok(())
     }
 
     /// Return the estimated memory size of this encoder.
     fn estimated_memory_size(&self) -> usize {
         self.buffer.capacity() * std::mem::size_of::<u8>() + self.bit_writer.estimated_memory_size()
+    }
+}
+
+// Generic PLAIN path retained for factory and dictionary consumers.
+struct LegacyPlainEncoder<T: DataType> {
+    inner: PlainEncoder<T>,
+}
+
+impl<T: DataType> LegacyPlainEncoder<T> {
+    fn new() -> Self {
+        Self {
+            inner: PlainEncoder::new(),
+        }
+    }
+}
+
+impl<T: DataType> Encoder<T> for LegacyPlainEncoder<T> {
+    // Performance Note:
+    // As far as can be seen these functions are rarely called and as such we can hint to the
+    // compiler that they dont need to be folded into hot locations in the final output.
+    #[cold]
+    fn encoding(&self) -> Encoding {
+        Encoding::PLAIN
+    }
+
+    fn estimated_data_encoded_size(&self) -> usize {
+        self.inner.buffer.len() + self.inner.bit_writer.bytes_written()
+    }
+
+    #[inline]
+    fn flush_buffer(&mut self) -> Result<Bytes> {
+        self.inner
+            .buffer
+            .extend_from_slice(self.inner.bit_writer.flush_buffer());
+        self.inner.bit_writer.clear();
+        Ok(std::mem::take(&mut self.inner.buffer).into())
+    }
+
+    #[inline]
+    fn put(&mut self, values: &[T::T]) -> Result<()> {
+        <T::T as ParquetValueType>::encode(
+            values,
+            &mut self.inner.buffer,
+            &mut self.inner.bit_writer,
+        )?;
+        Ok(())
+    }
+
+    /// Return the estimated memory size of this encoder.
+    fn estimated_memory_size(&self) -> usize {
+        self.inner.buffer.capacity() * std::mem::size_of::<u8>()
+            + self.inner.bit_writer.estimated_memory_size()
     }
 }
 
