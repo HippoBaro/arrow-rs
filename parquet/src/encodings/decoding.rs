@@ -1060,8 +1060,6 @@ impl<T: DataType> Decoder<T> for DeltaLengthByteArrayDecoder<T> {
 ///
 /// Prefix lengths are encoded using `DELTA_BINARY_PACKED` encoding, Suffixes are stored
 /// using `DELTA_LENGTH_BYTE_ARRAY` encoding.
-/// See [`DeltaByteArrayEncoder`](crate::encoding::DeltaByteArrayEncoder) for more
-/// information.
 pub struct DeltaByteArrayDecoder<T: DataType> {
     // Prefix lengths for each byte array
     // TODO: add memory tracker to this
