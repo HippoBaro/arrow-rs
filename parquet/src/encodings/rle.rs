@@ -591,10 +591,8 @@ impl RleDecoder {
                         let mut out_chunks = out.chunks_exact_mut(CHUNK);
                         let idx_chunks = idx.chunks_exact(CHUNK);
                         for (out_chunk, idx_chunk) in out_chunks.by_ref().zip(idx_chunks) {
-                            // u32 max-reduction instead of `.all(|&i| ..)`: `.all`
-                            // short-circuits and blocks autovectorisation. Negative
-                            // i32 cast to u32 becomes a large value so the bounds
-                            // check still rejects it.
+                            // Casting a negative i32 index to u32 produces a large
+                            // value, so the maximum also detects negative indices.
                             let max_idx = idx_chunk.iter().fold(0u32, |acc, &i| acc.max(i as u32));
                             if (max_idx as usize) >= dict_len {
                                 return Err(oob(max_idx, dict_len));

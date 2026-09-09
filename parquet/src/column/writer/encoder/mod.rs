@@ -257,8 +257,6 @@ struct FixedLenByteArrayScratch {
     max: Vec<u8>,
 }
 
-impl<T: DataType> TypedColumnChunkEncoder<T> {}
-
 impl<T: DataType> TypedColumnChunkEncoder<T> {
     #[cfg(feature = "arrow")]
     pub(crate) fn start_arrow_source(&mut self) {
