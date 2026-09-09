@@ -133,6 +133,8 @@ mod encoding_family_private {
         fn is_dictionary(&self) -> bool {
             false
         }
+        #[cfg(feature = "arrow")]
+        fn start_arrow_source(&mut self) {}
         /// If dictionary-encoding, serialize the dictionary page as `(buf, num_values,
         /// is_sorted)` and transition in place to the fallback encoding (dictionary
         /// fallback); otherwise `None`.
@@ -237,6 +239,13 @@ macro_rules! impl_dictionary_encoding_family {
                 matches!(self, Self::Dictionary(_))
             }
 
+            #[cfg(feature = "arrow")]
+            fn start_arrow_source(&mut self) {
+                if let Self::Dictionary(dict) = self {
+                    dict.start_arrow_source()
+                }
+            }
+
             fn take_dict_page(
                 &mut self,
                 fallback_encoding: Encoding,
@@ -317,34 +326,6 @@ macro_rules! dictionary_encoding_family {
         );
         impl_dictionary_encoding_family!($name $(<$generic: $bound>)?, $ty);
     };
-}
-
-#[cfg(feature = "arrow")]
-pub(crate) fn validate_column_encoding(encoding: Encoding, physical_type: Type) -> Result<()> {
-    let supported = match physical_type {
-        Type::BOOLEAN => matches!(encoding, Encoding::PLAIN | Encoding::RLE),
-        Type::INT32 | Type::INT64 => matches!(
-            encoding,
-            Encoding::PLAIN | Encoding::DELTA_BINARY_PACKED | Encoding::BYTE_STREAM_SPLIT
-        ),
-        Type::INT96 => encoding == Encoding::PLAIN,
-        Type::FLOAT | Type::DOUBLE => {
-            matches!(encoding, Encoding::PLAIN | Encoding::BYTE_STREAM_SPLIT)
-        }
-        Type::BYTE_ARRAY => matches!(
-            encoding,
-            Encoding::PLAIN | Encoding::DELTA_LENGTH_BYTE_ARRAY | Encoding::DELTA_BYTE_ARRAY
-        ),
-        Type::FIXED_LEN_BYTE_ARRAY => matches!(
-            encoding,
-            Encoding::PLAIN | Encoding::DELTA_BYTE_ARRAY | Encoding::BYTE_STREAM_SPLIT
-        ),
-    };
-    if supported {
-        Ok(())
-    } else {
-        Err(unsupported_column_encoding(encoding, physical_type))
-    }
 }
 
 fn unsupported_column_encoding(encoding: Encoding, physical_type: Type) -> ParquetError {
@@ -568,8 +549,12 @@ impl<T: DataType> Encoder<T> for RleValueEncoder<T> {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "arrow")]
+    use super::PlainEncoderImpl as PlainEncoder;
+    #[cfg(feature = "arrow")]
     use super::boolean::BoolBatchSelection;
     use super::*;
+    #[cfg(feature = "arrow")]
+    use crate::column::value_selection::DictionaryKeys;
 
     use std::sync::Arc;
 
@@ -1129,5 +1114,48 @@ mod tests {
             packed.selection,
             BoolBatchSelection::Sparse { .. }
         ));
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn physical_boolean_dictionary_streams_sliced_keys_directly() {
+        let bit_offset = 5;
+        let bits = [0b1011_0101, 0b0101_1010];
+        let mut keys = Vec::with_capacity(160);
+        for row in 0..160 {
+            keys.push((row % 6) as i16);
+        }
+        let selection = PhysicalValueSelection::dictionary(
+            ValueSelectionRef::Dense {
+                offset: 0,
+                len: keys.len(),
+            },
+            DictionaryKeys::I16(&keys),
+        )
+        .slice(7, 137);
+        let packed = BoolBatch::new_physical(&bits, bit_offset, selection);
+        assert!(matches!(
+            packed.selection,
+            BoolBatchSelection::Physical { scalar: true, .. }
+        ));
+
+        let expected = (7..144)
+            .map(|row| bit_util::get_bit(&bits, bit_offset + keys[row] as usize))
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        packed.for_each(|value| actual.push(value));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            packed.true_count(),
+            expected.iter().filter(|&&value| value).count()
+        );
+
+        let mut encoder = PlainEncoder::<BoolType>::new();
+        encoder.put_bool_batch(packed).unwrap();
+        let encoded = encoder.flush_buffer().unwrap();
+        assert_eq!(encoded.len(), expected.len().div_ceil(8));
+        for (index, expected) in expected.into_iter().enumerate() {
+            assert_eq!(bit_util::get_bit(&encoded, index), expected);
+        }
     }
 }
