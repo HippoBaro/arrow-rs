@@ -92,7 +92,7 @@ impl<'a> BoolBatch<'a> {
                 _ => BoolBatchSelection::Physical {
                     bit_offset,
                     selection,
-                    scalar: false,
+                    scalar: selection.has_dictionary_mapping(),
                 },
             },
         };
