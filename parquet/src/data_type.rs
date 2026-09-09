@@ -556,6 +556,7 @@ pub trait SliceAsBytes: Sized {
 }
 
 impl AsBytes for [u8] {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self
     }
@@ -564,6 +565,7 @@ impl AsBytes for [u8] {
 macro_rules! gen_as_bytes {
     ($source_ty:ident) => {
         impl AsBytes for $source_ty {
+            #[inline]
             fn as_bytes(&self) -> &[u8] {
                 // SAFETY: macro is only used with primitive types that have no padding, so the
                 // resulting slice always refers to initialized memory.
@@ -637,6 +639,7 @@ unimplemented_slice_as_bytes!(ByteArray);
 unimplemented_slice_as_bytes!(FixedLenByteArray);
 
 impl AsBytes for bool {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: a bool is guaranteed to be either 0x00 or 0x01 in memory, so the memory is
         // valid.
@@ -654,12 +657,14 @@ impl AsBytes for Int96 {
 }
 
 impl AsBytes for ByteArray {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self.data()
     }
 }
 
 impl AsBytes for FixedLenByteArray {
+    #[inline]
     fn as_bytes(&self) -> &[u8] {
         self.data()
     }
@@ -711,11 +716,7 @@ pub(crate) mod private {
         })
     }
 
-    /// Sealed trait to start to remove specialisation from implementations
-    ///
-    /// This is done to force the associated value type to be unimplementable outside of this
-    /// crate, and thus hint to the type system (and end user) traits are public for the contract
-    /// and not for extension.
+    /// Internal value contract for supported Parquet physical types.
     pub trait ParquetValueType:
         PartialEq
         + std::fmt::Debug
@@ -732,13 +733,6 @@ pub(crate) mod private {
         + crate::file::statistics::private::MakeStatistics
     {
         const PHYSICAL_TYPE: Type;
-
-        /// Encode the value directly from a higher level encoder
-        fn encode<W: std::io::Write>(
-            values: &[Self],
-            writer: &mut W,
-            bit_writer: &mut BitWriter,
-        ) -> Result<()>;
 
         /// Establish the data that will be decoded in a buffer
         fn set_data(decoder: &mut PlainDecoderDetails, data: Bytes, num_values: usize);
@@ -772,6 +766,7 @@ pub(crate) mod private {
         ///
         /// This is essentially the same as `std::convert::TryInto<u64>` but can't be
         /// implemented for `f32` and `f64`, types that would fail orphan rules
+        #[inline]
         fn as_u64(&self) -> Result<u64> {
             self.as_i64()
                 .map_err(|_| general_err!("Type cannot be converted to u64"))
@@ -816,15 +811,6 @@ pub(crate) mod private {
 
     impl ParquetValueType for bool {
         const PHYSICAL_TYPE: Type = Type::BOOLEAN;
-
-        #[inline]
-        fn encode<W: std::io::Write>(
-            values: &[Self],
-            writer: &mut W,
-            bit_writer: &mut BitWriter,
-        ) -> Result<()> {
-            <Self as PlainEncoderValue>::encode(values, writer, bit_writer)
-        }
 
         #[inline]
         fn set_data(decoder: &mut PlainDecoderDetails, data: Bytes, num_values: usize) {
@@ -885,15 +871,6 @@ pub(crate) mod private {
 
             impl ParquetValueType for $ty {
                 const PHYSICAL_TYPE: Type = $physical_ty;
-
-                #[inline]
-                fn encode<W: std::io::Write>(
-                    values: &[Self],
-                    writer: &mut W,
-                    bit_writer: &mut BitWriter,
-                ) -> Result<()> {
-                    <Self as PlainEncoderValue>::encode(values, writer, bit_writer)
-                }
 
                 #[inline]
                 fn set_data(decoder: &mut PlainDecoderDetails, data: Bytes, num_values: usize) {
@@ -986,15 +963,6 @@ pub(crate) mod private {
         const PHYSICAL_TYPE: Type = Type::INT96;
 
         #[inline]
-        fn encode<W: std::io::Write>(
-            values: &[Self],
-            writer: &mut W,
-            bit_writer: &mut BitWriter,
-        ) -> Result<()> {
-            <Self as PlainEncoderValue>::encode(values, writer, bit_writer)
-        }
-
-        #[inline]
         fn set_data(decoder: &mut PlainDecoderDetails, data: Bytes, num_values: usize) {
             decoder.data.replace(data);
             decoder.start = 0;
@@ -1071,21 +1039,6 @@ pub(crate) mod private {
 
     impl ParquetValueType for super::ByteArray {
         const PHYSICAL_TYPE: Type = Type::BYTE_ARRAY;
-
-        #[inline]
-        fn encode<W: std::io::Write>(
-            values: &[Self],
-            writer: &mut W,
-            _: &mut BitWriter,
-        ) -> Result<()> {
-            for value in values {
-                let len: u32 = value.len().try_into().unwrap();
-                writer.write_all(&len.to_ne_bytes())?;
-                let raw = value.data();
-                writer.write_all(raw)?;
-            }
-            Ok(())
-        }
 
         #[inline]
         fn set_data(decoder: &mut PlainDecoderDetails, data: Bytes, num_values: usize) {
@@ -1177,8 +1130,7 @@ pub(crate) mod private {
             _: &mut BitWriter,
         ) -> Result<()> {
             for value in values {
-                let raw = value.data();
-                writer.write_all(raw)?;
+                writer.write_all(value.data())?;
             }
             Ok(())
         }
@@ -1186,15 +1138,6 @@ pub(crate) mod private {
 
     impl ParquetValueType for super::FixedLenByteArray {
         const PHYSICAL_TYPE: Type = Type::FIXED_LEN_BYTE_ARRAY;
-
-        #[inline]
-        fn encode<W: std::io::Write>(
-            values: &[Self],
-            writer: &mut W,
-            bit_writer: &mut BitWriter,
-        ) -> Result<()> {
-            <Self as PlainEncoderValue>::encode(values, writer, bit_writer)
-        }
 
         #[inline]
         fn set_data(decoder: &mut PlainDecoderDetails, data: Bytes, num_values: usize) {
@@ -1282,7 +1225,7 @@ pub(crate) mod private {
 /// presentation.
 pub trait DataType: 'static + Send {
     /// The physical type of the Parquet data type.
-    type T: private::ParquetValueType + crate::encodings::encoding::DictionaryValue;
+    type T: private::ParquetValueType + crate::column::writer::encoder::ColumnWriterValue;
 
     /// Returns Parquet physical type.
     fn get_physical_type() -> Type {
@@ -1310,6 +1253,7 @@ pub trait DataType: 'static + Send {
         Self: Sized;
 
     /// Returns a mutable reference to the underlying [`ColumnWriterImpl`] for the given
+    /// [`ColumnWriter`].
     fn get_column_writer_mut<'a, 'b: 'a>(
         column_writer: &'a mut ColumnWriter<'b>,
     ) -> Option<&'a mut ColumnWriterImpl<'b, Self>>
@@ -1347,8 +1291,8 @@ macro_rules! make_type {
             }
 
             fn get_column_writer_ref<'a, 'b: 'a>(
-                column_writer: &'a ColumnWriter<'b>,
-            ) -> Option<&'a ColumnWriterImpl<'b, Self>> {
+                column_writer: &'b ColumnWriter<'a>,
+            ) -> Option<&'b ColumnWriterImpl<'a, Self>> {
                 match column_writer {
                     ColumnWriter::$writer_ident(w) => Some(w),
                     _ => None,
