@@ -5504,6 +5504,23 @@ mod tests {
         dict_page_size: usize,
     }
 
+    fn write_and_collect_pages_with<T: DataType>(
+        props: WriterProperties,
+        max_def_level: i16,
+        max_rep_level: i16,
+        write_batch: impl FnOnce(&mut ColumnWriterImpl<'_, T>) -> Result<()>,
+    ) -> CollectedPages {
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let mut writer =
+            get_test_column_writer::<T>(page_writer, max_def_level, max_rep_level, Arc::new(props));
+        write_batch(&mut writer).unwrap();
+        let result = writer.close().unwrap();
+        drop(write);
+        collect_written_pages(file, result)
+    }
+
     /// Writes `data` (with optional def/rep levels) through a raw
     /// `ColumnWriterImpl` configured by `props`, then re-reads the file and
     /// returns its page layout. Shared by the page-size regression tests so
@@ -5516,23 +5533,20 @@ mod tests {
         def_levels: Option<&[i16]>,
         rep_levels: Option<&[i16]>,
     ) -> CollectedPages {
-        let mut file = tempfile::tempfile().unwrap();
-        let mut write = TrackedWrite::new(&mut file);
-        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
-        let mut writer =
-            get_test_column_writer::<T>(page_writer, max_def_level, max_rep_level, Arc::new(props));
-        writer.write_batch(data, def_levels, rep_levels).unwrap();
-        let r = writer.close().unwrap();
-        drop(write);
+        write_and_collect_pages_with::<T>(props, max_def_level, max_rep_level, |writer| {
+            writer.write_batch(data, def_levels, rep_levels).map(|_| ())
+        })
+    }
 
+    fn collect_written_pages(file: std::fs::File, result: ColumnCloseResult) -> CollectedPages {
         let read_props = ReaderProperties::builder()
             .set_backward_compatible_lz4(false)
             .build();
         let mut page_reader = Box::new(
             SerializedPageReader::new_with_properties(
                 Arc::new(file),
-                &r.metadata,
-                r.rows_written as usize,
+                &result.metadata,
+                result.rows_written as usize,
                 None,
                 Arc::new(read_props),
             )
