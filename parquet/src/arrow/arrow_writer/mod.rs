@@ -64,6 +64,7 @@ use crate::file::properties::{WriterProperties, WriterPropertiesPtr};
 use crate::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use crate::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use crate::schema::types::{ColumnDescPtr, SchemaDescriptor};
+use levels::cursor::LevelTree;
 use levels::{ArrayLevels, LeafBatch, calculate_array_levels};
 
 mod boolean;
@@ -373,7 +374,9 @@ impl<W: Write + Send> ArrowWriter<W> {
     /// If one limit is set, that limit is respected.
     /// If both limits are set, the lower bound (whichever triggers first) is respected.
     ///
-    /// This will fail if the `batch`'s schema does not match the writer's schema.
+    /// This will fail if the `batch`'s schema does not match the writer's schema,
+    /// or if a logical null is reachable at a position the writer schema declares
+    /// non-nullable.
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -922,17 +925,182 @@ impl PageWriter for ArrowPageWriter {
     }
 }
 
+/// How one leaf's levels are produced.
+#[derive(Debug)]
+enum ArrowLeafPlan {
+    Cursor { tree: Arc<LevelTree>, leaf: u32 },
+    Legacy(Box<ArrayLevels>),
+}
+
 /// A leaf column that can be encoded by [`ArrowColumnWriter`]
 #[derive(Debug)]
-pub struct ArrowLeafColumn(ArrayLevels);
+pub struct ArrowLeafColumn(ArrowLeafPlan);
+
+const CURSOR_TARGET_SLOTS: usize = 1024;
+
+impl ArrowLeafColumn {
+    #[inline]
+    fn try_for_each_batch(
+        &self,
+        cursor_row_limit: usize,
+        emit: impl for<'a> FnMut(LeafBatch<'a>) -> Result<()>,
+    ) -> Result<()> {
+        match &self.0 {
+            ArrowLeafPlan::Cursor { tree, leaf } => {
+                write_leaf_window(tree, *leaf, cursor_row_limit, emit)
+            }
+            ArrowLeafPlan::Legacy(levels) => {
+                levels.validate()?;
+                let mut emit = emit;
+                emit(levels.leaf_batch())
+            }
+        }
+    }
+}
+
+/// Whether a shape still needs the materializing level builder.
+fn needs_legacy_levels(data_type: &ArrowDataType) -> bool {
+    match data_type {
+        ArrowDataType::RunEndEncoded(..) => true,
+        ArrowDataType::Dictionary(_, value) => {
+            !levels::is_leaf(value) || needs_legacy_levels(value)
+        }
+        ArrowDataType::List(field)
+        | ArrowDataType::LargeList(field)
+        | ArrowDataType::ListView(field)
+        | ArrowDataType::LargeListView(field)
+        | ArrowDataType::FixedSizeList(field, _)
+        | ArrowDataType::Map(field, _) => needs_legacy_levels(field.data_type()),
+        ArrowDataType::Struct(fields) => fields
+            .iter()
+            .any(|field| needs_legacy_levels(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Drive one leaf's cursor, handing each tile to `emit` as a batch.
+fn write_leaf_window(
+    tree: &LevelTree,
+    leaf: u32,
+    cursor_row_limit: usize,
+    mut emit: impl for<'a> FnMut(LeafBatch<'a>) -> Result<()>,
+) -> Result<()> {
+    let terminal = tree.terminal(leaf);
+    let mut cursor = tree.cursor(leaf..leaf + 1, CURSOR_TARGET_SLOTS, cursor_row_limit)?;
+    while let Some(tiles) = cursor.next_tiles()? {
+        emit(tiles.leaf(0, terminal))?;
+    }
+    Ok(())
+}
+
+/// Write every leaf of `tree`, sharing structural walks where useful.
+fn write_tree(tree: &LevelTree, writers: &mut [ArrowColumnWriter]) -> Result<()> {
+    let Some(first) = writers.first() else {
+        return Ok(());
+    };
+    let cursor_row_limit = first.cursor_row_limit;
+    if writers.len() == 1 {
+        writers[0].writer.start_arrow_source();
+        return write_leaf_window(tree, 0, cursor_row_limit, |batch| {
+            write_leaf(&mut writers[0].writer, batch)?;
+            Ok(())
+        });
+    }
+    let Some(windows) = tree.write_windows() else {
+        for (leaf, writer) in writers.iter_mut().enumerate() {
+            writer.writer.start_arrow_source();
+            write_leaf_window(tree, leaf as u32, cursor_row_limit, |batch| {
+                write_leaf(&mut writer.writer, batch)?;
+                Ok(())
+            })?;
+        }
+        return Ok(());
+    };
+    for writer in &mut *writers {
+        writer.writer.start_arrow_source();
+    }
+
+    for window in windows {
+        if window.len() == 1 {
+            let leaf = window.start;
+            write_leaf_window(tree, leaf, cursor_row_limit, |batch| {
+                write_leaf(&mut writers[leaf as usize].writer, batch)?;
+                Ok(())
+            })?;
+            continue;
+        }
+
+        let mut cursor = tree.cursor(window.clone(), CURSOR_TARGET_SLOTS, cursor_row_limit)?;
+        while let Some(tiles) = cursor.next_tiles()? {
+            for offset in 0..tiles.len() {
+                let leaf = window.start as usize + offset;
+                write_leaf(
+                    &mut writers[leaf].writer,
+                    tiles.leaf(offset, tree.terminal(leaf as u32)),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn shared_cursor_tree(leaves: &[ArrowLeafColumn]) -> Option<&LevelTree> {
+    let ArrowLeafPlan::Cursor {
+        tree,
+        leaf: first_leaf,
+    } = &leaves.first()?.0
+    else {
+        return None;
+    };
+    if *first_leaf != 0
+        || !leaves.iter().enumerate().all(|(index, column)| {
+            matches!(
+                &column.0,
+                ArrowLeafPlan::Cursor {
+                    tree: other,
+                    leaf,
+                } if *leaf == index as u32 && Arc::ptr_eq(tree, other)
+            )
+        })
+    {
+        return None;
+    }
+    Some(tree)
+}
+
+fn write_direct_group_batches(
+    leaves: &[ArrowLeafColumn],
+    writers: &mut [ArrowColumnWriter],
+) -> Result<bool> {
+    let Some(tree) = shared_cursor_tree(leaves) else {
+        return Ok(false);
+    };
+    write_tree(tree, writers)?;
+    Ok(true)
+}
 
 /// Computes the [`ArrowLeafColumn`] for a potentially nested [`ArrayRef`]
 ///
 /// This function can be used to encode individual columns in parallel.
-/// See example on [`ArrowColumnWriter`]
+/// See example on [`ArrowColumnWriter`].
+/// Structural compatibility is checked here. A logical null reachable at a
+/// non-nullable `field` returns an error when the leaf is written.
 pub fn compute_leaves(field: &Field, array: &ArrayRef) -> Result<Vec<ArrowLeafColumn>> {
-    let levels = calculate_array_levels(array, field)?;
-    Ok(levels.into_iter().map(ArrowLeafColumn).collect())
+    if needs_legacy_levels(array.data_type()) {
+        return Ok(calculate_array_levels(array, field)?
+            .into_iter()
+            .map(|levels| ArrowLeafColumn(ArrowLeafPlan::Legacy(Box::new(levels))))
+            .collect());
+    }
+    let tree = Arc::new(LevelTree::build(field, array)?);
+    Ok((0..tree.leaf_count() as u32)
+        .map(|leaf| {
+            ArrowLeafColumn(ArrowLeafPlan::Cursor {
+                tree: Arc::clone(&tree),
+                leaf,
+            })
+        })
+        .collect())
 }
 
 /// The data for a single column chunk, see [`ArrowColumnWriter`]
@@ -1088,6 +1256,7 @@ impl ArrowColumnChunk {
 pub struct ArrowColumnWriter {
     writer: ColumnWriter<'static>,
     chunk: SharedColumnChunk,
+    cursor_row_limit: usize,
 }
 
 impl std::fmt::Debug for ArrowColumnWriter {
@@ -1099,18 +1268,20 @@ impl std::fmt::Debug for ArrowColumnWriter {
 impl ArrowColumnWriter {
     /// Write an [`ArrowLeafColumn`]
     pub fn write(&mut self, col: &ArrowLeafColumn) -> Result<()> {
-        col.0.validate()?;
         self.writer.start_arrow_source();
-        self.write_internal(&col.0)
+        let cursor_row_limit = self.cursor_row_limit;
+        col.try_for_each_batch(cursor_row_limit, |batch| {
+            write_leaf(&mut self.writer, batch)?;
+            Ok(())
+        })
     }
 
     /// Write with content-defined chunking, inserting page flushes at chunk boundaries.
     fn write_with_chunker(
         &mut self,
-        col: &ArrowLeafColumn,
+        levels: &ArrayLevels,
         chunker: &mut ContentDefinedChunker,
     ) -> Result<()> {
-        let levels = &col.0;
         levels.validate()?;
         self.writer.start_arrow_source();
         let chunks = chunker.get_arrow_chunks(
@@ -1134,11 +1305,6 @@ impl ArrowColumnWriter {
                 self.writer.add_data_page()?;
             }
         }
-        Ok(())
-    }
-
-    fn write_internal(&mut self, levels: &ArrayLevels) -> Result<()> {
-        write_leaf(&mut self.writer, levels.leaf_batch())?;
         Ok(())
     }
 
@@ -1284,6 +1450,9 @@ impl ArrowRowGroupWriter {
         for (column_idx, field) in self.schema_plan.fields.iter().enumerate() {
             let leaves = compute_leaves(field.field.as_ref(), batch.column(column_idx))?;
             self.validate_leaf_count(field, leaves.len())?;
+            if write_direct_group_batches(&leaves, &mut self.writers[field.leaf_range.clone()])? {
+                continue;
+            }
             for (offset, leaf) in leaves.into_iter().enumerate() {
                 self.writers[field.leaf_range.start + offset].write(&leaf)?;
             }
@@ -1300,7 +1469,7 @@ impl ArrowRowGroupWriter {
         self.buffered_rows += batch.num_rows();
 
         for (column_idx, field) in self.schema_plan.fields.iter().enumerate() {
-            let leaves = compute_leaves(field.field.as_ref(), batch.column(column_idx))?;
+            let leaves = calculate_array_levels(batch.column(column_idx), field.field.as_ref())?;
             self.validate_leaf_count(field, leaves.len())?;
             for (offset, leaf) in leaves.into_iter().enumerate() {
                 let leaf_idx = field.leaf_range.start + offset;
@@ -1543,7 +1712,11 @@ impl ArrowColumnWriterFactory {
         let page_writer = self.create_page_writer(descriptor, column_index)?;
         let chunk = page_writer.buffer.clone();
         let writer = get_column_writer(Arc::clone(descriptor), Arc::clone(props), page_writer);
-        Ok(ArrowColumnWriter { writer, chunk })
+        Ok(ArrowColumnWriter {
+            writer,
+            chunk,
+            cursor_row_limit: props.data_page_row_count_limit(),
+        })
     }
 }
 
@@ -2101,9 +2274,13 @@ mod tests {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let a = Int32Array::from(vec![1, 2, 3, 4, 5]);
 
-        RoundTripTest::new(Arc::new(a))
-            .with_schema(Arc::new(schema))
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap();
+
+        RoundTripTest::new(batch.column(0).clone())
+            .with_schema(batch.schema())
             .run();
+
+        roundtrip(batch, Some(SMALL_SIZE / 2));
     }
 
     #[test]
@@ -2134,11 +2311,16 @@ mod tests {
         .build()
         .unwrap();
         let a = ListArray::from(a_list_data);
-        assert_eq!(a.null_count(), 1);
 
-        RoundTripTest::new(Arc::new(a))
-            .with_schema(Arc::new(schema))
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap();
+
+        assert_eq!(batch.column(0).null_count(), 1);
+
+        RoundTripTest::new(batch.column(0).clone())
+            .with_schema(batch.schema())
             .run();
+
+        roundtrip(batch, None);
     }
 
     #[test]
@@ -2256,11 +2438,11 @@ mod tests {
             true,
         )]);
 
-        //  [[1], [2, 3], null, [4, 5, 6], [7, 8, 9, 10]]
+        // [[1], [2, 3], null, [7, 8, 9, 10], [4, 5, 6]] — out of order offsets
         let a = LargeListViewArray::new(
             list_field,
-            vec![0i64, 1, 0, 3, 6].into(),
-            vec![1i64, 2, 0, 3, 4].into(),
+            vec![0i64, 1, 0, 6, 3].into(),
+            vec![1i64, 2, 0, 4, 3].into(),
             Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
             Some(vec![true, true, false, true, true].into()),
         );
@@ -3126,7 +3308,7 @@ mod tests {
         );
         let dict: ArrayRef = Arc::new(DictionaryArray::new(Int8Array::from(vec![0, 1]), values));
         let leaves = compute_leaves(&required, &dict).unwrap();
-        assert!(leaves[0].0.validate().is_err());
+        assert!(leaves[0].try_for_each_batch(1024, |_| Ok(())).is_err());
 
         // A nullable ancestor masks an otherwise required child null.
         let actual_fields = Fields::from(vec![Field::new("source_child", DataType::Int32, true)]);
@@ -3145,7 +3327,7 @@ mod tests {
             true,
         );
         let leaves = compute_leaves(&target, &array).unwrap();
-        assert!(leaves[0].0.validate().is_ok());
+        assert!(leaves[0].try_for_each_batch(1024, |_| Ok(())).is_ok());
         let result = roundtrip_compatible_column(target, array);
         assert_eq!(result.as_struct().fields()[0].name(), "target_child");
         assert!(result.is_null(1));
@@ -3165,8 +3347,7 @@ mod tests {
         );
         assert!(
             compute_leaves(&target, &list).unwrap()[0]
-                .0
-                .validate()
+                .try_for_each_batch(1024, |_| Ok(()))
                 .is_ok()
         );
         assert_eq!(
@@ -3288,7 +3469,10 @@ mod tests {
                     columns[0].get_estimated_total_bytes(),
                 );
                 let result = match &mut chunkers {
-                    Some(chunkers) => columns[0].write_with_chunker(&leaves[0], &mut chunkers[0]),
+                    Some(chunkers) => columns[0].write_with_chunker(
+                        &calculate_array_levels(&array, &target).unwrap()[0],
+                        &mut chunkers[0],
+                    ),
                     None => columns[0].write(&leaves[0]),
                 };
                 if invalid {
@@ -3309,7 +3493,10 @@ mod tests {
                     let valid_leaves = compute_leaves(&target, &valid).unwrap();
                     match &mut chunkers {
                         Some(chunkers) => columns[0]
-                            .write_with_chunker(&valid_leaves[0], &mut chunkers[0])
+                            .write_with_chunker(
+                                &calculate_array_levels(&valid, &target).unwrap()[0],
+                                &mut chunkers[0],
+                            )
                             .unwrap(),
                         None => columns[0].write(&valid_leaves[0]).unwrap(),
                     }
@@ -4711,8 +4898,8 @@ mod tests {
         builder.values().append_value("a");
         builder.values().append_null();
         builder.append(true);
-        // The null parent list covers selective padding dropping values below
-        // the list definition level while preserving the preceding item null.
+        // A null parent list drops padding below the list definition level while
+        // preserving the preceding item null.
         builder.append(false);
         // The long string covers the non-inlined Utf8View buffer path.
         builder.values().append_value("large payload over 12 bytes");
@@ -7641,5 +7828,67 @@ mod tests {
         reader.metadata().offset_index().expect("offset index")[0][0]
             .page_locations
             .len()
+    }
+    #[test]
+    fn arrow_writer_clustered_nullable_ranges_roundtrip_all_families() {
+        const ROWS: usize = 80;
+        let valid = |idx: usize| (7..23).contains(&idx) || (47..59).contains(&idx);
+
+        let ints = Int32Array::from(
+            (0..ROWS)
+                .map(|idx| valid(idx).then_some(idx as i32))
+                .collect::<Vec<_>>(),
+        );
+        let bools = BooleanArray::from(
+            (0..ROWS)
+                .map(|idx| valid(idx).then_some(idx % 3 == 0))
+                .collect::<Vec<_>>(),
+        );
+        let strings = StringArray::from(
+            (0..ROWS)
+                .map(|idx| valid(idx).then(|| format!("value-{idx:03}")))
+                .collect::<Vec<_>>(),
+        );
+
+        let mut fixed = FixedSizeBinaryBuilder::with_capacity(ROWS, 4);
+        for idx in 0..ROWS {
+            if valid(idx) {
+                fixed.append_value((idx as u32).to_le_bytes()).unwrap();
+            } else {
+                fixed.append_null();
+            }
+        }
+        let fixed = fixed.finish();
+
+        let keys = Int8Array::from(
+            (0..ROWS)
+                .map(|idx| valid(idx).then_some((idx % 3) as i8))
+                .collect::<Vec<_>>(),
+        );
+        let dictionary = DictionaryArray::<Int8Type>::try_new(
+            keys,
+            Arc::new(StringArray::from(vec!["zero", "one", "two"])),
+        )
+        .unwrap();
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("ints", Arc::new(ints) as ArrayRef),
+            ("bools", Arc::new(bools) as ArrayRef),
+            ("strings", Arc::new(strings) as ArrayRef),
+            ("fixed", Arc::new(fixed) as ArrayRef),
+            ("dictionary", Arc::new(dictionary) as ArrayRef),
+        ])
+        .unwrap();
+
+        for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+            let props = WriterProperties::builder()
+                .set_writer_version(version)
+                .set_max_row_group_row_count(Some(17))
+                .set_write_batch_size(5)
+                .set_data_page_row_count_limit(7)
+                .build();
+            roundtrip_opts(&batch, props);
+        }
+        roundtrip(batch, None);
     }
 }
