@@ -432,67 +432,6 @@ mod tests {
 
     use super::*;
 
-    // Temporary canonical-wire regression; P25 retires this extra fixture before target equality.
-    #[test]
-    fn fixed_dictionary_canonical_wire_read_skip_and_truncation() {
-        use crate::schema::types::{ColumnDescriptor, ColumnPath, Type as SchemaType};
-        use arrow_array::cast::AsArray;
-        use std::sync::Arc;
-        let primitive = Arc::new(
-            SchemaType::primitive_type_builder("fixed", Type::FIXED_LEN_BYTE_ARRAY)
-                .with_length(4)
-                .build()
-                .unwrap(),
-        );
-        let desc = Arc::new(ColumnDescriptor::new(
-            primitive,
-            0,
-            0,
-            ColumnPath::from("fixed"),
-        ));
-        let dtype = ArrowType::Dictionary(
-            Box::new(ArrowType::Int32),
-            Box::new(ArrowType::FixedSizeBinary(4)),
-        );
-        // Canonical PLAIN has no length prefixes, independent of ArrowWriter.
-        let raw = Bytes::from_static(b"abcdEFGHijkl");
-        let mut decoder = DictionaryDecoder::<i32, i32>::new(&desc);
-        decoder
-            .set_dict(raw.clone(), 3, Encoding::PLAIN, false)
-            .unwrap();
-        let dict = decoder.dict.as_ref().unwrap().as_binary::<i32>();
-        assert_eq!(dict.value(0), b"abcd");
-        assert_eq!(dict.value(1), b"EFGH");
-        assert_eq!(dict.value(2), b"ijkl");
-        assert!(
-            decoder
-                .set_dict(raw.slice(..11), 3, Encoding::PLAIN, false)
-                .unwrap_err()
-                .to_string()
-                .contains("too few bytes")
-        );
-
-        decoder.set_data(Encoding::PLAIN, raw, 3, Some(3)).unwrap();
-        let mut output = DictionaryBuffer::<i32, i32>::with_capacity(0);
-        assert_eq!(decoder.read(&mut output, 1).unwrap(), 1);
-        assert_eq!(decoder.skip_values(1).unwrap(), 1);
-        assert_eq!(decoder.read(&mut output, 10).unwrap(), 1);
-        assert_eq!(decoder.skip_values(10).unwrap(), 0);
-        let array = output.into_array(None, &dtype).unwrap();
-        let array = cast(&array, &ArrowType::FixedSizeBinary(4)).unwrap();
-        assert_eq!(array.as_fixed_size_binary().value(0), b"abcd");
-        assert_eq!(array.as_fixed_size_binary().value(1), b"ijkl");
-
-        // Truncated PLAIN data yields only complete values; it cannot manufacture a row.
-        decoder
-            .set_data(Encoding::PLAIN, Bytes::from_static(b"abcdEFG"), 2, Some(2))
-            .unwrap();
-        let mut output = DictionaryBuffer::<i32, i32>::with_capacity(0);
-        assert_eq!(decoder.read(&mut output, 2).unwrap(), 1);
-        assert_eq!(decoder.read(&mut output, 1).unwrap(), 0);
-        assert_eq!(decoder.skip_values(1).unwrap(), 0);
-    }
-
     fn utf8_dictionary() -> ArrowType {
         ArrowType::Dictionary(Box::new(ArrowType::Int32), Box::new(ArrowType::Utf8))
     }

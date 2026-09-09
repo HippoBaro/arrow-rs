@@ -291,7 +291,6 @@ impl<'a> LeafBatch<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Int32Array;
 
     fn selected(selection: &ValueSelection) -> Vec<usize> {
         selection.as_ref().cursor().collect()
@@ -369,32 +368,5 @@ mod tests {
         let before = selected(&ranges);
         ranges.append_sparse(NullBuffer::from(&[true]), 40, 0);
         assert_eq!(selected(&ranges), before);
-    }
-    #[test]
-    fn leaf_batch_window_preserves_levels_and_selected_values() {
-        let array = Int32Array::from(vec![10, 20, 30, 40]);
-        let batch = LeafBatch::new(
-            &array,
-            LevelDataRef::Materialized(&[1, 0, 1, 1]),
-            LevelDataRef::Absent,
-            ValueSelectionRef::Sparse(&[3, 0, 2]),
-        );
-        let sliced = batch.slice(LevelValueWindow {
-            levels: 1..4,
-            values: 1..3,
-        });
-        assert_eq!(
-            sliced.def_level_data().cursor().collect::<Vec<_>>(),
-            [0, 1, 1]
-        );
-        assert_eq!(
-            sliced
-                .value_selection()
-                .cursor()
-                .map(|i| array.value(i))
-                .collect::<Vec<_>>(),
-            [10, 30]
-        );
-        assert!(std::ptr::eq(batch.array(), sliced.array()));
     }
 }

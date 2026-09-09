@@ -2379,75 +2379,6 @@ mod tests {
 
     use super::*;
 
-    // Temporary dense proof of the O10 budget correction; P22 owns retirement.
-    #[test]
-    fn remaining_dictionary_budget_bounds_dense_mini_batches() {
-        let props = Arc::new(
-            WriterProperties::builder()
-                .set_dictionary_page_size_limit(16)
-                .set_write_batch_size(4)
-                .build(),
-        );
-        let mut writer = get_test_column_writer::<Int32Type>(get_test_page_writer(), 0, 0, props);
-        writer.write_batch(&[0, 1, 2], None, None).unwrap();
-        assert_eq!(writer.encoder.estimated_dict_page_size(), Some(12));
-        let chunker = ByteBudgetChunker::new(&writer.descr, &writer.props);
-        let values = [3, 4, 5, 6];
-        assert_eq!(
-            chunker.pick_sub_batch_size(
-                &writer.encoder,
-                values.as_slice(),
-                LevelWindow::new(4, LevelDataRef::Absent, LevelDataRef::Absent),
-                0
-            ),
-            1
-        );
-        // A budget below one physical value must still admit a singleton.
-        <i32 as ColumnWriterValue>::encode_slice(&mut writer.encoder, &[3]).unwrap();
-        assert_eq!(
-            chunker.pick_sub_batch_size(
-                &writer.encoder,
-                values.as_slice(),
-                LevelWindow::new(4, LevelDataRef::Absent, LevelDataRef::Absent),
-                0
-            ),
-            1
-        );
-
-        // Exercise actual page/dictionary driving independently of the synthetic encoder state.
-        let props = Arc::new(
-            WriterProperties::builder()
-                .set_dictionary_page_size_limit(16)
-                .set_write_batch_size(4)
-                .build(),
-        );
-        let mut writer = get_test_column_writer::<Int32Type>(get_test_page_writer(), 1, 0, props);
-        writer
-            .write_batch(&[0, 1, 2], Some(&[1, 0, 1, 1]), None)
-            .unwrap();
-        let chunker = ByteBudgetChunker::new(&writer.descr, &writer.props);
-        assert_eq!(
-            chunker.pick_sub_batch_size(
-                &writer.encoder,
-                values.as_slice(),
-                LevelWindow::new(
-                    4,
-                    LevelDataRef::Materialized(&[1, 0, 1, 1]),
-                    LevelDataRef::Absent
-                ),
-                0
-            ),
-            2
-        );
-        writer
-            .write_batch(&values, Some(&[1, 0, 1, 1, 1]), None)
-            .unwrap();
-        assert!(!writer.encoder.has_dictionary());
-        let metadata = writer.close().unwrap().metadata;
-        assert_eq!(metadata.num_values(), 9);
-        assert_eq!(metadata.statistics().unwrap().null_count_opt(), Some(2));
-    }
-
     #[test]
     fn test_column_writer_inconsistent_def_rep_length() {
         let page_writer = get_test_page_writer();
@@ -3191,6 +3122,15 @@ mod tests {
     fn test_column_writer_empty_column_roundtrip() {
         let props = Default::default();
         column_roundtrip::<Int32Type>(props, &[], None, None);
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_flush_empty_data_page_is_noop() {
+        let descr = Arc::new(get_test_column_descr::<Int32Type>(0, 0));
+        let mut writer = get_column_writer(descr, Default::default(), get_test_page_writer());
+        writer.flush_data_page().unwrap();
+        assert_eq!(writer.close().unwrap().bytes_written, 0);
     }
 
     #[test]
@@ -5912,7 +5852,6 @@ mod tests {
                 self.max_rep_level,
                 Arc::new(self.props),
             );
-
             writer
                 .write_batch_internal(
                     self.values,
@@ -6076,6 +6015,230 @@ mod tests {
                 .run();
         }
     }
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn level_data_cursor_matches_all_representations() {
+        let level_run_ends = [2, 5, 7];
+        let level_run_values = [2, 1, 3];
+        let level_runs = RunLevelsRef::from_level_runs(&level_run_ends, &level_run_values, 1, 5);
+
+        let check = |levels: LevelDataRef<'_>, expected: &[i16]| {
+            let cursor = levels.cursor();
+            assert_eq!(cursor.len(), levels.len());
+            let actual = cursor.collect::<Vec<_>>();
+            assert_eq!(actual.len(), levels.len());
+            assert_eq!(actual, expected);
+        };
+        check(LevelDataRef::Absent, &[]);
+        check(LevelDataRef::Materialized(&[3, 1, 2]), &[3, 1, 2]);
+        check(LevelDataRef::Uniform { value: 4, count: 3 }, &[4, 4, 4]);
+        check(LevelDataRef::Runs(level_runs), &[2, 1, 1, 1, 3]);
+
+        let empty_runs = RunLevelsRef::from_level_runs(&[], &[], 0, 0);
+        let mut empty = RunLevelCursor::new(empty_runs);
+        assert_eq!(empty.next(), None);
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn page_flush_decision_boundaries() {
+        let mut writer =
+            get_test_column_writer::<Int32Type>(get_test_page_writer(), 0, 0, Default::default());
+        assert!(!writer.should_add_data_page());
+        writer.page_metrics.num_buffered_values = MAX_DATA_PAGE_VALUE_COUNT;
+        assert!(writer.should_add_data_page());
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn level_runs_slice_matrix_matches_materialized() {
+        let ends = [3, 5, 9, 12];
+        let values = [2, 0, 3, 1];
+        let materialized = [2, 2, 2, 0, 0, 3, 3, 3, 3, 1, 1, 1];
+        let runs = RunLevelsRef::from_level_runs(&ends, &values, 0, materialized.len());
+
+        for offset in 0..=materialized.len() {
+            for len in 0..=materialized.len() - offset {
+                let expected = &materialized[offset..offset + len];
+                let sliced = runs.slice(offset, len);
+                let levels = LevelDataRef::Runs(sliced);
+
+                assert_eq!(levels.len(), len, "offset={offset}, len={len}");
+                assert_eq!(levels.first(), expected.first().copied());
+                assert_eq!(levels.cursor().collect::<Vec<_>>(), expected);
+                assert_eq!(
+                    levels.value_count(len, 3),
+                    expected.iter().filter(|&&v| v == 3).count()
+                );
+                for idx in 0..=len {
+                    assert_eq!(
+                        levels.value_at(idx),
+                        expected.get(idx).copied(),
+                        "offset={offset}, len={len}, idx={idx}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn level_runs_encoding_matches_materialized_for_every_slice() {
+        let ends = [1, 3, 11, 12, 20];
+        let values = [0, 2, 1, 3, 0];
+        let materialized = [0, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0];
+        let runs = RunLevelsRef::from_level_runs(&ends, &values, 0, materialized.len());
+
+        for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+            for offset in 0..=materialized.len() {
+                for len in 0..=materialized.len() - offset {
+                    let make_encoder = || match version {
+                        WriterVersion::PARQUET_1_0 => LevelEncoder::v1_streaming(3),
+                        WriterVersion::PARQUET_2_0 => LevelEncoder::v2_streaming(3),
+                    };
+                    let encode = |levels| {
+                        let mut encoder = make_encoder();
+                        let mut histogram = [0usize; 4];
+                        encode_level_data_with(&mut encoder, levels, |level, count| {
+                            histogram[level as usize] += count
+                        });
+                        (histogram, encoder.consume())
+                    };
+                    let (actual_histogram, actual) =
+                        encode(LevelDataRef::Runs(runs.slice(offset, len)));
+                    let (expected_histogram, expected) = encode(LevelDataRef::Materialized(
+                        &materialized[offset..offset + len],
+                    ));
+
+                    assert_eq!(actual_histogram, expected_histogram);
+                    assert_eq!(
+                        actual, expected,
+                        "version={version:?}, offset={offset}, len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn level_runs_record_boundary_extension_matches_materialized() {
+        assert_eq!(extend_to_record_boundary(LevelDataRef::Absent, 2, 4), 2);
+        assert_eq!(
+            extend_to_record_boundary(LevelDataRef::Uniform { value: 0, count: 4 }, 2, 4,),
+            2
+        );
+        assert_eq!(
+            extend_to_record_boundary(LevelDataRef::Uniform { value: 1, count: 4 }, 2, 4,),
+            4
+        );
+
+        let ends = [1, 3, 4, 6, 7];
+        let values = [0, 1, 0, 1, 0];
+        let materialized = [0, 1, 1, 0, 1, 1, 0];
+        let runs = LevelDataRef::Runs(RunLevelsRef::from_level_runs(
+            &ends,
+            &values,
+            0,
+            materialized.len(),
+        ));
+        let materialized_levels = LevelDataRef::Materialized(&materialized);
+        for (case, levels) in [("level runs", runs)] {
+            for limit in 0..=materialized_levels.len() {
+                for candidate in 0..=limit {
+                    assert_eq!(
+                        extend_to_record_boundary(levels, candidate, limit),
+                        extend_to_record_boundary(materialized_levels, candidate, limit),
+                        "{case}: candidate={candidate}, limit={limit}"
+                    );
+                }
+            }
+        }
+
+        // Sliced views use offsets relative to the view, not the backing runs.
+        let sliced_runs = runs.slice(2, 4);
+        let sliced_materialized = LevelDataRef::Materialized(&materialized[2..6]);
+        for candidate in 0..=4 {
+            assert_eq!(
+                extend_to_record_boundary(sliced_runs, candidate, 4),
+                extend_to_record_boundary(sliced_materialized, candidate, 4),
+            );
+        }
+    }
+
+    #[test]
+    fn test_checked_page_value_increment() {
+        assert_eq!(
+            checked_page_value_increment(0, MAX_DATA_PAGE_VALUE_COUNT as usize).unwrap(),
+            MAX_DATA_PAGE_VALUE_COUNT
+        );
+        assert_eq!(
+            checked_page_value_increment(MAX_DATA_PAGE_VALUE_COUNT - 1, 1).unwrap(),
+            1
+        );
+        assert!(checked_page_value_increment(0, MAX_DATA_PAGE_VALUE_COUNT as usize + 1).is_err());
+        assert!(checked_page_value_increment(MAX_DATA_PAGE_VALUE_COUNT, 1).is_err());
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn repeated_records_respect_the_hard_page_value_limit() {
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .build(),
+        );
+        let mut writer = get_test_column_writer::<Int32Type>(get_test_page_writer(), 0, 1, props);
+        writer.write_batch(&[10], None, Some(&[0])).unwrap();
+        writer.page_metrics.num_buffered_values = MAX_DATA_PAGE_VALUE_COUNT - 1;
+
+        let run_ends = [1, 2];
+        let levels = [0, 1];
+        let rep = LevelDataRef::Runs(RunLevelsRef::from_level_runs(&run_ends, &levels, 0, 2));
+        assert_eq!(
+            writer
+                .write_batch_internal(
+                    &[20_i32, 30][..],
+                    LevelDataRef::Absent,
+                    rep,
+                    None,
+                    None,
+                    None
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(writer.page_metrics.num_buffered_values, 2);
+        assert!(writer.column_metrics.total_bytes_written > 0);
+
+        let mut writer =
+            get_test_column_writer::<Int32Type>(get_test_page_writer(), 1, 1, Default::default());
+        let oversized = MAX_DATA_PAGE_VALUE_COUNT as usize + 1;
+        let run_ends = [1, oversized];
+        let levels = [0, 1];
+        let rep = LevelDataRef::Runs(RunLevelsRef::from_level_runs(
+            &run_ends, &levels, 0, oversized,
+        ));
+        let error = writer
+            .write_batch_internal(
+                &[] as &[i32],
+                LevelDataRef::Uniform {
+                    value: 0,
+                    count: oversized,
+                },
+                rep,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Parquet error: Record contains more than {MAX_DATA_PAGE_VALUE_COUNT} values and cannot fit in a Parquet data page"
+            )
+        );
+    }
 
     #[derive(Clone)]
     struct CustomInt32Type;
@@ -6178,233 +6341,5 @@ mod tests {
         generic_write_batch::<CustomInt32Type>(&mut writer, &[1, 2, 3, 4]).unwrap();
         let result = writer.close().unwrap();
         assert_eq!(result.rows_written, 4);
-    }
-
-    #[test]
-    fn page_flush_decision_boundaries() {
-        let mut writer =
-            get_test_column_writer::<Int32Type>(get_test_page_writer(), 0, 0, Default::default());
-        assert!(!writer.should_add_data_page());
-        writer.page_metrics.num_buffered_values = MAX_DATA_PAGE_VALUE_COUNT;
-        assert!(writer.should_add_data_page());
-    }
-
-    #[test]
-    fn test_checked_page_value_increment() {
-        assert_eq!(
-            checked_page_value_increment(0, MAX_DATA_PAGE_VALUE_COUNT as usize).unwrap(),
-            MAX_DATA_PAGE_VALUE_COUNT
-        );
-        assert_eq!(
-            checked_page_value_increment(MAX_DATA_PAGE_VALUE_COUNT - 1, 1).unwrap(),
-            1
-        );
-        assert!(checked_page_value_increment(0, MAX_DATA_PAGE_VALUE_COUNT as usize + 1).is_err());
-        assert!(checked_page_value_increment(MAX_DATA_PAGE_VALUE_COUNT, 1).is_err());
-    }
-    #[cfg(feature = "arrow")]
-    #[test]
-    fn level_data_cursor_matches_all_representations() {
-        let level_run_ends = [2, 5, 7];
-        let level_run_values = [2, 1, 3];
-        let level_runs = RunLevelsRef::from_level_runs(&level_run_ends, &level_run_values, 1, 5);
-
-        let check = |levels: LevelDataRef<'_>, expected: &[i16]| {
-            let cursor = levels.cursor();
-            assert_eq!(cursor.len(), levels.len());
-            let actual = cursor.collect::<Vec<_>>();
-            assert_eq!(actual.len(), levels.len());
-            assert_eq!(actual, expected);
-        };
-        check(LevelDataRef::Absent, &[]);
-        check(LevelDataRef::Materialized(&[3, 1, 2]), &[3, 1, 2]);
-        check(LevelDataRef::Uniform { value: 4, count: 3 }, &[4, 4, 4]);
-        check(LevelDataRef::Runs(level_runs), &[2, 1, 1, 1, 3]);
-
-        let empty_runs = RunLevelsRef::from_level_runs(&[], &[], 0, 0);
-        let mut empty = RunLevelCursor::new(empty_runs);
-        assert_eq!(empty.next(), None);
-        assert_eq!(empty.len(), 0);
-    }
-    #[cfg(feature = "arrow")]
-    #[test]
-    fn level_runs_slice_matrix_matches_materialized() {
-        let ends = [3, 5, 9, 12];
-        let values = [2, 0, 3, 1];
-        let materialized = [2, 2, 2, 0, 0, 3, 3, 3, 3, 1, 1, 1];
-        let runs = RunLevelsRef::from_level_runs(&ends, &values, 0, materialized.len());
-
-        for offset in 0..=materialized.len() {
-            for len in 0..=materialized.len() - offset {
-                let expected = &materialized[offset..offset + len];
-                let sliced = runs.slice(offset, len);
-                let levels = LevelDataRef::Runs(sliced);
-
-                assert_eq!(levels.len(), len, "offset={offset}, len={len}");
-                assert_eq!(levels.first(), expected.first().copied());
-                assert_eq!(levels.cursor().collect::<Vec<_>>(), expected);
-                assert_eq!(
-                    levels.value_count(len, 3),
-                    expected.iter().filter(|&&v| v == 3).count()
-                );
-                for idx in 0..=len {
-                    assert_eq!(
-                        levels.value_at(idx),
-                        expected.get(idx).copied(),
-                        "offset={offset}, len={len}, idx={idx}"
-                    );
-                }
-            }
-        }
-    }
-    #[cfg(feature = "arrow")]
-    #[test]
-    fn level_runs_encoding_matches_materialized_for_every_slice() {
-        let ends = [1, 3, 11, 12, 20];
-        let values = [0, 2, 1, 3, 0];
-        let materialized = [0, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0];
-        let runs = RunLevelsRef::from_level_runs(&ends, &values, 0, materialized.len());
-
-        for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
-            for offset in 0..=materialized.len() {
-                for len in 0..=materialized.len() - offset {
-                    let make_encoder = || match version {
-                        WriterVersion::PARQUET_1_0 => LevelEncoder::v1_streaming(3),
-                        WriterVersion::PARQUET_2_0 => LevelEncoder::v2_streaming(3),
-                    };
-                    let encode = |levels| {
-                        let mut encoder = make_encoder();
-                        let mut histogram = [0usize; 4];
-                        encode_level_data_with(&mut encoder, levels, |level, count| {
-                            histogram[level as usize] += count
-                        });
-                        (histogram, encoder.consume())
-                    };
-                    let (actual_histogram, actual) =
-                        encode(LevelDataRef::Runs(runs.slice(offset, len)));
-                    let (expected_histogram, expected) = encode(LevelDataRef::Materialized(
-                        &materialized[offset..offset + len],
-                    ));
-
-                    assert_eq!(actual_histogram, expected_histogram);
-                    assert_eq!(
-                        actual, expected,
-                        "version={version:?}, offset={offset}, len={len}"
-                    );
-                }
-            }
-        }
-    }
-    #[cfg(feature = "arrow")]
-    #[test]
-    fn level_runs_record_boundary_extension_matches_materialized() {
-        assert_eq!(extend_to_record_boundary(LevelDataRef::Absent, 2, 4), 2);
-        assert_eq!(
-            extend_to_record_boundary(LevelDataRef::Uniform { value: 0, count: 4 }, 2, 4,),
-            2
-        );
-        assert_eq!(
-            extend_to_record_boundary(LevelDataRef::Uniform { value: 1, count: 4 }, 2, 4,),
-            4
-        );
-
-        let ends = [1, 3, 4, 6, 7];
-        let values = [0, 1, 0, 1, 0];
-        let materialized = [0, 1, 1, 0, 1, 1, 0];
-        let runs = LevelDataRef::Runs(RunLevelsRef::from_level_runs(
-            &ends,
-            &values,
-            0,
-            materialized.len(),
-        ));
-        let materialized_levels = LevelDataRef::Materialized(&materialized);
-        for (case, levels) in [("level runs", runs)] {
-            for limit in 0..=materialized_levels.len() {
-                for candidate in 0..=limit {
-                    assert_eq!(
-                        extend_to_record_boundary(levels, candidate, limit),
-                        extend_to_record_boundary(materialized_levels, candidate, limit),
-                        "{case}: candidate={candidate}, limit={limit}"
-                    );
-                }
-            }
-        }
-
-        // Sliced views use offsets relative to the view, not the backing runs.
-        let sliced_runs = runs.slice(2, 4);
-        let sliced_materialized = LevelDataRef::Materialized(&materialized[2..6]);
-        for candidate in 0..=4 {
-            assert_eq!(
-                extend_to_record_boundary(sliced_runs, candidate, 4),
-                extend_to_record_boundary(sliced_materialized, candidate, 4),
-            );
-        }
-    }
-    #[cfg(feature = "arrow")]
-    #[test]
-    fn repeated_records_respect_the_hard_page_value_limit() {
-        let props = Arc::new(
-            WriterProperties::builder()
-                .set_dictionary_enabled(false)
-                .build(),
-        );
-        let mut writer = get_test_column_writer::<Int32Type>(get_test_page_writer(), 0, 1, props);
-        writer.write_batch(&[10], None, Some(&[0])).unwrap();
-        writer.page_metrics.num_buffered_values = MAX_DATA_PAGE_VALUE_COUNT - 1;
-
-        let run_ends = [1, 2];
-        let levels = [0, 1];
-        let rep = LevelDataRef::Runs(RunLevelsRef::from_level_runs(&run_ends, &levels, 0, 2));
-        assert_eq!(
-            writer
-                .write_batch_internal(
-                    &[20_i32, 30][..],
-                    LevelDataRef::Absent,
-                    rep,
-                    None,
-                    None,
-                    None
-                )
-                .unwrap(),
-            2
-        );
-        assert_eq!(writer.page_metrics.num_buffered_values, 2);
-        assert!(writer.column_metrics.total_bytes_written > 0);
-
-        let mut writer =
-            get_test_column_writer::<Int32Type>(get_test_page_writer(), 1, 1, Default::default());
-        let oversized = MAX_DATA_PAGE_VALUE_COUNT as usize + 1;
-        let run_ends = [1, oversized];
-        let levels = [0, 1];
-        let rep = LevelDataRef::Runs(RunLevelsRef::from_level_runs(
-            &run_ends, &levels, 0, oversized,
-        ));
-        let error = writer
-            .write_batch_internal(
-                &[] as &[i32],
-                LevelDataRef::Uniform {
-                    value: 0,
-                    count: oversized,
-                },
-                rep,
-                None,
-                None,
-                None,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "Parquet error: Record contains more than {MAX_DATA_PAGE_VALUE_COUNT} values and cannot fit in a Parquet data page"
-            )
-        );
-    }
-    #[cfg(feature = "arrow")]
-    #[test]
-    fn test_flush_empty_data_page_is_noop() {
-        let descr = Arc::new(get_test_column_descr::<Int32Type>(0, 0));
-        let mut writer = get_column_writer(descr, Default::default(), get_test_page_writer());
-        writer.flush_data_page().unwrap();
-        assert_eq!(writer.close().unwrap().bytes_written, 0);
     }
 }

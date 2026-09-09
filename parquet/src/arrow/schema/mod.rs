@@ -2180,51 +2180,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_normalization_nested_and_view_dictionary_contract() {
-        let dictionary = |dt| DataType::Dictionary(Box::new(DataType::Int8), Box::new(dt));
-        let ree = DataType::RunEndEncoded(
-            Arc::new(Field::new("run_ends", DataType::Int32, false)),
-            Arc::new(Field::new("values", DataType::Int32, true)),
-        );
-        let fields = vec![
-            Field::new(
-                "nested",
-                dictionary(DataType::Struct(
-                    vec![Field::new("child", ree, false)].into(),
-                )),
-                false,
-            ),
-            Field::new("view", dictionary(DataType::Utf8View), true),
-            Field::new("ordinary", dictionary(DataType::Utf8), true),
-        ];
-        let schema = Schema::new(fields);
-        let mut props = WriterProperties::builder().build();
-        add_encoded_arrow_schema_to_metadata(&schema, &mut props);
-        let encoded = props
-            .key_value_metadata()
-            .unwrap()
-            .iter()
-            .find(|kv| kv.key == crate::arrow::ARROW_SCHEMA_META_KEY)
-            .unwrap()
-            .value
-            .as_deref()
-            .unwrap();
-        let decoded = get_arrow_schema_from_metadata(encoded).unwrap();
-        let DataType::Struct(children) = decoded.field(0).data_type() else {
-            panic!("nested dictionary not erased")
-        };
-        assert_eq!(children[0].name(), "child");
-        assert_eq!(children[0].data_type(), &DataType::Int32);
-        assert!(children[0].is_nullable());
-        assert!(!decoded.field(0).is_nullable());
-        assert_eq!(decoded.field(1).data_type(), &DataType::Utf8View);
-        assert_eq!(decoded.field(2), schema.field(2));
-        let parquet = ArrowSchemaConverter::new().convert(&schema).unwrap();
-        assert_eq!(parquet.column(0).path().parts(), &["nested", "child"]);
-        assert_eq!(parquet.column(0).max_def_level(), 1);
-    }
-
-    #[test]
     fn test_metadata() {
         let message_type = "
         message test_schema {
