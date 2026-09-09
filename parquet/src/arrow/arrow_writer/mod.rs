@@ -28,7 +28,7 @@ use std::vec::IntoIter;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchWriter, new_empty_array};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchWriter, new_empty_array};
 use arrow_schema::{
     ArrowError, DataType as ArrowDataType, Field, FieldRef, IntervalUnit, SchemaRef, TimeUnit,
 };
@@ -40,10 +40,10 @@ use crate::arrow::arrow_writer::byte_array::ByteArrayStorage;
 use crate::basic::PageType;
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
-use crate::column::value_batch::{BatchSink, map_values};
+use crate::column::value_batch::{BatchSink, RunBatch, gather_run_groups_tiled, map_values};
 use crate::column::value_selection::{DictionaryKeys, PhysicalValueSelection, ValueSelectionRef};
-use crate::column::writer::encoder::ColumnChunkEncoder;
 use crate::column::writer::encoder::{
+    ColumnChunkEncoder, FIXED_LEN_BYTE_ARRAY_BATCH_VALUES, FIXED_LEN_BYTE_ARRAY_MAX_WIDTH,
     FixedLenByteArrayBatch, FixedLenByteArrayBatchPacker, FixedLenByteArraySink,
     FixedLenByteArraySource, PhysicalNumericSource, TypedColumnChunkEncoder,
 };
