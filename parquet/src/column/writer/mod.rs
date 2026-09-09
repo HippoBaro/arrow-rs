@@ -132,13 +132,20 @@ impl ColumnWriter<'_> {
         downcast_writer!(self, typed, typed.get_estimated_total_bytes())
     }
 
-    /// Finalize the currently buffered values as a data page.
+    /// Finalize the currently buffered values as a data page. This is a no-op
+    /// when the page is already empty.
     ///
-    /// This is used by content-defined chunking to force a page boundary at
+    /// Content-defined framing uses this to force page boundaries at
     /// content-determined positions.
     #[cfg(feature = "arrow")]
-    pub(crate) fn add_data_page(&mut self) -> Result<()> {
-        downcast_writer!(self, typed, typed.add_data_page())
+    pub(crate) fn flush_data_page(&mut self) -> Result<()> {
+        downcast_writer!(self, typed, {
+            if typed.page_metrics.num_buffered_values == 0 {
+                Ok(())
+            } else {
+                typed.add_data_page()
+            }
+        })
     }
 
     /// Close this [`ColumnWriter`], returning the metadata for the column chunk.
@@ -449,7 +456,7 @@ impl<'a> LevelDataRef<'a> {
         }
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(all(feature = "arrow", test))]
     #[inline]
     pub(crate) fn value_at(self, idx: usize) -> Option<i16> {
         match self {
@@ -5498,6 +5505,23 @@ mod tests {
         dict_page_size: usize,
     }
 
+    fn write_and_collect_pages_with<T: DataType>(
+        props: WriterProperties,
+        max_def_level: i16,
+        max_rep_level: i16,
+        write_batch: impl FnOnce(&mut ColumnWriterImpl<'_, T>) -> Result<()>,
+    ) -> CollectedPages {
+        let mut file = tempfile::tempfile().unwrap();
+        let mut write = TrackedWrite::new(&mut file);
+        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
+        let mut writer =
+            get_test_column_writer::<T>(page_writer, max_def_level, max_rep_level, Arc::new(props));
+        write_batch(&mut writer).unwrap();
+        let result = writer.close().unwrap();
+        drop(write);
+        collect_written_pages(file, result)
+    }
+
     /// Writes `data` (with optional def/rep levels) through a raw
     /// `ColumnWriterImpl` configured by `props`, then re-reads the file and
     /// returns its page layout. Shared by the page-size regression tests so
@@ -5510,23 +5534,20 @@ mod tests {
         def_levels: Option<&[i16]>,
         rep_levels: Option<&[i16]>,
     ) -> CollectedPages {
-        let mut file = tempfile::tempfile().unwrap();
-        let mut write = TrackedWrite::new(&mut file);
-        let page_writer = Box::new(SerializedPageWriter::new(&mut write));
-        let mut writer =
-            get_test_column_writer::<T>(page_writer, max_def_level, max_rep_level, Arc::new(props));
-        writer.write_batch(data, def_levels, rep_levels).unwrap();
-        let r = writer.close().unwrap();
-        drop(write);
+        write_and_collect_pages_with::<T>(props, max_def_level, max_rep_level, |writer| {
+            writer.write_batch(data, def_levels, rep_levels).map(|_| ())
+        })
+    }
 
+    fn collect_written_pages(file: std::fs::File, result: ColumnCloseResult) -> CollectedPages {
         let read_props = ReaderProperties::builder()
             .set_backward_compatible_lz4(false)
             .build();
         let mut page_reader = Box::new(
             SerializedPageReader::new_with_properties(
                 Arc::new(file),
-                &r.metadata,
-                r.rows_written as usize,
+                &result.metadata,
+                result.rows_written as usize,
                 None,
                 Arc::new(read_props),
             )
@@ -6386,5 +6407,13 @@ mod tests {
                 "Parquet error: Record contains more than {MAX_DATA_PAGE_VALUE_COUNT} values and cannot fit in a Parquet data page"
             )
         );
+    }
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_flush_empty_data_page_is_noop() {
+        let descr = Arc::new(get_test_column_descr::<Int32Type>(0, 0));
+        let mut writer = get_column_writer(descr, Default::default(), get_test_page_writer());
+        writer.flush_data_page().unwrap();
+        assert_eq!(writer.close().unwrap().bytes_written, 0);
     }
 }
