@@ -21,17 +21,21 @@ use self::byte_array::encode_byte_slice;
 use crate::basic::{ConvertedType, Encoding, LogicalType, Type};
 use crate::bloom_filter::Sbbf;
 use crate::column::value_batch::{BatchSink, ValueProducer};
+#[cfg(feature = "arrow")]
+use crate::column::value_batch::{gather_tiled, map_values};
+#[cfg(feature = "arrow")]
+use crate::column::value_selection::PhysicalValueSelection;
 use crate::column::writer::{compare_greater_byte_array, is_f16_nan};
 use crate::column::writer::{fallback_encoding, has_dictionary_support, update_max, update_min};
 use crate::data_type::FixedLenByteArrayType;
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::{BoolType, ByteArray, DataType, FixedLenByteArray, Int96};
-use crate::encodings::encoding::FixedLenByteArrayEncoder;
 use crate::encodings::encoding::{BoolBatch, BoolEncoder};
 use crate::encodings::encoding::{
     BoolEncodingFamily, ByteArrayEncodingFamily, DictEncoder, DictionaryValue, Encoder,
     EncodingFamily, FixedLenByteArrayEncodingFamily, NumericEncodingFamily, PlainEncoderType,
 };
+use crate::encodings::encoding::{FixedLenByteArrayEncoder, PackedFixedLenByteArrayBatch};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
@@ -43,8 +47,16 @@ pub(super) mod byte_array;
 mod fixed_len_byte_array;
 mod numeric;
 
+#[cfg(feature = "arrow")]
+pub(crate) use fixed_len_byte_array::FixedLenByteArrayBatchPacker;
 use fixed_len_byte_array::encode_fixed_len_byte_array_slice;
+#[cfg(feature = "arrow")]
+pub(crate) use fixed_len_byte_array::{
+    FixedLenByteArrayBatch, FixedLenByteArraySink, FixedLenByteArraySource,
+};
 use numeric::NumericBatch;
+#[cfg(feature = "arrow")]
+pub(crate) use numeric::PhysicalNumericSource;
 /// The encoded data for a dictionary page
 pub struct DictionaryPage {
     pub buf: Bytes,
@@ -603,6 +615,10 @@ fn plain_encoded_byte_size<T: DataType>(value: &T::T) -> usize {
     }
 }
 
+/// How many leading present values fit in `byte_budget` bytes. The value that
+/// crosses the budget is included so the post-write page check flushes on this
+/// mini-batch rather than leaving a sliver for the next page.
+#[inline]
 pub(crate) fn count_within_budget<'a, T: DataType>(
     byte_budget: usize,
     vals: impl Iterator<Item = &'a T::T>,
@@ -620,4 +636,89 @@ where
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixed_len_byte_array::{
+        FixedLenByteArrayBatch, FixedLenByteArraySink, FixedLenByteArraySource,
+    };
+    use super::*;
+    use crate::encodings::encoding::PackedFixedLenByteArrayBatch;
+    use crate::schema::types::{ColumnPath, Type as SchemaType};
+    use std::sync::Arc;
+    #[test]
+    fn packed_fixed_len_byte_array_batches_merge_statistics() {
+        let primitive = SchemaType::primitive_type_builder("col", Type::FIXED_LEN_BYTE_ARRAY)
+            .with_length(2)
+            .with_logical_type(Some(LogicalType::Float16))
+            .build()
+            .unwrap();
+        let descriptor = Arc::new(ColumnDescriptor::new(
+            Arc::new(primitive),
+            0,
+            0,
+            ColumnPath::from("col"),
+        ));
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .build();
+        let mut encoder =
+            TypedColumnChunkEncoder::<FixedLenByteArrayType>::try_new(&descriptor, &properties)
+                .unwrap();
+
+        struct PackedSource<'a>(&'a [&'a [u8]]);
+        impl FixedLenByteArraySource for PackedSource<'_> {
+            fn len(&self) -> usize {
+                self.0.iter().map(|batch| batch.len() / 2).sum()
+            }
+
+            fn write_to(
+                self,
+                sink: &mut FixedLenByteArraySink<'_>,
+                _: Option<usize>,
+            ) -> Result<()> {
+                for batch in self.0 {
+                    sink.push_batch(FixedLenByteArrayBatch::Packed(
+                        PackedFixedLenByteArrayBatch::new(batch, 2, batch.len() / 2),
+                    ))?;
+                }
+                Ok(())
+            }
+        }
+
+        let all_nan: &[&[u8]] = &[&[0x01, 0x7e], &[0x01, 0xfe]];
+        let mixed: &[&[u8]] = &[
+            &[0x01, 0x7e, 0x01, 0xfe],
+            &[0x00, 0x42, 0x00, 0xc0], // 3.0, -2.0
+            &[0x00, 0x7e],
+        ];
+        for (batches, min, max, nan_count) in [
+            (all_nan, [0x01, 0xfe], [0x01, 0x7e], 2),
+            (mixed, [0x00, 0xc0], [0x00, 0x42], 3),
+        ] {
+            encoder
+                .write_fixed_len_byte_array_source(PackedSource(batches))
+                .unwrap();
+            let page = encoder.flush_data_page().unwrap();
+            assert_eq!(page.min_value, Some(min.to_vec().into()));
+            assert_eq!(page.max_value, Some(max.to_vec().into()));
+            assert_eq!(page.nan_count, Some(nan_count));
+        }
+
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .set_writer_version(crate::file::properties::WriterVersion::PARQUET_2_0)
+            .build();
+        let mut encoder =
+            TypedColumnChunkEncoder::<FixedLenByteArrayType>::try_new(&descriptor, &properties)
+                .unwrap();
+        let values = [FixedLenByteArray::from(vec![0_u8; 2])];
+        encoder
+            .write_fixed_len_byte_array_source(&values[..])
+            .unwrap();
+        assert!(encoder.flush_dict_page().is_err());
+        encoder.flush_data_page().unwrap();
+        assert!(encoder.flush_dict_page().unwrap().is_some());
+    }
 }
