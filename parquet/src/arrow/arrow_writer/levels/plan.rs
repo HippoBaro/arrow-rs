@@ -15,16 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::column::value_selection::ValueSelectionRef;
-#[cfg(test)]
-use crate::column::value_selection::{RangesSelectionRef, SelectionRange};
+use crate::column::value_selection::{RangesSelectionRef, SelectionRange, ValueSelectionRef};
 use crate::column::writer::{LevelDataRef, LevelValueWindow};
 use arrow_array::Array;
-#[cfg(test)]
 use arrow_buffer::NullBuffer;
-#[cfg(test)]
 use arrow_buffer::bit_iterator::BitIndexIterator;
-#[cfg(test)]
 use std::ops::Range;
 
 pub(super) const LEVEL_RUN_PROBE_SIZE: usize = 128;
@@ -36,7 +31,6 @@ pub(super) const MIN_AVERAGE_LEVEL_RUN_LENGTH: usize = 8;
 /// vector's capacity for every index it appends, and does so from an outlined
 /// call. Filling the spare capacity directly keeps the append a counted loop.
 /// `upper_bound` only has to be a hint: the fill repeats if it runs short.
-#[cfg(test)]
 #[inline]
 fn extend_indices(
     indices: &mut Vec<usize>,
@@ -68,7 +62,6 @@ fn extend_indices(
 }
 
 /// Owned value positions for one reusable cursor tile.
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum ValueSelection {
     Empty,
@@ -83,7 +76,6 @@ pub(crate) enum ValueSelection {
     Sparse(Vec<usize>),
 }
 
-#[cfg(test)]
 impl ValueSelection {
     pub(crate) fn as_ref(&self) -> ValueSelectionRef<'_> {
         match self {
