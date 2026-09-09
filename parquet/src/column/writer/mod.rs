@@ -3192,6 +3192,15 @@ mod tests {
         column_roundtrip::<Int32Type>(props, &[], None, None);
     }
 
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn test_flush_empty_data_page_is_noop() {
+        let descr = Arc::new(get_test_column_descr::<Int32Type>(0, 0));
+        let mut writer = get_column_writer(descr, Default::default(), get_test_page_writer());
+        writer.flush_data_page().unwrap();
+        assert_eq!(writer.close().unwrap().bytes_written, 0);
+    }
+
     #[test]
     fn test_column_writer_non_nullable_values_roundtrip() {
         let props = Default::default();
@@ -6074,132 +6083,6 @@ mod tests {
                 .run();
         }
     }
-
-    #[derive(Clone)]
-    struct CustomInt32Type;
-
-    impl DataType for CustomInt32Type {
-        type T = i32;
-
-        fn get_type_size() -> usize {
-            std::mem::size_of::<Self::T>()
-        }
-
-        // `ColumnReader` and `ColumnWriter` contain only the built-in marker
-        // variants, so a custom marker has no corresponding enum downcast.
-        fn get_column_reader(_: ColumnReader) -> Option<ColumnReaderImpl<Self>> {
-            None
-        }
-
-        fn get_column_writer(_: ColumnWriter<'_>) -> Option<ColumnWriterImpl<'_, Self>> {
-            None
-        }
-
-        fn get_column_writer_ref<'a, 'b: 'a>(
-            _: &'b ColumnWriter<'a>,
-        ) -> Option<&'b ColumnWriterImpl<'a, Self>> {
-            None
-        }
-
-        fn get_column_writer_mut<'a, 'b: 'a>(
-            _: &'a mut ColumnWriter<'b>,
-        ) -> Option<&'a mut ColumnWriterImpl<'b, Self>> {
-            None
-        }
-    }
-
-    // The distinct implementations verify that `ColumnWriterImpl` retains its
-    // `DataType` marker as part of the public alias's type identity.
-    trait MarkerSpecificColumnWriter {}
-
-    impl<'a> MarkerSpecificColumnWriter for ColumnWriterImpl<'a, Int32Type> {}
-    impl<'a> MarkerSpecificColumnWriter for ColumnWriterImpl<'a, CustomInt32Type> {}
-
-    fn generic_typed_writer<T: DataType>(writer: ColumnWriter<'_>) -> ColumnWriterImpl<'_, T> {
-        get_typed_column_writer::<T>(writer)
-    }
-
-    fn generic_typed_writer_ref<'a, 'b: 'a, T: DataType>(
-        writer: &'b ColumnWriter<'a>,
-    ) -> &'b ColumnWriterImpl<'a, T> {
-        get_typed_column_writer_ref::<T>(writer)
-    }
-
-    fn generic_typed_writer_mut<'a, 'b: 'a, T: DataType>(
-        writer: &'a mut ColumnWriter<'b>,
-    ) -> &'a mut ColumnWriterImpl<'b, T> {
-        get_typed_column_writer_mut::<T>(writer)
-    }
-
-    fn generic_serialized_typed_writer<'a, 'b, T: DataType>(
-        writer: &'b mut crate::file::writer::SerializedColumnWriter<'a>,
-    ) -> &'b mut ColumnWriterImpl<'a, T> {
-        writer.typed::<T>()
-    }
-
-    fn generic_write_batch<T: DataType>(
-        writer: &mut ColumnWriterImpl<'_, T>,
-        values: &[T::T],
-    ) -> Result<usize> {
-        writer.write_batch(values, None, None)
-    }
-
-    #[test]
-    fn test_data_type_bound_supports_typed_writer_api() {
-        let new_writer = || {
-            let descr = Arc::new(get_test_column_descr::<Int32Type>(0, 0));
-            get_column_writer(descr, Default::default(), get_test_page_writer())
-        };
-
-        let _: ColumnWriterImpl<'_, Int32Type> = generic_typed_writer::<Int32Type>(new_writer());
-
-        let mut writer = new_writer();
-        let _: &ColumnWriterImpl<'_, Int32Type> = generic_typed_writer_ref::<Int32Type>(&writer);
-        let _: &mut ColumnWriterImpl<'_, Int32Type> =
-            generic_typed_writer_mut::<Int32Type>(&mut writer);
-
-        let mut writer = crate::file::writer::SerializedColumnWriter::new(new_writer(), None);
-        let _: &mut ColumnWriterImpl<'_, Int32Type> =
-            generic_serialized_typed_writer::<Int32Type>(&mut writer);
-    }
-
-    #[test]
-    fn test_custom_data_type_supports_column_writer() {
-        fn assert_marker_specific<T: MarkerSpecificColumnWriter>() {}
-        assert_marker_specific::<ColumnWriterImpl<'_, Int32Type>>();
-        assert_marker_specific::<ColumnWriterImpl<'_, CustomInt32Type>>();
-
-        let descr = Arc::new(get_test_column_descr::<CustomInt32Type>(0, 0));
-        let mut writer: ColumnWriterImpl<'_, CustomInt32Type> =
-            GenericColumnWriter::new(descr, Default::default(), get_test_page_writer());
-
-        generic_write_batch::<CustomInt32Type>(&mut writer, &[1, 2, 3, 4]).unwrap();
-        let result = writer.close().unwrap();
-        assert_eq!(result.rows_written, 4);
-    }
-
-    #[test]
-    fn page_flush_decision_boundaries() {
-        let mut writer =
-            get_test_column_writer::<Int32Type>(get_test_page_writer(), 0, 0, Default::default());
-        assert!(!writer.should_add_data_page());
-        writer.page_metrics.num_buffered_values = MAX_DATA_PAGE_VALUE_COUNT;
-        assert!(writer.should_add_data_page());
-    }
-
-    #[test]
-    fn test_checked_page_value_increment() {
-        assert_eq!(
-            checked_page_value_increment(0, MAX_DATA_PAGE_VALUE_COUNT as usize).unwrap(),
-            MAX_DATA_PAGE_VALUE_COUNT
-        );
-        assert_eq!(
-            checked_page_value_increment(MAX_DATA_PAGE_VALUE_COUNT - 1, 1).unwrap(),
-            1
-        );
-        assert!(checked_page_value_increment(0, MAX_DATA_PAGE_VALUE_COUNT as usize + 1).is_err());
-        assert!(checked_page_value_increment(MAX_DATA_PAGE_VALUE_COUNT, 1).is_err());
-    }
     #[cfg(feature = "arrow")]
     #[test]
     fn level_data_cursor_matches_all_representations() {
@@ -6223,6 +6106,15 @@ mod tests {
         let mut empty = RunLevelCursor::new(empty_runs);
         assert_eq!(empty.next(), None);
         assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn page_flush_decision_boundaries() {
+        let mut writer =
+            get_test_column_writer::<Int32Type>(get_test_page_writer(), 0, 0, Default::default());
+        assert!(!writer.should_add_data_page());
+        writer.page_metrics.num_buffered_values = MAX_DATA_PAGE_VALUE_COUNT;
+        assert!(writer.should_add_data_page());
     }
 
     #[cfg(feature = "arrow")]
@@ -6342,6 +6234,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_checked_page_value_increment() {
+        assert_eq!(
+            checked_page_value_increment(0, MAX_DATA_PAGE_VALUE_COUNT as usize).unwrap(),
+            MAX_DATA_PAGE_VALUE_COUNT
+        );
+        assert_eq!(
+            checked_page_value_increment(MAX_DATA_PAGE_VALUE_COUNT - 1, 1).unwrap(),
+            1
+        );
+        assert!(checked_page_value_increment(0, MAX_DATA_PAGE_VALUE_COUNT as usize + 1).is_err());
+        assert!(checked_page_value_increment(MAX_DATA_PAGE_VALUE_COUNT, 1).is_err());
+    }
+
     #[cfg(feature = "arrow")]
     #[test]
     fn repeated_records_respect_the_hard_page_value_limit() {
@@ -6402,12 +6308,106 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "arrow")]
+    #[derive(Clone)]
+    struct CustomInt32Type;
+
+    impl DataType for CustomInt32Type {
+        type T = i32;
+
+        fn get_type_size() -> usize {
+            std::mem::size_of::<Self::T>()
+        }
+
+        // `ColumnReader` and `ColumnWriter` contain only the built-in marker
+        // variants, so a custom marker has no corresponding enum downcast.
+        fn get_column_reader(_: ColumnReader) -> Option<ColumnReaderImpl<Self>> {
+            None
+        }
+
+        fn get_column_writer(_: ColumnWriter<'_>) -> Option<ColumnWriterImpl<'_, Self>> {
+            None
+        }
+
+        fn get_column_writer_ref<'a, 'b: 'a>(
+            _: &'b ColumnWriter<'a>,
+        ) -> Option<&'b ColumnWriterImpl<'a, Self>> {
+            None
+        }
+
+        fn get_column_writer_mut<'a, 'b: 'a>(
+            _: &'a mut ColumnWriter<'b>,
+        ) -> Option<&'a mut ColumnWriterImpl<'b, Self>> {
+            None
+        }
+    }
+
+    // The distinct implementations verify that `ColumnWriterImpl` retains its
+    // `DataType` marker as part of the public alias's type identity.
+    trait MarkerSpecificColumnWriter {}
+
+    impl<'a> MarkerSpecificColumnWriter for ColumnWriterImpl<'a, Int32Type> {}
+    impl<'a> MarkerSpecificColumnWriter for ColumnWriterImpl<'a, CustomInt32Type> {}
+
+    fn generic_typed_writer<T: DataType>(writer: ColumnWriter<'_>) -> ColumnWriterImpl<'_, T> {
+        get_typed_column_writer::<T>(writer)
+    }
+
+    fn generic_typed_writer_ref<'a, 'b: 'a, T: DataType>(
+        writer: &'b ColumnWriter<'a>,
+    ) -> &'b ColumnWriterImpl<'a, T> {
+        get_typed_column_writer_ref::<T>(writer)
+    }
+
+    fn generic_typed_writer_mut<'a, 'b: 'a, T: DataType>(
+        writer: &'a mut ColumnWriter<'b>,
+    ) -> &'a mut ColumnWriterImpl<'b, T> {
+        get_typed_column_writer_mut::<T>(writer)
+    }
+
+    fn generic_serialized_typed_writer<'a, 'b, T: DataType>(
+        writer: &'b mut crate::file::writer::SerializedColumnWriter<'a>,
+    ) -> &'b mut ColumnWriterImpl<'a, T> {
+        writer.typed::<T>()
+    }
+
+    fn generic_write_batch<T: DataType>(
+        writer: &mut ColumnWriterImpl<'_, T>,
+        values: &[T::T],
+    ) -> Result<usize> {
+        writer.write_batch(values, None, None)
+    }
+
     #[test]
-    fn test_flush_empty_data_page_is_noop() {
-        let descr = Arc::new(get_test_column_descr::<Int32Type>(0, 0));
-        let mut writer = get_column_writer(descr, Default::default(), get_test_page_writer());
-        writer.flush_data_page().unwrap();
-        assert_eq!(writer.close().unwrap().bytes_written, 0);
+    fn test_data_type_bound_supports_typed_writer_api() {
+        let new_writer = || {
+            let descr = Arc::new(get_test_column_descr::<Int32Type>(0, 0));
+            get_column_writer(descr, Default::default(), get_test_page_writer())
+        };
+
+        let _: ColumnWriterImpl<'_, Int32Type> = generic_typed_writer::<Int32Type>(new_writer());
+
+        let mut writer = new_writer();
+        let _: &ColumnWriterImpl<'_, Int32Type> = generic_typed_writer_ref::<Int32Type>(&writer);
+        let _: &mut ColumnWriterImpl<'_, Int32Type> =
+            generic_typed_writer_mut::<Int32Type>(&mut writer);
+
+        let mut writer = crate::file::writer::SerializedColumnWriter::new(new_writer(), None);
+        let _: &mut ColumnWriterImpl<'_, Int32Type> =
+            generic_serialized_typed_writer::<Int32Type>(&mut writer);
+    }
+
+    #[test]
+    fn test_custom_data_type_supports_column_writer() {
+        fn assert_marker_specific<T: MarkerSpecificColumnWriter>() {}
+        assert_marker_specific::<ColumnWriterImpl<'_, Int32Type>>();
+        assert_marker_specific::<ColumnWriterImpl<'_, CustomInt32Type>>();
+
+        let descr = Arc::new(get_test_column_descr::<CustomInt32Type>(0, 0));
+        let mut writer: ColumnWriterImpl<'_, CustomInt32Type> =
+            GenericColumnWriter::new(descr, Default::default(), get_test_page_writer());
+
+        generic_write_batch::<CustomInt32Type>(&mut writer, &[1, 2, 3, 4]).unwrap();
+        let result = writer.close().unwrap();
+        assert_eq!(result.rows_written, 4);
     }
 }
