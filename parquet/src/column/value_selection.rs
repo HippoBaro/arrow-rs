@@ -21,7 +21,6 @@
 //! planning. [`PhysicalValueSelection`] maps those positions through optional
 //! dictionary keys to the physical value array.
 
-#[cfg(test)]
 use std::slice;
 use std::{mem::MaybeUninit, ops::Range};
 
@@ -214,7 +213,6 @@ impl<'a> ValueSelectionRef<'a> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn cursor(self) -> ValueSelectionCursor<'a> {
         match self {
             Self::Empty => ValueSelectionCursor::Empty,
@@ -269,7 +267,6 @@ impl<'a> ValueSelectionRef<'a> {
 /// Exact-size sequential traversal of a value selection. This is deliberately
 /// separate from the encoder-facing `ValueProducer`: it yields source positions
 /// while CDC zips positions with definition and repetition levels.
-#[cfg(test)]
 pub(crate) enum ValueSelectionCursor<'a> {
     Empty,
     Dense(std::ops::Range<usize>),
@@ -277,7 +274,6 @@ pub(crate) enum ValueSelectionCursor<'a> {
     Sparse(slice::Iter<'a, usize>),
 }
 
-#[cfg(test)]
 impl Iterator for ValueSelectionCursor<'_> {
     type Item = usize;
 
@@ -297,7 +293,6 @@ impl Iterator for ValueSelectionCursor<'_> {
     }
 }
 
-#[cfg(test)]
 impl ExactSizeIterator for ValueSelectionCursor<'_> {
     fn len(&self) -> usize {
         match self {
@@ -309,7 +304,6 @@ impl ExactSizeIterator for ValueSelectionCursor<'_> {
     }
 }
 
-#[cfg(test)]
 pub(crate) struct RangesSelectionCursor<'a> {
     ranges: &'a [SelectionRange],
     range_index: usize,
@@ -318,7 +312,6 @@ pub(crate) struct RangesSelectionCursor<'a> {
     remaining: usize,
 }
 
-#[cfg(test)]
 impl<'a> RangesSelectionCursor<'a> {
     pub(crate) fn new(selection: RangesSelectionRef<'a>) -> Self {
         let range_index = selection.range_index(selection.offset);
@@ -343,7 +336,6 @@ impl<'a> RangesSelectionCursor<'a> {
     }
 }
 
-#[cfg(test)]
 impl Iterator for RangesSelectionCursor<'_> {
     type Item = usize;
 
@@ -370,7 +362,6 @@ impl Iterator for RangesSelectionCursor<'_> {
     }
 }
 
-#[cfg(test)]
 impl ExactSizeIterator for RangesSelectionCursor<'_> {
     fn len(&self) -> usize {
         self.remaining
