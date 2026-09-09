@@ -367,12 +367,14 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
                     ));
                 }
 
-                let buf = encoder.write_dict()?;
+                let num_values = encoder.num_entries();
+                let is_sorted = encoder.is_sorted();
+                let buf = encoder.into_dict_page()?;
 
                 Ok(Some(DictionaryPage {
                     buf,
-                    num_values: encoder.num_entries(),
-                    is_sorted: encoder.is_sorted(),
+                    num_values,
+                    is_sorted,
                 }))
             }
             _ => Ok(None),
