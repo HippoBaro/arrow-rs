@@ -416,14 +416,9 @@ impl<W: Write + Send> ArrowWriter<W> {
                 return self.write(batch);
             }
 
-            if let Some(avg_row_bytes) = current_bytes
-                .checked_div(in_progress.buffered_rows)
-                .filter(|avg_row_bytes| *avg_row_bytes > 0)
-            {
+            let avg_row_bytes = current_bytes / in_progress.buffered_rows;
+            if let Some(rows_that_fit) = (max_bytes - current_bytes).checked_div(avg_row_bytes) {
                 // At this point, `current_bytes < max_bytes` (checked above)
-                let remaining_bytes = max_bytes - current_bytes;
-                let rows_that_fit = remaining_bytes.checked_div(avg_row_bytes).unwrap_or(0);
-
                 if batch.num_rows() > rows_that_fit {
                     if rows_that_fit > 0 {
                         let a = batch.slice(0, rows_that_fit);
@@ -615,7 +610,6 @@ impl ArrowWriterOptions {
     ///
     /// impl PageStore for TempFilePageStore {
     ///     fn put(&mut self, value: Bytes) -> Result<PageKey> {
-    ///         // Append to the end of the file
     ///         self.file.seek(SeekFrom::Start(self.end))?;
     ///         self.file.write_all(&value)?;
     ///         let key = PageKey::new(self.locs.len() as u64);
@@ -643,7 +637,7 @@ impl ArrowWriterOptions {
     ///         // type, path), so a real backend might choose to spill only large columns.
     ///         let _ = (args.column_index(), args.column_descriptor());
     ///         Ok(Box::new(TempFilePageStore {
-    ///             file: tempfile::tempfile()?, // temp file is cleaned on drop
+    ///             file: tempfile::tempfile()?,
     ///             end: 0,
     ///             locs: Vec::new(),
     ///         }))
@@ -717,18 +711,11 @@ struct ArrowColumnChunkData {
     keys: Vec<PageKey>,
     /// Handles to the dictionary page's blobs (header then data) in the store.
     ///
-    /// A dictionary page is produced at most once and bounded by
-    /// `dict_page_size_limit`, but it must be written *first* in the chunk even
-    /// though the data pages reach the writer before it (see
-    /// [`PageWriter::defers_dictionary_ordering`]). Its header and data are `put`
-    /// into the store like any other page — which keeps the store uniform, and
-    /// lets an oversized dictionary page spill — and their handles are held apart
-    /// so they can be emitted ahead of the data pages at splice.
-    /// Empty for non-dictionary columns.
+    /// A dictionary page must be written first even though data pages reach the
+    /// writer before it. Keeping its handles separate lets the splice reorder it
+    /// while allowing an oversized dictionary page to spill like any other page.
     dictionary_keys: Vec<PageKey>,
-    /// Serialized length of the dictionary page (0 if there is none), recorded
-    /// so the data pages can be shifted past it when offsets are rewritten to a
-    /// dictionary-first layout at splice.
+    /// Serialized dictionary-page length, used when rewriting data-page offsets.
     dictionary_len: usize,
 }
 
@@ -751,9 +738,7 @@ impl ArrowColumnChunkData {
         Ok(())
     }
 
-    /// Store a dictionary-page blob (header or data) in the page store,
-    /// recording its handle (emitted first at splice) and accumulating its
-    /// serialized length.
+    /// Store a dictionary-page blob and record its handle for first-at-splice ordering.
     fn push_dictionary(&mut self, value: Bytes) -> Result<()> {
         self.dictionary_len += value.len();
         let key = self.store.put(value)?;
@@ -761,32 +746,21 @@ impl ArrowColumnChunkData {
         Ok(())
     }
 
-    /// Bytes this chunk currently holds on the heap: whatever the store keeps
-    /// resident (zero for a spilling backend).
+    /// Bytes this chunk currently holds on the heap.
     fn memory_size(&self) -> usize {
         self.store.memory_size()
     }
 }
 
-/// A streaming iterator over one column chunk's buffered page blobs, in final
-/// file order: the dictionary page (if any) first, then the data pages.
-///
-/// Each blob is taken back out of the [`PageStore`] *as it is
-/// consumed* and released immediately afterwards, so splicing a chunk into the
-/// output file never materializes more than a single page in memory at a time.
-/// This is what keeps the splice phase within the memory bound for a spilling
-/// backend (an in-memory store already holds the bytes, so it is unaffected).
+/// A streaming iterator over a chunk's blobs in final file order.
 struct StreamingColumnChunkPages {
     store: Box<dyn PageStore>,
-    /// Page handles in final file order: the dictionary page first (if any),
-    /// then the data pages.
+    /// Dictionary-page handles first, followed by data-page handles.
     keys: IntoIter<PageKey>,
 }
 
 impl StreamingColumnChunkPages {
     fn new(data: ArrowColumnChunkData) -> Self {
-        // The dictionary page must be emitted first, ahead of the data pages,
-        // even though it was the last page produced.
         let keys = if data.dictionary_keys.is_empty() {
             data.keys
         } else {
@@ -844,8 +818,6 @@ impl ArrowPageWriter {
         self.page_encryptor.as_mut()
     }
 
-    // Mirrors the signature of the encryption-enabled version above, so that the
-    // callers do not need a `cfg` of their own.
     #[cfg(not(feature = "encryption"))]
     #[expect(
         clippy::needless_pass_by_ref_mut,
@@ -898,8 +870,7 @@ impl PageWriter for ArrowPageWriter {
 
         buf.length += compressed_size;
         if spec.page_type == PageType::DICTIONARY_PAGE {
-            // Recorded apart from the data pages so it is emitted first at
-            // splice — see `ArrowColumnChunkData::dictionary_keys`.
+            // Recorded apart from data pages so it is emitted first at splice.
             buf.push_dictionary(header)?;
             buf.push_dictionary(data)?;
         } else {
@@ -1665,13 +1636,14 @@ impl ArrowColumnWriterFactory {
         props: &WriterPropertiesPtr,
         column_index: usize,
     ) -> Result<ArrowColumnWriter> {
+        let cursor_row_limit = props.data_page_row_count_limit();
         let page_writer = self.create_page_writer(descriptor, column_index)?;
         let chunk = page_writer.buffer.clone();
         let writer = get_column_writer(Arc::clone(descriptor), Arc::clone(props), page_writer);
         Ok(ArrowColumnWriter {
             writer,
             chunk,
-            cursor_row_limit: props.data_page_row_count_limit(),
+            cursor_row_limit,
         })
     }
 }
