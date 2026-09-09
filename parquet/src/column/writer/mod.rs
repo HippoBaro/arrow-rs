@@ -28,10 +28,11 @@ use std::collections::{BTreeSet, VecDeque};
 use std::str;
 
 use crate::basic::{
-    BoundaryOrder, Compression, ConvertedType, Encoding, EncodingMask, LogicalType, PageType,
-    SortOrder, Type,
+    BoundaryOrder, Compression, ConvertedType, Encoding, EncodingMask, IntType, LogicalType,
+    PageType, Type,
 };
 use crate::column::page::{CompressedPage, Page, PageWriteSpec, PageWriter};
+use crate::column::writer::encoder::byte_array::ByteMinMaxOrder;
 use crate::column::writer::encoder::{ColumnChunkEncoder, ColumnValues, TypedColumnChunkEncoder};
 use crate::compression::{Codec, CodecOptionsBuilder, create_codec};
 use crate::data_type::private::ParquetValueType;
@@ -48,7 +49,7 @@ use crate::file::properties::{
     EnabledStatistics, WriterProperties, WriterPropertiesPtr, WriterVersion,
 };
 use crate::file::statistics::{Statistics, ValueStatistics};
-use crate::schema::types::{BasicTypeInfo, ColumnDescPtr, ColumnDescriptor};
+use crate::schema::types::{ColumnDescPtr, ColumnDescriptor};
 
 mod byte_budget_chunker;
 pub(crate) mod encoder;
@@ -1119,11 +1120,11 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
                     let new_min = stat.min_opt().unwrap();
                     let new_max = stat.max_opt().unwrap();
                     if let Some((last_min, last_max)) = &self.last_non_null_data_page_min_max {
-                        let basic_info = self.descr.get_basic_info();
+                        let descr = self.descr.as_ref();
                         if self.data_page_boundary_ascending {
                             // If last min/max are greater than new min/max then not ascending anymore
-                            let not_ascending = compare_greater(basic_info, last_min, new_min)
-                                || compare_greater(basic_info, last_max, new_max);
+                            let not_ascending = compare_greater(descr, last_min, new_min)
+                                || compare_greater(descr, last_max, new_max);
                             if not_ascending {
                                 self.data_page_boundary_ascending = false;
                             }
@@ -1131,8 +1132,8 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
 
                         if self.data_page_boundary_descending {
                             // If new min/max are greater than last min/max then not descending anymore
-                            let not_descending = compare_greater(basic_info, new_min, last_min)
-                                || compare_greater(basic_info, new_max, last_max);
+                            let not_descending = compare_greater(descr, new_min, last_min)
+                                || compare_greater(descr, new_max, last_max);
                             if not_descending {
                                 self.data_page_boundary_descending = false;
                             }
@@ -1685,78 +1686,53 @@ impl<'a, E: ColumnChunkEncoder> GenericColumnWriter<'a, E> {
 fn update_min<T: ParquetValueType>(descr: &ColumnDescriptor, val: &T, min: &mut Option<T>) {
     match min {
         None => *min = Some(val.clone()),
-        Some(min) => {
-            let basic_type_info = descr.get_basic_info();
-            let is_min_nan = is_nan(basic_type_info, min);
-            let is_val_nan = is_nan(basic_type_info, val);
-            match (is_min_nan, is_val_nan) {
-                // current min is not NaN, but incoming is NaN: skip
-                (false, true) => {}
-                // current min is NaN, but incoming is not: assign val to min
-                (true, false) => *min = val.clone(),
-                // both NaN or non-NaN, safe to call update_stat()
-                _ => {
-                    update_stat::<T, _>(val, min, |cur| compare_greater(basic_type_info, cur, val))
-                }
-            }
-        }
+        Some(current) => match (is_nan(descr, current), is_nan(descr, val)) {
+            (false, true) => {}
+            (true, false) => *current = val.clone(),
+            _ if compare_greater(descr, current, val) => *current = val.clone(),
+            _ => {}
+        },
     }
 }
 
 fn update_max<T: ParquetValueType>(descr: &ColumnDescriptor, val: &T, max: &mut Option<T>) {
     match max {
         None => *max = Some(val.clone()),
-        Some(max) => {
-            let basic_type_info = descr.get_basic_info();
-            let is_max_nan = is_nan(basic_type_info, max);
-            let is_val_nan = is_nan(basic_type_info, val);
-            match (is_max_nan, is_val_nan) {
-                // current max is not NaN, but incoming is NaN: skip
-                (false, true) => {}
-                // current max is NaN, but incoming is not: assign val to max
-                (true, false) => *max = val.clone(),
-                // both NaN or non-NaN, safe to call update_stat()
-                _ => {
-                    update_stat::<T, _>(val, max, |cur| compare_greater(basic_type_info, val, cur))
-                }
-            }
-        }
+        Some(current) => match (is_nan(descr, current), is_nan(descr, val)) {
+            (false, true) => {}
+            (true, false) => *current = val.clone(),
+            _ if compare_greater(descr, val, current) => *current = val.clone(),
+            _ => {}
+        },
     }
 }
 
 #[inline]
 #[expect(clippy::eq_op)]
-fn is_nan<T: ParquetValueType>(basic_type_info: &BasicTypeInfo, val: &T) -> bool {
+fn is_nan<T: ParquetValueType>(descr: &ColumnDescriptor, val: &T) -> bool {
     match T::PHYSICAL_TYPE {
         Type::FLOAT | Type::DOUBLE => val != val,
-        Type::FIXED_LEN_BYTE_ARRAY
-            if matches!(basic_type_info.sort_order(), SortOrder::TOTAL_ORDER) =>
-        {
-            // taken from f16 impl, but skips creating f16. just compare the bits as u16.
-            let val = val.as_bytes();
-            // Float16 is stored little endian
-            let uval = ((val[1] as u16) << 8) | val[0] as u16;
-            uval & 0x7FFFu16 > 0x7C00u16
-        }
+        Type::FIXED_LEN_BYTE_ARRAY => is_nan_byte_array(descr, val.as_bytes()),
         _ => false,
     }
 }
 
-/// Perform a conditional update of `cur`
+pub(crate) fn is_nan_byte_array(descr: &ColumnDescriptor, val: &[u8]) -> bool {
+    descr.logical_type_ref() == Some(&LogicalType::Float16) && is_f16_nan(val)
+}
+
+/// NaN test for a Float16 value, without re-checking the column's logical type.
 ///
-/// Calls `should_update` with the value of `cur`, and updates `cur` to `Some(val)` if it
-/// returns `true`. `cur` must not be `None` or this will panic.
-fn update_stat<T: ParquetValueType, F>(val: &T, cur: &mut T, should_update: F)
-where
-    F: Fn(&T) -> bool,
-{
-    if should_update(cur) {
-        *cur = val.clone();
-    }
+/// Callers that fold statistics over many values resolve the logical type once
+/// and then use this directly: `==` on [`LogicalType`] is an out-of-line
+/// comparison over a large enum, which is far too expensive per value.
+#[inline(always)]
+pub(crate) fn is_f16_nan(val: &[u8]) -> bool {
+    f16::from_le_bytes([val[0], val[1]]).is_nan()
 }
 
 /// Evaluate `a > b` according to underlying logical type.
-fn compare_greater<T: ParquetValueType>(basic_type_info: &BasicTypeInfo, a: &T, b: &T) -> bool {
+fn compare_greater<T: ParquetValueType>(descr: &ColumnDescriptor, a: &T, b: &T) -> bool {
     match T::PHYSICAL_TYPE {
         Type::FLOAT => {
             let a = f32::from_le_bytes(a.as_bytes().try_into().unwrap());
@@ -1768,24 +1744,27 @@ fn compare_greater<T: ParquetValueType>(basic_type_info: &BasicTypeInfo, a: &T, 
             let b = f64::from_le_bytes(b.as_bytes().try_into().unwrap());
             return a.total_cmp(&b) == Ordering::Greater;
         }
-        Type::INT32 | Type::INT64
-            if matches!(basic_type_info.sort_order(), SortOrder::UNSIGNED) =>
-        {
-            return compare_greater_unsigned_int(a, b);
+        Type::INT32 | Type::INT64 => {
+            if let Some(LogicalType::Integer(IntType {
+                is_signed: false, ..
+            })) = descr.logical_type_ref()
+            {
+                // need to compare unsigned
+                return compare_greater_unsigned_int(a, b);
+            }
+
+            match descr.converted_type() {
+                ConvertedType::UINT_8
+                | ConvertedType::UINT_16
+                | ConvertedType::UINT_32
+                | ConvertedType::UINT_64 => {
+                    return compare_greater_unsigned_int(a, b);
+                }
+                _ => {}
+            };
         }
-        Type::FIXED_LEN_BYTE_ARRAY
-            if matches!(basic_type_info.sort_order(), SortOrder::TOTAL_ORDER) =>
-        {
-            return compare_greater_f16(a.as_bytes(), b.as_bytes());
-        }
-        Type::FIXED_LEN_BYTE_ARRAY | Type::BYTE_ARRAY
-            if matches!(basic_type_info.converted_type(), ConvertedType::DECIMAL)
-                || matches!(
-                    basic_type_info.logical_type_ref(),
-                    Some(LogicalType::Decimal(_))
-                ) =>
-        {
-            return compare_greater_byte_array_decimals(a.as_bytes(), b.as_bytes());
+        Type::FIXED_LEN_BYTE_ARRAY | Type::BYTE_ARRAY => {
+            return compare_greater_byte_array(descr, a.as_bytes(), b.as_bytes());
         }
 
         _ => {}
@@ -1830,15 +1809,20 @@ fn compare_greater_unsigned_int<T: ParquetValueType>(a: &T, b: &T) -> bool {
     a.as_u64().unwrap() > b.as_u64().unwrap()
 }
 
+pub(crate) fn compare_greater_byte_array(descr: &ColumnDescriptor, a: &[u8], b: &[u8]) -> bool {
+    // Use the same descriptor-derived ordering as the byte-array statistics.
+    ByteMinMaxOrder::from_descr(descr).greater(a, b)
+}
+
 #[inline]
-fn compare_greater_f16(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn compare_greater_f16(a: &[u8], b: &[u8]) -> bool {
     let a = f16::from_le_bytes(a.try_into().unwrap());
     let b = f16::from_le_bytes(b.try_into().unwrap());
     a.total_cmp(&b) == Ordering::Greater
 }
 
 /// Signed comparison of bytes arrays
-fn compare_greater_byte_array_decimals(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn compare_greater_byte_array_decimals(a: &[u8], b: &[u8]) -> bool {
     let a_length = a.len();
     let b_length = b.len();
 
@@ -3810,6 +3794,14 @@ mod tests {
             &[0u8,],
             &[255u8, 35u8, 0u8, 0u8,],
         ),);
+        assert!(!compare_greater_byte_array_decimals(&[1], &[2, 0]));
+        assert!(compare_greater_byte_array_decimals(&[2, 0], &[1]));
+        assert!(compare_greater_byte_array_decimals(&[0xff], &[0xfe, 0]));
+        assert!(!compare_greater_byte_array_decimals(&[0xfe, 0], &[0xff]));
+        assert!(compare_greater_byte_array_decimals(&[0, 2], &[1]));
+        assert!(!compare_greater_byte_array_decimals(&[1], &[0, 2]));
+        assert!(compare_greater_byte_array_decimals(&[0xff, 0xff], &[0xfe]));
+        assert!(!compare_greater_byte_array_decimals(&[0xfe], &[0xff, 0xff]));
     }
 
     #[test]
