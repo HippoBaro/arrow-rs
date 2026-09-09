@@ -434,6 +434,7 @@ impl BitWriter {
     /// directly so it can be written into. Useful for filling in a header
     /// (such as a length prefix) once the size of the following payload is
     /// known.
+    #[cfg(any(test, feature = "experimental"))]
     #[inline]
     pub fn get_next_byte_ptr(&mut self, num_bytes: usize) -> &mut [u8] {
         let offset = self.skip(num_bytes);
@@ -444,7 +445,7 @@ impl BitWriter {
     /// partial byte still held in the bit accumulator (rounded up).
     #[inline]
     pub fn bytes_written(&self) -> usize {
-        self.buffer.len() + ceil(self.bit_offset, 8) as usize
+        self.byte_offset() + ceil(self.bit_offset, 8) as usize
     }
 
     /// Returns a borrowed view of the bytes that have been flushed to the
