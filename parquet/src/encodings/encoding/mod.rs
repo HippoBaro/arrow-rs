@@ -20,6 +20,10 @@
 use std::{cmp, marker::PhantomData};
 
 use crate::basic::*;
+#[cfg(feature = "arrow")]
+use crate::column::value_selection::{
+    PhysicalValueSelection, PhysicalValueSpan, ValueSelectionRef,
+};
 #[cfg(any(test, feature = "test_common", feature = "experimental"))]
 use crate::column::writer::encoder::EncodingFamilyFor;
 use crate::data_type::private::{ParquetValueType, PlainEncoderValue};
@@ -28,6 +32,11 @@ use crate::encodings::rle::RleEncoder;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{BitWriter, num_required_bits};
+
+#[cfg(feature = "arrow")]
+use crate::util::bit_util::get_bit;
+#[cfg(feature = "arrow")]
+use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
 
 use byte_stream_split_encoder::{ByteStreamSplitEncoder, VariableWidthByteStreamSplitEncoder};
 use bytes::Bytes;

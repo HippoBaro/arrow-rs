@@ -21,17 +21,21 @@ use self::byte_array::encode_byte_slice;
 use crate::basic::{ConvertedType, Encoding, LogicalType, Type};
 use crate::bloom_filter::Sbbf;
 use crate::column::value_batch::{BatchSink, ValueProducer};
+#[cfg(feature = "arrow")]
+use crate::column::value_batch::{gather_tiled, map_values};
+#[cfg(feature = "arrow")]
+use crate::column::value_selection::PhysicalValueSelection;
 use crate::column::writer::{compare_greater_byte_array, is_f16_nan};
 use crate::column::writer::{fallback_encoding, has_dictionary_support, update_max, update_min};
 use crate::data_type::FixedLenByteArrayType;
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::{BoolType, ByteArray, DataType, FixedLenByteArray, Int96};
-use crate::encodings::encoding::FixedLenByteArrayEncoder;
 use crate::encodings::encoding::{BoolBatch, BoolEncoder};
 use crate::encodings::encoding::{
     BoolEncodingFamily, ByteArrayEncodingFamily, DictEncoder, DictionaryValue, Encoder,
     EncodingFamily, FixedLenByteArrayEncodingFamily, NumericEncodingFamily, PlainEncoderType,
 };
+use crate::encodings::encoding::{FixedLenByteArrayEncoder, PackedFixedLenByteArrayBatch};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
@@ -43,8 +47,16 @@ pub(super) mod byte_array;
 mod fixed_len_byte_array;
 mod numeric;
 
+#[cfg(feature = "arrow")]
+pub(crate) use fixed_len_byte_array::FixedLenByteArrayBatchPacker;
 use fixed_len_byte_array::encode_fixed_len_byte_array_slice;
+#[cfg(feature = "arrow")]
+pub(crate) use fixed_len_byte_array::{
+    FixedLenByteArrayBatch, FixedLenByteArraySink, FixedLenByteArraySource,
+};
 use numeric::NumericBatch;
+#[cfg(feature = "arrow")]
+pub(crate) use numeric::PhysicalNumericSource;
 /// The encoded data for a dictionary page
 pub struct DictionaryPage {
     pub buf: Bytes,
@@ -603,6 +615,10 @@ fn plain_encoded_byte_size<T: DataType>(value: &T::T) -> usize {
     }
 }
 
+/// How many leading present values fit in `byte_budget` bytes. The value that
+/// crosses the budget is included so the post-write page check flushes on this
+/// mini-batch rather than leaving a sliver for the next page.
+#[inline]
 pub(crate) fn count_within_budget<'a, T: DataType>(
     byte_budget: usize,
     vals: impl Iterator<Item = &'a T::T>,
