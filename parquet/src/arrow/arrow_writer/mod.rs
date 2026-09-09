@@ -6828,26 +6828,23 @@ mod tests {
                 assert!(column.column_index_length().is_some());
             }
         }
-        assert!(file_meta_data.column_index().is_some());
-        if let Some(col_indexes) = file_meta_data.column_index() {
-            for rg_idx in col_indexes {
-                for idx in rg_idx {
-                    assert!(idx.nan_counts().is_some());
-                    let float_idx = match idx {
-                        ColumnIndexMetaData::DOUBLE(idx) => idx,
-                        _ => panic!("expected double statistics"),
-                    };
-                    for i in 0..idx.num_pages() as usize {
-                        assert_eq!(float_idx.nan_count(i), Some(10));
-                        assert_eq!(
-                            f64::NAN.total_cmp(float_idx.min_value(i).unwrap()),
-                            Ordering::Equal
-                        );
-                        assert_eq!(
-                            f64::NAN.total_cmp(float_idx.max_value(i).unwrap()),
-                            Ordering::Equal
-                        );
-                    }
+        let col_indexes = file_meta_data.column_index().unwrap();
+        for row_group in col_indexes {
+            for index in row_group {
+                assert!(index.nan_counts().is_some());
+                let ColumnIndexMetaData::DOUBLE(index) = index else {
+                    panic!("expected double statistics")
+                };
+                for page in 0..index.num_pages() as usize {
+                    assert_eq!(index.nan_count(page), Some(10));
+                    assert_eq!(
+                        f64::NAN.total_cmp(index.min_value(page).unwrap()),
+                        Ordering::Equal
+                    );
+                    assert_eq!(
+                        f64::NAN.total_cmp(index.max_value(page).unwrap()),
+                        Ordering::Equal
+                    );
                 }
             }
         }
@@ -6860,84 +6857,55 @@ mod tests {
             DataType::Float64,
             true,
         )]));
-
-        let mut out = Vec::with_capacity(1024);
         let props = WriterProperties::builder()
             .set_data_page_row_count_limit(10)
             .build();
-        let mut writer = ArrowWriter::try_new(&mut out, schema.clone(), Some(props))
-            .expect("Unable to write file");
+        let mut out = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut out, schema.clone(), Some(props)).unwrap();
 
-        // write a page of all NaN (since batch min and max are NaN, global min/max are NaN)
-        let values = Arc::new(Float64Array::from(vec![f64::NAN; 10]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        writer.write(&batch).unwrap();
+        for values in [
+            vec![f64::NAN; 10],
+            vec![-f64::NAN; 10],
+            vec![0.0; 10],
+            vec![-1.0, 0.0, f64::NAN, -f64::NAN, 1.0],
+        ] {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(values))])
+                    .unwrap();
+            writer.write(&batch).unwrap();
+        }
 
-        // write a page of all -NaN (batch min/max is -NaN, should update global min to -NaN)
-        let values = Arc::new(Float64Array::from(vec![-f64::NAN; 10]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        writer.write(&batch).unwrap();
+        let metadata = writer.close().unwrap();
+        let stats = metadata.row_group(0).column(0).statistics().unwrap();
+        assert_eq!(stats.nan_count_opt(), Some(22));
+        assert_eq!(stats.min_bytes_opt(), Some((-1.0f64).as_bytes()));
+        assert_eq!(stats.max_bytes_opt(), Some(1.0f64.as_bytes()));
 
-        // write a page of all 0 (non-NaN should override global min/max, now 0/0)
-        let values = Arc::new(Float64Array::from(vec![0_f64; 10]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        writer.write(&batch).unwrap();
-
-        // write a mixed page (should now have min -1, max 1)
-        let values = Arc::new(Float64Array::from(vec![
-            -1.0,
-            0.0,
-            f64::NAN,
-            -f64::NAN,
-            1.0,
-        ]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
-        writer.write(&batch).unwrap();
-
-        let file_meta_data = writer.close().unwrap();
-
-        // check the column chunk stats are correct
-        let col_stats = file_meta_data
-            .row_group(0)
-            .column(0)
-            .statistics()
-            .expect("missing column chunk statistics");
-
-        assert_eq!(col_stats.nan_count_opt(), Some(22));
-        assert_eq!(col_stats.min_bytes_opt(), Some((-1.0f64).as_bytes()));
-        assert_eq!(col_stats.max_bytes_opt(), Some(1.0f64.as_bytes()));
-
-        assert!(file_meta_data.column_index().is_some());
-        let col_idx = &file_meta_data.column_index().as_ref().unwrap()[0][0];
-        assert_eq!(col_idx.num_pages(), 4);
-
-        // test each page
-        let float_idx = match col_idx {
-            ColumnIndexMetaData::DOUBLE(idx) => idx,
-            _ => panic!("expected double statistics"),
+        let ColumnIndexMetaData::DOUBLE(index) = &metadata.column_index().unwrap()[0][0] else {
+            panic!("expected double statistics")
         };
-
-        assert_eq!(float_idx.nan_counts, Some(vec![10, 10, 0, 2]));
+        assert_eq!(index.num_pages(), 4);
+        assert_eq!(index.nan_counts, Some(vec![10, 10, 0, 2]));
         assert_eq!(
-            f64::NAN.total_cmp(float_idx.min_value(0).unwrap()),
+            f64::NAN.total_cmp(index.min_value(0).unwrap()),
             Ordering::Equal
         );
         assert_eq!(
-            f64::NAN.total_cmp(float_idx.max_value(0).unwrap()),
+            f64::NAN.total_cmp(index.max_value(0).unwrap()),
             Ordering::Equal
         );
         assert_eq!(
-            (-f64::NAN).total_cmp(float_idx.min_value(1).unwrap()),
+            (-f64::NAN).total_cmp(index.min_value(1).unwrap()),
             Ordering::Equal
         );
         assert_eq!(
-            (-f64::NAN).total_cmp(float_idx.max_value(1).unwrap()),
+            (-f64::NAN).total_cmp(index.max_value(1).unwrap()),
             Ordering::Equal
         );
-        assert_eq!(float_idx.min_value(2), Some(&0.0));
-        assert_eq!(float_idx.max_value(2), Some(&0.0));
-        assert_eq!(float_idx.min_value(3), Some(&-1.0));
-        assert_eq!(float_idx.max_value(3), Some(&1.0));
+        assert_eq!(index.min_value(2), Some(&0.0));
+        assert_eq!(index.max_value(2), Some(&0.0));
+        assert_eq!(index.min_value(3), Some(&-1.0));
+        assert_eq!(index.max_value(3), Some(&1.0));
     }
 
     #[test]
