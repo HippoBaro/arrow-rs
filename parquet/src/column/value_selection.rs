@@ -43,12 +43,15 @@ pub(crate) struct SelectionRange {
 }
 
 impl SelectionRange {
-    #[cfg(test)]
     pub(crate) fn new(source: Range<usize>, selected_end: usize) -> Self {
         Self {
             source_start: source.start,
             selected_end,
         }
+    }
+    #[inline]
+    pub(crate) fn source_range(&self, selected_start: usize) -> Range<usize> {
+        self.source_start..self.source_start + (self.selected_end - selected_start)
     }
 }
 
@@ -61,7 +64,6 @@ pub(crate) struct RangesSelectionRef<'a> {
 }
 
 impl<'a> RangesSelectionRef<'a> {
-    #[cfg(test)]
     pub(crate) fn new(ranges: &'a [SelectionRange], len: usize) -> Self {
         #[cfg(debug_assertions)]
         {
