@@ -40,6 +40,7 @@ mod dict_encoder;
 mod fixed_len_byte_array;
 mod numeric;
 
+pub(crate) use boolean::{BoolBatch, BoolEncoder};
 pub use numeric::DeltaBitPackEncoder;
 
 // ----------------------------------------------------------------------
