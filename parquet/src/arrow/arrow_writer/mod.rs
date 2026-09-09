@@ -37,7 +37,8 @@ use arrow_schema::{
 use super::schema::{add_encoded_arrow_schema_to_metadata, decimal_length_from_precision};
 
 use crate::arrow::ArrowSchemaConverter;
-use crate::arrow::arrow_writer::byte_array::ByteArrayEncoder;
+use crate::arrow::arrow_writer::byte_array::ByteArrayStorage;
+use crate::arrow::arrow_writer::legacy_byte_array::ByteArrayEncoder;
 use crate::basic::PageType;
 use crate::column::page::{CompressedPage, PageWriteSpec, PageWriter};
 use crate::column::page_encryption::PageEncryptor;
@@ -70,6 +71,7 @@ use levels::{ArrayLevels, LeafBatch, calculate_array_levels};
 mod boolean;
 mod byte_array;
 mod fixed_len_byte_array;
+mod legacy_byte_array;
 mod levels;
 mod numeric;
 
@@ -1161,7 +1163,7 @@ impl ArrowColumnWriter {
             ArrowColumnWriterImpl::ByteArray(c) => {
                 let batch = levels.leaf_batch();
                 c.write_batch_internal(
-                    byte_array::ByteArrayGatherSource::new(
+                    legacy_byte_array::ByteArrayGatherSource::new(
                         batch.array(),
                         levels.non_null_indices(),
                     ),
@@ -1616,7 +1618,7 @@ impl ArrowColumnWriterFactory {
             | ArrowDataType::Utf8
             | ArrowDataType::LargeUtf8
             | ArrowDataType::BinaryView
-            | ArrowDataType::Utf8View => out.push(bytes(leaves.next().unwrap())?),
+            | ArrowDataType::Utf8View => out.push(col(leaves.next().unwrap())?),
             ArrowDataType::List(f)
             | ArrowDataType::LargeList(f)
             | ArrowDataType::FixedSizeList(f, _)
@@ -1826,9 +1828,7 @@ macro_rules! dispatch_leaf_writer {
             }
             ColumnWriter::FloatColumnWriter(typed) => $phys!(Float32Storage<'_>, typed),
             ColumnWriter::DoubleColumnWriter(typed) => $phys!(Float64Storage<'_>, typed),
-            ColumnWriter::ByteArrayColumnWriter(_typed) => {
-                unreachable!("byte arrays are written by ArrowColumnWriterImpl::ByteArray")
-            }
+            ColumnWriter::ByteArrayColumnWriter(typed) => $phys!(ByteArrayStorage<'_>, typed),
             ColumnWriter::FixedLenByteArrayColumnWriter(typed) => {
                 $phys!(FixedLenByteArrayStorage<'_>, typed)
             }
