@@ -50,6 +50,11 @@ impl SelectionRange {
             selected_end,
         }
     }
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn source_range(&self, selected_start: usize) -> Range<usize> {
+        self.source_start..self.source_start + (self.selected_end - selected_start)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
