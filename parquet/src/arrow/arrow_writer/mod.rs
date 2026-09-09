@@ -416,14 +416,9 @@ impl<W: Write + Send> ArrowWriter<W> {
                 return self.write(batch);
             }
 
-            if let Some(avg_row_bytes) = current_bytes
-                .checked_div(in_progress.buffered_rows)
-                .filter(|avg_row_bytes| *avg_row_bytes > 0)
-            {
+            let avg_row_bytes = current_bytes / in_progress.buffered_rows;
+            if let Some(rows_that_fit) = (max_bytes - current_bytes).checked_div(avg_row_bytes) {
                 // At this point, `current_bytes < max_bytes` (checked above)
-                let remaining_bytes = max_bytes - current_bytes;
-                let rows_that_fit = remaining_bytes.checked_div(avg_row_bytes).unwrap_or(0);
-
                 if batch.num_rows() > rows_that_fit {
                     if rows_that_fit > 0 {
                         let a = batch.slice(0, rows_that_fit);
