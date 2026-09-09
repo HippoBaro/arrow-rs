@@ -140,6 +140,10 @@ impl FallbackEncoder {
                     WriterVersion::PARQUET_2_0 => Encoding::DELTA_BYTE_ARRAY,
                 });
 
+        crate::encodings::encoding::validate_column_encoding(
+            encoding,
+            crate::basic::Type::BYTE_ARRAY,
+        )?;
         let encoder = match encoding {
             Encoding::PLAIN => FallbackEncoderImpl::Plain { buffer: vec![] },
             Encoding::DELTA_LENGTH_BYTE_ARRAY => FallbackEncoderImpl::DeltaLength {
