@@ -85,6 +85,7 @@ pub fn get_encoder<T: DataType>(
     encoding: Encoding,
     descr: &ColumnDescPtr,
 ) -> Result<Box<dyn Encoder<T>>> {
+    validate_column_encoding(encoding, T::get_physical_type())?;
     let encoder: Box<dyn Encoder<T>> = match encoding {
         Encoding::PLAIN => Box::new(PlainEncoder::new()),
         Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
@@ -106,6 +107,42 @@ pub fn get_encoder<T: DataType>(
         e @ Encoding::BIT_PACKED => return Err(nyi_err!("Encoding {} is not supported", e)),
     };
     Ok(encoder)
+}
+
+fn unsupported_column_encoding(encoding: Encoding, physical_type: Type) -> ParquetError {
+    nyi_err!(
+        "Encoding {} is not supported for physical type {:?}",
+        encoding,
+        physical_type
+    )
+}
+
+// The legacy factory validates the same policy the typed families will own in P12.
+pub(crate) fn validate_column_encoding(encoding: Encoding, physical_type: Type) -> Result<()> {
+    let supported = match physical_type {
+        Type::BOOLEAN => matches!(encoding, Encoding::PLAIN | Encoding::RLE),
+        Type::INT32 | Type::INT64 => matches!(
+            encoding,
+            Encoding::PLAIN | Encoding::DELTA_BINARY_PACKED | Encoding::BYTE_STREAM_SPLIT
+        ),
+        Type::INT96 => encoding == Encoding::PLAIN,
+        Type::FLOAT | Type::DOUBLE => {
+            matches!(encoding, Encoding::PLAIN | Encoding::BYTE_STREAM_SPLIT)
+        }
+        Type::BYTE_ARRAY => matches!(
+            encoding,
+            Encoding::PLAIN | Encoding::DELTA_LENGTH_BYTE_ARRAY | Encoding::DELTA_BYTE_ARRAY
+        ),
+        Type::FIXED_LEN_BYTE_ARRAY => matches!(
+            encoding,
+            Encoding::PLAIN | Encoding::DELTA_BYTE_ARRAY | Encoding::BYTE_STREAM_SPLIT
+        ),
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(unsupported_column_encoding(encoding, physical_type))
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -775,23 +812,39 @@ mod tests {
         // supported encodings
         create_and_check_encoder::<Int32Type>(0, Encoding::PLAIN, None);
         create_and_check_encoder::<Int32Type>(0, Encoding::DELTA_BINARY_PACKED, None);
-        create_and_check_encoder::<Int32Type>(0, Encoding::DELTA_LENGTH_BYTE_ARRAY, None);
-        create_and_check_encoder::<Int32Type>(0, Encoding::DELTA_BYTE_ARRAY, None);
         create_and_check_encoder::<BoolType>(0, Encoding::RLE, None);
 
         // error when initializing
         create_and_check_encoder::<Int32Type>(
             0,
             Encoding::RLE_DICTIONARY,
-            Some(general_err!(
-                "Cannot initialize this encoding through this function"
+            Some(unsupported_column_encoding(
+                Encoding::RLE_DICTIONARY,
+                Type::INT32,
             )),
         );
         create_and_check_encoder::<Int32Type>(
             0,
             Encoding::PLAIN_DICTIONARY,
-            Some(general_err!(
-                "Cannot initialize this encoding through this function"
+            Some(unsupported_column_encoding(
+                Encoding::PLAIN_DICTIONARY,
+                Type::INT32,
+            )),
+        );
+        create_and_check_encoder::<Int32Type>(
+            0,
+            Encoding::DELTA_LENGTH_BYTE_ARRAY,
+            Some(unsupported_column_encoding(
+                Encoding::DELTA_LENGTH_BYTE_ARRAY,
+                Type::INT32,
+            )),
+        );
+        create_and_check_encoder::<Int32Type>(
+            0,
+            Encoding::DELTA_BYTE_ARRAY,
+            Some(unsupported_column_encoding(
+                Encoding::DELTA_BYTE_ARRAY,
+                Type::INT32,
             )),
         );
 
@@ -800,8 +853,94 @@ mod tests {
         create_and_check_encoder::<Int32Type>(
             0,
             Encoding::BIT_PACKED,
-            Some(nyi_err!("Encoding BIT_PACKED is not supported")),
+            Some(unsupported_column_encoding(
+                Encoding::BIT_PACKED,
+                Type::INT32,
+            )),
         );
+    }
+
+    #[test]
+    fn legacy_column_construction_validates_encoding_fallback_matrix() {
+        use crate::file::properties::{WriterProperties, WriterVersion};
+        use crate::file::writer::SerializedFileWriter;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::Arc;
+        let encodings = [
+            Encoding::PLAIN,
+            Encoding::RLE,
+            Encoding::DELTA_BINARY_PACKED,
+            Encoding::DELTA_LENGTH_BYTE_ARRAY,
+            Encoding::DELTA_BYTE_ARRAY,
+            Encoding::BYTE_STREAM_SPLIT,
+        ];
+        for physical in [
+            Type::BOOLEAN,
+            Type::INT32,
+            Type::INT64,
+            Type::INT96,
+            Type::FLOAT,
+            Type::DOUBLE,
+            Type::BYTE_ARRAY,
+            Type::FIXED_LEN_BYTE_ARRAY,
+        ] {
+            let valid: &[Encoding] = match physical {
+                Type::BOOLEAN => &[Encoding::PLAIN, Encoding::RLE],
+                Type::INT32 | Type::INT64 => &[
+                    Encoding::PLAIN,
+                    Encoding::DELTA_BINARY_PACKED,
+                    Encoding::BYTE_STREAM_SPLIT,
+                ],
+                Type::INT96 => &[Encoding::PLAIN],
+                Type::FLOAT | Type::DOUBLE => &[Encoding::PLAIN, Encoding::BYTE_STREAM_SPLIT],
+                Type::BYTE_ARRAY => &[
+                    Encoding::PLAIN,
+                    Encoding::DELTA_LENGTH_BYTE_ARRAY,
+                    Encoding::DELTA_BYTE_ARRAY,
+                ],
+                Type::FIXED_LEN_BYTE_ARRAY => &[
+                    Encoding::PLAIN,
+                    Encoding::DELTA_BYTE_ARRAY,
+                    Encoding::BYTE_STREAM_SPLIT,
+                ],
+            };
+            for version in [WriterVersion::PARQUET_1_0, WriterVersion::PARQUET_2_0] {
+                for dictionary in [false, true] {
+                    for encoding in encodings {
+                        let field = Arc::new(
+                            SchemaType::primitive_type_builder("a", physical)
+                                .with_length(4)
+                                .build()
+                                .unwrap(),
+                        );
+                        let schema = Arc::new(
+                            SchemaType::group_type_builder("schema")
+                                .with_fields(vec![field])
+                                .build()
+                                .unwrap(),
+                        );
+                        let props = Arc::new(
+                            WriterProperties::builder()
+                                .set_writer_version(version)
+                                .set_dictionary_enabled(dictionary)
+                                .set_encoding(encoding)
+                                .build(),
+                        );
+                        let created = catch_unwind(AssertUnwindSafe(|| {
+                            let mut writer =
+                                SerializedFileWriter::new(Vec::new(), schema, props).unwrap();
+                            let mut group = writer.next_row_group().unwrap();
+                            group.next_column().unwrap().unwrap();
+                        }));
+                        assert_eq!(
+                            created.is_ok(),
+                            valid.contains(&encoding),
+                            "{physical:?} {version:?} dictionary={dictionary} {encoding:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
