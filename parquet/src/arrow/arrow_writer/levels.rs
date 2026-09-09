@@ -44,6 +44,8 @@
 use crate::column::chunker::CdcChunk;
 use crate::column::value_selection::ValueSelectionRef;
 use crate::column::writer::{LevelDataRef, RunLevelsRef};
+#[cfg(test)]
+pub(crate) mod cursor;
 mod plan;
 use crate::errors::{ParquetError, Result};
 use arrow_array::cast::AsArray;
@@ -124,6 +126,50 @@ fn is_leaf(data_type: &DataType) -> bool {
             | DataType::Decimal256(_, _)
             | DataType::FixedSizeBinary(_)
     )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct FieldContract<'a> {
+    data_type: &'a DataType,
+    nullable: bool,
+    name: &'a str,
+}
+
+/// Erase schema-only dictionary and REE wrappers. REE value-field
+/// nullability belongs to the logical node it exposes.
+#[cfg(test)]
+fn normalized(field: &Field) -> FieldContract<'_> {
+    let (data_type, nullable) = logical_type(field.data_type());
+    FieldContract {
+        data_type,
+        nullable: field.is_nullable() || nullable,
+        name: field.name(),
+    }
+}
+
+#[cfg(test)]
+fn leaf_types_compatible(expected: &DataType, actual: &DataType) -> bool {
+    is_leaf(expected)
+        && is_leaf(actual)
+        && (expected.equals_datatype(actual)
+            || matches!(
+                (expected, actual),
+                (
+                    DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8,
+                    DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+                ) | (
+                    DataType::Binary | DataType::BinaryView | DataType::LargeBinary,
+                    DataType::Binary | DataType::BinaryView | DataType::LargeBinary
+                )
+            ))
+}
+
+#[cfg(test)]
+fn required_null(field: &str, index: usize) -> ParquetError {
+    ParquetError::ArrowError(format!(
+        "Found null at index {index} for required field '{field}'"
+    ))
 }
 
 /// The definition and repetition level of an array within a potentially nested hierarchy
@@ -1099,6 +1145,49 @@ impl LevelData {
             },
             Self::Runs(_) => {
                 Self::Materialized(self.as_ref().slice(offset, len).cursor().collect())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Absent => 0,
+            Self::Materialized(values) => values.len(),
+            Self::Uniform { count, .. } => *count,
+            Self::Runs(runs) => runs.len(),
+        }
+    }
+
+    /// Append `count` repetitions of `value` straight into a materialized
+    /// buffer, skipping the compact representations.
+    ///
+    /// For a stream that a later pass has to index into — repetition levels,
+    /// which `patch_list_starts` rewrites per list row — the compact forms are
+    /// pure overhead: they would be built, re-checked on every append, and then
+    /// converted back. `Absent` stays absent, so this is a no-op for a column
+    /// that has no such stream.
+    #[inline]
+    #[cfg(test)]
+    pub(super) fn append_dense_run(&mut self, value: i16, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(values) = self.materialize_mut() {
+            values.extend(std::iter::repeat_n(value, count));
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(super) fn clear(&mut self) {
+        match self {
+            Self::Absent => {}
+            Self::Materialized(values) => values.clear(),
+            Self::Uniform { .. } => *self = Self::Materialized(Vec::new()),
+            Self::Runs(runs) => {
+                runs.ends.clear();
+                runs.values.clear();
             }
         }
     }
