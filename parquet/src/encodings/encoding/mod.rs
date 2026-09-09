@@ -128,6 +128,8 @@ mod encoding_family_private {
         fn is_dictionary(&self) -> bool {
             false
         }
+        #[cfg(feature = "arrow")]
+        fn start_arrow_source(&mut self) {}
         /// If dictionary-encoding, serialize the dictionary page as `(buf, num_values,
         /// is_sorted)` and transition in place to the fallback encoding (dictionary
         /// fallback); otherwise `None`.
@@ -232,6 +234,13 @@ macro_rules! impl_dictionary_encoding_family {
                 matches!(self, Self::Dictionary(_))
             }
 
+            #[cfg(feature = "arrow")]
+            fn start_arrow_source(&mut self) {
+                if let Self::Dictionary(dict) = self {
+                    dict.start_arrow_source()
+                }
+            }
+
             fn take_dict_page(
                 &mut self,
                 fallback_encoding: Encoding,
@@ -312,33 +321,6 @@ macro_rules! dictionary_encoding_family {
         );
         impl_dictionary_encoding_family!($name $(<$generic: $bound>)?, $ty);
     };
-}
-
-pub(crate) fn validate_column_encoding(encoding: Encoding, physical_type: Type) -> Result<()> {
-    let supported = match physical_type {
-        Type::BOOLEAN => matches!(encoding, Encoding::PLAIN | Encoding::RLE),
-        Type::INT32 | Type::INT64 => matches!(
-            encoding,
-            Encoding::PLAIN | Encoding::DELTA_BINARY_PACKED | Encoding::BYTE_STREAM_SPLIT
-        ),
-        Type::INT96 => encoding == Encoding::PLAIN,
-        Type::FLOAT | Type::DOUBLE => {
-            matches!(encoding, Encoding::PLAIN | Encoding::BYTE_STREAM_SPLIT)
-        }
-        Type::BYTE_ARRAY => matches!(
-            encoding,
-            Encoding::PLAIN | Encoding::DELTA_LENGTH_BYTE_ARRAY | Encoding::DELTA_BYTE_ARRAY
-        ),
-        Type::FIXED_LEN_BYTE_ARRAY => matches!(
-            encoding,
-            Encoding::PLAIN | Encoding::DELTA_BYTE_ARRAY | Encoding::BYTE_STREAM_SPLIT
-        ),
-    };
-    if supported {
-        Ok(())
-    } else {
-        Err(unsupported_column_encoding(encoding, physical_type))
-    }
 }
 
 fn unsupported_column_encoding(encoding: Encoding, physical_type: Type) -> ParquetError {
