@@ -24,7 +24,9 @@ use crate::arrow::record_reader::buffer::ValuesBuffer;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::{Encoding, Type};
 use crate::column::page::PageIterator;
-use crate::column::reader::decoder::ColumnValueDecoder;
+use crate::column::reader::decoder::{
+    ColumnValueDecoder, validate_fixed_len_byte_array_payload,
+};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::{
@@ -488,14 +490,12 @@ impl ColumnValueDecoder for ValueDecoder {
                 encoding
             ));
         }
-        let expected_len = num_values as usize * self.byte_length;
-        if expected_len > buf.len() {
-            return Err(general_err!(
-                "too few bytes in dictionary page, expected {} got {}",
-                expected_len,
-                buf.len()
-            ));
-        }
+        validate_fixed_len_byte_array_payload(
+            buf.len(),
+            num_values as usize,
+            self.byte_length,
+            "dictionary page",
+        )?;
 
         self.dict_page = Some(buf);
         Ok(())
