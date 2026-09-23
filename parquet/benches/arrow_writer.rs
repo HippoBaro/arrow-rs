@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::*;
 use arrow::util::bench_util::{create_f16_array, create_f32_array, create_f64_array};
+use arrow::util::test_util::seedable_rng;
 use arrow::{record_batch::RecordBatch, util::data_gen::*};
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{
@@ -211,7 +212,7 @@ fn create_string_bench_batch(
 }
 // Creates a DictionaryArray with target cardinality
 fn create_low_card_dictionary_bench_batch(size: usize, cardinality: usize) -> Result<RecordBatch> {
-    let mut rng = rand::rng();
+    let mut rng = seedable_rng();
 
     // Generate `cardinality` unique random strings.
     let categories: Vec<String> = (0..cardinality)
